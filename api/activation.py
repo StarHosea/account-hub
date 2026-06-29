@@ -47,12 +47,12 @@ def create_router() -> APIRouter:
     @router.post("/api/activation/start")
     async def start_activation(body: ActivationStartRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"activation": activation_service.start(body.tokens)}
+        return {"activation": activation_service.start(body.tokens), "config": _safe_config()}
 
     @router.post("/api/activation/stop")
     async def stop_activation(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"activation": activation_service.stop()}
+        return {"activation": activation_service.stop(), "config": _safe_config()}
 
     @router.get("/api/activation/events")
     async def activation_events(token: str = ""):
@@ -61,7 +61,7 @@ def create_router() -> APIRouter:
         async def stream():
             last = ""
             while True:
-                payload = json.dumps(activation_service.get(), ensure_ascii=False)
+                payload = json.dumps({"activation": activation_service.get(), "config": _safe_config()}, ensure_ascii=False)
                 if payload != last:
                     last = payload
                     yield f"data: {payload}\n\n"

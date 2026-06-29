@@ -7,22 +7,19 @@ import { usePathname, useRouter } from "next/navigation";
 
 import { HeaderActions } from "@/components/header-actions";
 import { Sheet, SheetClose, SheetContent, SheetFooter, SheetHeader, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
-import webConfig from "@/constants/common-env";
 import { getValidatedAuthSession } from "@/lib/auth-session";
 import { cn } from "@/lib/utils";
 import { clearStoredAuthSession, type StoredAuthSession } from "@/store/auth";
 
 const adminNavItems = [
-  { href: "/image", label: "生图" },
   { href: "/accounts", label: "号池管理" },
   { href: "/register", label: "注册机" },
-  { href: "/image-manager", label: "图片管理" },
-  { href: "/logs", label: "日志管理" },
-  { href: "/debug", label: "调试" },
+  { href: "/mailboxes", label: "邮箱管理" },
+  { href: "/cdks", label: "Plus CDK管理" },
   { href: "/settings", label: "设置" },
 ];
 
-const userNavItems = [{ href: "/image", label: "画图" }];
+const userNavItems: { href: string; label: string }[] = [];
 
 export function TopNav() {
   const pathname = usePathname();
@@ -66,10 +63,7 @@ export function TopNav() {
   const navItems = session.role === "admin" ? adminNavItems : userNavItems;
   const roleLabel = session.role === "admin" ? "管理员" : "普通用户";
   const displayName = session.name.trim() || roleLabel;
-  const baseUrl = webConfig.apiUrl.replace(/\/$/, "") || window.location.origin;
-  const canvasHref = `https://infinite-canvas-cpco.onrender.com?apiKey=${encodeURIComponent(session.key)}&baseUrl=${encodeURIComponent(baseUrl)}`;
-  const canvasItem = { href: canvasHref, label: "无限画布", external: true };
-  const allNavItems = [canvasItem, ...navItems.map((item) => ({ ...item, external: false }))];
+  const allNavItems = navItems.map((item) => ({ ...item, external: false }));
 
   return (
     <header className="border-b border-stone-100/50 dark:border-white/10">
@@ -113,7 +107,7 @@ export function TopNav() {
             </SheetContent>
           </Sheet>
           <Link
-            href="/image"
+            href="/accounts"
             className="shrink-0 py-1 text-[15px] font-bold tracking-tight text-stone-950 transition hover:text-stone-700 dark:text-stone-50 dark:hover:text-white"
           >
             chatgpt2api
@@ -121,14 +115,6 @@ export function TopNav() {
           <HeaderActions className="ml-auto sm:hidden" showGithubText={false} />
         </div>
         <nav className="hide-scrollbar -mx-1 hidden min-w-0 flex-1 gap-1 overflow-x-auto px-1 sm:mx-0 sm:flex sm:justify-center sm:gap-8 sm:overflow-visible sm:px-0">
-          <a
-            href={canvasHref}
-            target="_blank"
-            rel="noreferrer"
-            className="relative shrink-0 whitespace-nowrap rounded-full px-2.5 py-1 text-[13px] font-medium text-stone-500 transition hover:text-stone-900 sm:rounded-none sm:px-0 sm:text-[15px] dark:text-stone-400 dark:hover:text-stone-100"
-          >
-            无限画布
-          </a>
           {navItems.map((item) => {
             const active = pathname === item.href;
             return (

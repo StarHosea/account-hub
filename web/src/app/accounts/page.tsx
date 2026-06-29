@@ -17,8 +17,10 @@ import {
   Pencil,
   RefreshCw,
   Search,
+  Square,
   Trash2,
   UserRound,
+  Zap,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -45,21 +47,27 @@ import {
 import {
   deleteAccounts,
   fetchAccounts,
-  fetchModels,
+  fetchActivation,
   fetchRefreshProgress,
   fetchReLoginProgress,
   reLoginAccounts,
   refreshAccounts,
+  startActivation,
+  stopActivation,
   testProxy,
   updateAccount,
   type Account,
   type AccountRefreshResponse,
   type AccountStatus,
-  type Model,
+  type ActivationState,
+  type ActivationSummary,
+  type PlusStatus,
   type RefreshProgressResponse,
 } from "@/lib/api";
+import webConfig from "@/constants/common-env";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 import { cn } from "@/lib/utils";
+import { getStoredAuthKey } from "@/store/auth";
 
 import { AccountImportDialog } from "./components/account-import-dialog";
 
@@ -84,38 +92,33 @@ const statusMeta: Record<
   禁用: { icon: Ban, badge: "secondary" },
 };
 
+const plusStatusBadge: Record<PlusStatus, ComponentProps<typeof Badge>["variant"]> = {
+  未激活: "secondary",
+  排队中: "info",
+  激活中: "warning",
+  已激活: "success",
+  激活失败: "danger",
+};
+
 const metricCards = [
   { key: "total", label: "账户总数", color: "text-stone-900", icon: UserRound },
   { key: "active", label: "正常账户", color: "text-emerald-600", icon: CheckCircle2 },
   { key: "limited", label: "限流账户", color: "text-orange-500", icon: CircleAlert },
   { key: "abnormal", label: "异常账户", color: "text-rose-500", icon: CircleOff },
   { key: "disabled", label: "禁用账户", color: "text-stone-500", icon: Ban },
-  { key: "quota", label: "剩余额度", color: "text-blue-500", icon: RefreshCw },
 ] as const;
 
-function isUnlimitedImageQuotaAccount(account: Account) {
-  return account.type === "pro" || account.type === "prolite";
-}
-
-function imageQuotaUnknown(account: Account) {
-  return Boolean(account.image_quota_unknown);
-}
+const plusMetricCards = [
+  { key: "free", label: "Free 账号数", color: "text-stone-700", icon: UserRound },
+  { key: "activated", label: "已激活数", color: "text-emerald-600", icon: CheckCircle2 },
+  { key: "activating", label: "激活中数", color: "text-amber-500", icon: Zap },
+] as const;
 
 function formatCompact(value: number) {
   if (value >= 1000) {
     return `${(value / 1000).toFixed(1)}k`;
   }
   return String(value);
-}
-
-function formatQuota(account: Account) {
-  if (isUnlimitedImageQuotaAccount(account)) {
-    return "∞";
-  }
-  if (imageQuotaUnknown(account)) {
-    return "未知";
-  }
-  return String(Math.max(0, account.quota));
 }
 
 function formatRestoreAt(value?: string | null) {
@@ -140,17 +143,6 @@ function formatRestoreAt(value?: string | null) {
   )}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 
   return { absolute, relative };
-}
-
-function formatQuotaSummary(accounts: Account[]) {
-  const availableAccounts = accounts.filter((account) => account.status === "正常");
-  if (availableAccounts.some(isUnlimitedImageQuotaAccount)) {
-    return "∞";
-  }
-  if (availableAccounts.some(imageQuotaUnknown)) {
-    return "未知";
-  }
-  return formatCompact(availableAccounts.reduce((sum, account) => sum + Math.max(0, account.quota), 0));
 }
 
 function maskToken(token?: string) {
@@ -188,7 +180,6 @@ function displayAccountSource(account: Account) {
 function AccountsPageContent() {
   const didLoadRef = useRef(false);
   const [accounts, setAccounts] = useState<Account[]>([]);
-  const [availableModels, setAvailableModels] = useState<Model[]>([]);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [query, setQuery] = useState("");
   const [typeFilter, setTypeFilter] = useState("all");
@@ -200,12 +191,14 @@ function AccountsPageContent() {
   const [editProxy, setEditProxy] = useState("");
   const [isTestingProxy, setIsTestingProxy] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
-  const [isLoadingModels, setIsLoadingModels] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [refreshingTokens, setRefreshingTokens] = useState<Set<string>>(new Set());
   const [isDeleting, setIsDeleting] = useState(false);
   const [isUpdating, setIsUpdating] = useState(false);
   const [isRelogining, setIsRelogining] = useState(false);
+  const [activationRunning, setActivationRunning] = useState(false);
+  const [activationSummary, setActivationSummary] = useState<ActivationSummary | null>(null);
+  const [isActivating, setIsActivating] = useState(false);
   const [progress, setProgress] = useState<{
     visible: boolean;
     current: number;
@@ -220,6 +213,8 @@ function AccountsPageContent() {
     email: "",
   });
   const progressRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const activationEventRef = useRef<EventSource | null>(null);
+  const activationPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [refreshSummary, setRefreshSummary] = useState<Record<string, number | string> | null>(null);
 
   const loadAccounts = async (silent = false) => {
@@ -240,16 +235,57 @@ function AccountsPageContent() {
     }
   };
 
-  const loadModels = async () => {
-    setIsLoadingModels(true);
+  const applyActivationState = (state: ActivationState) => {
+    setActivationRunning(state.activation.running);
+    setActivationSummary(state.activation.summary);
+  };
+
+  const loadActivation = async () => {
     try {
-      const data = await fetchModels();
-      setAvailableModels(Array.isArray(data.data) ? data.data : []);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "加载模型列表失败";
-      toast.error(message);
-    } finally {
-      setIsLoadingModels(false);
+      const state = await fetchActivation();
+      applyActivationState(state);
+    } catch {
+      /* 静默失败，summary 可由 items 兜底计算 */
+    }
+  };
+
+  // 打开 SSE 实时刷新激活状态；运行期间周期性刷新账号列表
+  const openActivationStream = () => {
+    void getStoredAuthKey().then((token) => {
+      if (!token) return;
+      activationEventRef.current?.close();
+      const baseUrl = webConfig.apiUrl.replace(/\/$/, "");
+      const source = new EventSource(`${baseUrl}/api/activation/events?token=${encodeURIComponent(token)}`);
+      activationEventRef.current = source;
+      source.onmessage = (event) => {
+        try {
+          const state = JSON.parse(event.data) as ActivationState;
+          applyActivationState(state);
+          if (!state.activation.running) {
+            stopActivationStream();
+            void loadAccounts(true);
+          }
+        } catch {
+          /* ignore malformed event */
+        }
+      };
+      source.onerror = () => {
+        stopActivationStream();
+      };
+    });
+    if (!activationPollRef.current) {
+      activationPollRef.current = setInterval(() => {
+        void loadAccounts(true);
+      }, 2000);
+    }
+  };
+
+  const stopActivationStream = () => {
+    activationEventRef.current?.close();
+    activationEventRef.current = null;
+    if (activationPollRef.current) {
+      clearInterval(activationPollRef.current);
+      activationPollRef.current = null;
     }
   };
 
@@ -259,11 +295,12 @@ function AccountsPageContent() {
     }
     didLoadRef.current = true;
     void loadAccounts();
-    void loadModels();
+    void loadActivation();
 
     // 清理进度条定时器
     return () => {
       if (progressRef.current) clearInterval(progressRef.current);
+      stopActivationStream();
     };
   }, []);
 
@@ -291,10 +328,26 @@ function AccountsPageContent() {
     const limited = accounts.filter((item) => item.status === "限流").length;
     const abnormal = accounts.filter((item) => item.status === "异常").length;
     const disabled = accounts.filter((item) => item.status === "禁用").length;
-    const quota = formatQuotaSummary(accounts);
 
-    return { total, active, limited, abnormal, disabled, quota };
+    return { total, active, limited, abnormal, disabled };
   }, [accounts]);
+
+  // Plus 概览：优先用后端 summary（含在途），否则按 items 计算
+  const plusSummary = useMemo(() => {
+    if (activationSummary) {
+      return {
+        free: activationSummary.free,
+        activated: activationSummary.activated,
+        activating: activationSummary.activating,
+      };
+    }
+    const free = accounts.filter((item) => item.plus_status === "未激活").length;
+    const activated = accounts.filter((item) => item.plus_status === "已激活").length;
+    const activating = accounts.filter(
+      (item) => item.plus_status === "排队中" || item.plus_status === "激活中",
+    ).length;
+    return { free, activated, activating };
+  }, [accounts, activationSummary]);
 
   const accountTypeOptions = useMemo(
     () => [
@@ -386,10 +439,6 @@ function AccountsPageContent() {
     const baseLimited = baseAccountsList.filter((a) => a.status === "限流").length;
     const baseAbnormal = baseAccountsList.filter((a) => a.status === "异常").length;
     const baseDisabled = baseAccountsList.filter((a) => a.status === "禁用").length;
-    const baseNormalAccounts = baseAccountsList.filter((a) => a.status === "正常");
-    const baseHasUnlimited = baseNormalAccounts.some(isUnlimitedImageQuotaAccount);
-    const baseHasUnknown = baseNormalAccounts.some(imageQuotaUnknown);
-    const baseQuotaNum = baseNormalAccounts.reduce((s, a) => s + Math.max(0, a.quota), 0);
 
     // 显示进度条（只显示当前任务，不含分类统计）
     const total = accessTokens.length;
@@ -439,21 +488,12 @@ function AccountsPageContent() {
               const runningLimited = baseLimited + ((p.status_counts?.["限流"]) ?? 0);
               const runningAbnormal = baseAbnormal + ((p.status_counts?.["异常"]) ?? 0);
               const runningDisabled = baseDisabled + ((p.status_counts?.["禁用"]) ?? 0);
-              let runningQuota: string | number;
-              if (baseHasUnlimited) {
-                runningQuota = "∞";
-              } else if (baseHasUnknown) {
-                runningQuota = "未知";
-              } else {
-                runningQuota = formatCompact(baseQuotaNum + (p.total_quota ?? 0));
-              }
               setRefreshSummary({
                 total: accounts.length,
                 active: runningActive,
                 limited: runningLimited,
                 abnormal: runningAbnormal,
                 disabled: runningDisabled,
-                quota: runningQuota,
               });
             }
           } catch (err) {
@@ -641,7 +681,6 @@ function AccountsPageContent() {
                 limited: baseLimited,
                 abnormal: runningAbnormal,
                 disabled: runningDisabled,
-                quota: summary.quota,
               });
             }
           } catch (err) {
@@ -733,6 +772,37 @@ function AccountsPageContent() {
       return;
     }
     setSelectedIds((prev) => prev.filter((id) => !currentRows.some((row) => row.access_token === id)));
+  };
+
+  const handleStartActivation = async (tokens: string[]) => {
+    setIsActivating(true);
+    try {
+      const state = await startActivation(tokens);
+      applyActivationState(state);
+      openActivationStream();
+      const target = tokens.length > 0 ? `${tokens.length} 个选中账号` : "全部未激活账号";
+      toast.success(`已开始批量激活 ${target}`);
+      void loadAccounts(true);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "启动批量激活失败");
+    } finally {
+      setIsActivating(false);
+    }
+  };
+
+  const handleStopActivation = async () => {
+    setIsActivating(true);
+    try {
+      const state = await stopActivation();
+      applyActivationState(state);
+      stopActivationStream();
+      void loadAccounts(true);
+      toast.success("已停止批量激活");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "停止批量激活失败");
+    } finally {
+      setIsActivating(false);
+    }
   };
 
   return (
@@ -876,7 +946,7 @@ function AccountsPageContent() {
       </Dialog>
 
       <section className="space-y-3">
-        <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-6">
+        <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-5">
           {metricCards.map((item) => {
             const Icon = item.icon;
             const value = (refreshSummary ?? summary)[item.key];
@@ -897,42 +967,25 @@ function AccountsPageContent() {
             );
           })}
         </div>
-        <Card className="rounded-2xl border-white/80 bg-white/90 shadow-sm">
-          <CardContent className="p-4">
-            <div className="mb-3 text-sm font-medium text-stone-700">
-              系统可用模型
-              <span className="ml-1 text-stone-400">({availableModels.length})</span>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              {availableModels.length > 0 ? (
-                availableModels.map((model) => (
-                  <button
-                    key={model.id}
-                    type="button"
-                    className="inline-flex cursor-pointer items-center rounded-full border border-stone-200 bg-white px-2.5 py-1 text-xs font-medium text-stone-700 transition hover:border-stone-300 hover:bg-stone-50"
-                    onClick={() => {
-                      void navigator.clipboard.writeText(model.id);
-                      toast.success("模型名已复制");
-                    }}
-                    title={`点击复制 ${model.id}`}
-                  >
-                    <img
-                      src="/openai.svg"
-                      alt=""
-                      aria-hidden="true"
-                      className="mr-1.5 size-3.5 shrink-0"
-                    />
-                    {model.id}
-                  </button>
-                ))
-              ) : isLoadingModels ? (
-                <span className="text-sm text-stone-400">正在加载模型列表...</span>
-              ) : (
-                <span className="text-sm text-stone-400">当前暂无可用模型</span>
-              )}
-            </div>
-          </CardContent>
-        </Card>
+        <div className="grid gap-3 md:grid-cols-3">
+          {plusMetricCards.map((item) => {
+            const Icon = item.icon;
+            const value = plusSummary[item.key];
+            return (
+              <Card key={item.key} className="rounded-2xl border-white/80 bg-white/90 shadow-sm">
+                <CardContent className="p-4">
+                  <div className="mb-4 flex items-start justify-between">
+                    <span className="text-xs font-medium text-stone-400">{item.label}</span>
+                    <Icon className="size-4 text-stone-400" />
+                  </div>
+                  <div className={cn("text-[1.75rem] font-semibold tracking-tight", item.color)}>
+                    {formatCompact(value)}
+                  </div>
+                </CardContent>
+              </Card>
+            );
+          })}
+        </div>
       </section>
 
       <section className="space-y-4">
@@ -1056,6 +1109,32 @@ function AccountsPageContent() {
                   {isDeleting ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
                   删除所选
                 </Button>
+                <Button
+                  variant="ghost"
+                  className="h-8 rounded-lg px-3 text-emerald-600 hover:bg-emerald-50 hover:text-emerald-700"
+                  onClick={() => void handleStartActivation(selectedTokens)}
+                  disabled={isActivating || activationRunning}
+                  title="对选中账号执行激活；未选中时激活全部未激活账号"
+                >
+                  {isActivating ? <LoaderCircle className="size-4 animate-spin" /> : <Zap className="size-4" />}
+                  批量激活Plus
+                </Button>
+                {activationRunning ? (
+                  <Button
+                    variant="ghost"
+                    className="h-8 rounded-lg px-3 text-rose-500 hover:bg-rose-50 hover:text-rose-600"
+                    onClick={() => void handleStopActivation()}
+                    disabled={isActivating}
+                  >
+                    {isActivating ? <LoaderCircle className="size-4 animate-spin" /> : <Square className="size-4" />}
+                    停止激活
+                  </Button>
+                ) : null}
+                {activationRunning ? (
+                  <span className="rounded-lg bg-amber-50 px-2.5 py-1 text-xs font-medium text-amber-700">
+                    激活进行中
+                  </span>
+                ) : null}
                 {selectedIds.length > 0 ? (
                   <span className="rounded-lg bg-stone-100 px-2.5 py-1 text-xs font-medium text-stone-600">
                     已选择 {selectedIds.length} 项
@@ -1080,9 +1159,8 @@ function AccountsPageContent() {
                     <th className="w-24 px-4 py-3">状态</th>
                     <th className="w-56 px-4 py-3">账号信息</th>
                     <th className="w-32 px-4 py-3">创建时间</th>
-                    <th className="w-24 px-4 py-3">额度</th>
+                    <th className="w-40 px-4 py-3">Plus进度</th>
                     <th className="w-40 px-4 py-3">恢复时间</th>
-                    <th className="w-18 px-4 py-3">在途</th>
                     <th className="w-18 px-4 py-3">成功</th>
                     <th className="w-18 px-4 py-3">失败</th>
                     <th className="w-24 px-4 py-3">操作</th>
@@ -1161,9 +1239,24 @@ function AccountsPageContent() {
                           })()}
                         </td>
                         <td className="px-4 py-3">
-                          <Badge variant="info" className="rounded-md">
-                            {formatQuota(account)}
-                          </Badge>
+                          {(() => {
+                            const plusStatus: PlusStatus = account.plus_status ?? "未激活";
+                            return (
+                              <div className="space-y-0.5">
+                                <Badge variant={plusStatusBadge[plusStatus]} className="rounded-md">
+                                  {plusStatus}
+                                </Badge>
+                                {account.plus_last_message ? (
+                                  <div
+                                    className="max-w-[160px] truncate text-[11px] leading-4 text-stone-400"
+                                    title={account.plus_last_message}
+                                  >
+                                    {account.plus_last_message}
+                                  </div>
+                                ) : null}
+                              </div>
+                            );
+                          })()}
                         </td>
                         <td className="px-4 py-3 text-xs leading-5 text-stone-500">
                           {(() => {
@@ -1173,27 +1266,6 @@ function AccountsPageContent() {
                                 {restore.relative ? <div className="font-medium text-stone-700">{restore.relative}</div> : null}
                                 <div>{restore.absolute}</div>
                               </div>
-                            );
-                          })()}
-                        </td>
-                        <td className="px-4 py-3">
-                          {(() => {
-                            const inflight = account.image_inflight ?? 0;
-                            return (
-                              <span
-                                className={
-                                  inflight > 0
-                                    ? "font-semibold text-amber-600"
-                                    : "text-stone-400"
-                                }
-                                title={
-                                  inflight > 0
-                                    ? "当前正在生成的图片数。号池空闲时此值持续 > 0，说明并发槽位泄漏、该账号已被静默排除出调度"
-                                    : "当前无在途生图任务"
-                                }
-                              >
-                                {inflight}
-                              </span>
                             );
                           })()}
                         </td>

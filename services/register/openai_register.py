@@ -472,6 +472,7 @@ class PlatformRegistrar:
         except Exception as error:
             mail_provider.mark_mailbox_result(mailbox, success=False, error=error)
             raise
+        mailbox["access_token"] = str(tokens.get("access_token") or "").strip()
         mail_provider.mark_mailbox_result(mailbox, success=True)
         return {
             "email": email,

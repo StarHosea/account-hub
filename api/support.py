@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from threading import Event, Thread
 
-from fastapi import HTTPException, Request
+from fastapi import HTTPException
 
 from services.account_service import account_service
 from services.auth_service import auth_service
@@ -44,39 +44,6 @@ def require_admin(authorization: str | None) -> dict[str, object]:
     if identity.get("role") != "admin":
         raise HTTPException(status_code=403, detail={"error": "需要管理员权限才能执行这个操作"})
     return identity
-
-
-def resolve_image_base_url(request: Request) -> str:
-    return config.base_url or f"{request.url.scheme}://{request.headers.get('host', request.url.netloc)}"
-
-
-def raise_image_quota_error(exc: Exception) -> None:
-    message = str(exc)
-    if "no available image quota" in message.lower():
-        raise HTTPException(status_code=429, detail={"error": "no available image quota"}) from exc
-    raise HTTPException(status_code=502, detail={"error": message}) from exc
-
-
-def sanitize_cpa_pool(pool: dict | None) -> dict | None:
-    if not isinstance(pool, dict):
-        return None
-    return {key: value for key, value in pool.items() if key != "secret_key"}
-
-
-def sanitize_cpa_pools(pools: list[dict]) -> list[dict]:
-    return [sanitized for pool in pools if (sanitized := sanitize_cpa_pool(pool)) is not None]
-
-
-def sanitize_sub2api_server(server: dict | None) -> dict | None:
-    if not isinstance(server, dict):
-        return None
-    sanitized = {key: value for key, value in server.items() if key not in {"password", "api_key"}}
-    sanitized["has_api_key"] = bool(str(server.get("api_key") or "").strip())
-    return sanitized
-
-
-def sanitize_sub2api_servers(servers: list[dict]) -> list[dict]:
-    return [sanitized for server in servers if (sanitized := sanitize_sub2api_server(server)) is not None]
 
 
 def start_limited_account_watcher(stop_event: Event) -> Thread:

@@ -21,6 +21,21 @@ from services.storage.base import StorageBackend
 from utils.helper import anonymize_token
 
 
+def _is_tls_connection_error(message: str) -> bool:
+    """检测 TLS/SSL/代理连接错误（网络问题，可重试，不计入账号失败）。"""
+    text = str(message or "").lower()
+    return (
+        "curl: (35)" in text
+        or "tls connect error" in text
+        or "openssl_internal" in text
+        or "ssl: wrong_version_number" in text
+        or "ssl: certificate_verify_failed" in text
+        or "connection aborted" in text
+        or "remote disconnected" in text
+        or "connection reset by peer" in text
+    )
+
+
 class AccountService:
     """账号池服务，使用 token -> account 的 dict 保存账号。"""
 
@@ -243,6 +258,18 @@ class AccountService:
         normalized["last_token_refresh_error"] = normalized.get("last_token_refresh_error") or None
         normalized["last_token_refresh_error_at"] = normalized.get("last_token_refresh_error_at") or None
         normalized["created_at"] = normalized.get("created_at") or AccountService._now()
+        # Plus 激活相关字段（由 activation_service 维护）。
+        plus_status = str(normalized.get("plus_status") or "未激活").strip() or "未激活"
+        if plus_status not in {"未激活", "排队中", "激活中", "已激活", "激活失败"}:
+            plus_status = "未激活"
+        normalized["plus_status"] = plus_status
+        attempts = normalized.get("plus_attempts")
+        attempts = attempts if isinstance(attempts, dict) else {}
+        normalized["plus_attempts"] = {"UPI": int(attempts.get("UPI") or 0), "IDEL": int(attempts.get("IDEL") or 0)}
+        normalized["plus_cdk"] = normalized.get("plus_cdk") or None
+        normalized["plus_task_id"] = normalized.get("plus_task_id") or None
+        normalized["plus_last_message"] = normalized.get("plus_last_message") or None
+        normalized["plus_updated_at"] = normalized.get("plus_updated_at") or None
         return normalized
 
     @staticmethod
@@ -1485,8 +1512,7 @@ class AccountService:
                 except Exception as exc:
                     error_str = str(exc)
                     # TLS/代理连接错误是网络问题，不计入账号失败
-                    from services.protocol.conversation import is_tls_connection_error
-                    if not is_tls_connection_error(error_str):
+                    if not _is_tls_connection_error(error_str):
                         errors.append({"token": anonymize_token(token), "error": error_str})
                 else:
                     if account is not None:

@@ -250,6 +250,30 @@ class ConfigStore:
         return _normalize_auth_key(os.getenv("CHATGPT2API_AUTH_KEY") or self.data.get("auth-key"))
 
     @property
+    def cdk_activation(self) -> dict:
+        """Plus CDK 兑换/激活配置。API Key 仅存后端，优先取环境变量。"""
+        raw = self.data.get("cdk_activation")
+        raw = raw if isinstance(raw, dict) else {}
+        return {
+            "base_url": str(os.getenv("CDK_API_BASE_URL") or raw.get("base_url") or "https://chong.nerver.cc").strip().rstrip("/"),
+            "api_key": str(os.getenv("CDK_API_KEY") or raw.get("api_key") or "").strip(),
+            "concurrency": max(1, min(10, int(raw.get("concurrency") or 3))),
+            "poll_interval": max(1.0, float(raw.get("poll_interval") or 5.0)),
+            "poll_timeout": max(30.0, float(raw.get("poll_timeout") or 1800.0)),
+            "max_attempts_per_type": max(1, int(raw.get("max_attempts_per_type") or 3)),
+        }
+
+    def update_cdk_activation(self, updates: dict) -> dict:
+        current = self.data.get("cdk_activation")
+        current = dict(current) if isinstance(current, dict) else {}
+        for key in ("base_url", "api_key", "concurrency", "poll_interval", "poll_timeout", "max_attempts_per_type"):
+            if key in updates and updates[key] is not None:
+                current[key] = updates[key]
+        self.data["cdk_activation"] = current
+        self._save()
+        return self.cdk_activation
+
+    @property
     def accounts_file(self) -> Path:
         return DATA_DIR / "accounts.json"
 

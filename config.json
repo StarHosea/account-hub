@@ -79,6 +79,8 @@
     "auto_activate_after_register": false,
     "base_url": "http://127.0.0.1:8199",
     "api_key": "mock-key",
-    "poll_interval": 2.0
+    "poll_interval": 2.0,
+    "target": 10,
+    "auto_replenish": true
   }
 }

@@ -9,27 +9,14 @@ import zipfile
 from datetime import datetime
 from typing import Any, Literal
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
-from services.auth_service import auth_service
-
 from api.support import require_admin
 from services.account_service import account_service
 from services.mailbox_service import mailbox_service
-
-
-
-class UserKeyCreateRequest(BaseModel):
-    name: str = ""
-
-
-class UserKeyUpdateRequest(BaseModel):
-    name: str | None = None
-    enabled: bool | None = None
-    key: str | None = None
 
 
 class AccountCreateRequest(BaseModel):
@@ -58,12 +45,33 @@ class AccountUpdateRequest(BaseModel):
     proxy: str | None = None
 
 
+class Account2FARequest(BaseModel):
+    access_token: str = ""
+
+
+class AccountMarkUsedRequest(BaseModel):
+    access_tokens: list[str] = Field(default_factory=list)
+    used: bool = True
+
+
+class AccountCredentialsExportRequest(BaseModel):
+    access_tokens: list[str] = Field(default_factory=list)
+    only_unused: bool = False
+    mark_used: bool = False
+
+
 def _account_payload_token(item: dict[str, Any]) -> str:
     return str(item.get("access_token") or item.get("accessToken") or "").strip()
 
 
 def _unique_tokens(tokens: list[str]) -> list[str]:
     return list(dict.fromkeys(str(token or "").strip() for token in tokens if str(token or "").strip()))
+
+
+def _paginate(seq: list[Any], page: int, page_size: int) -> list[Any]:
+    """按 1-based page 切片；page/page_size 已由 Query 约束为 >=1。"""
+    start = (page - 1) * page_size
+    return seq[start : start + page_size]
 
 
 def _download_timestamp() -> str:
@@ -98,60 +106,58 @@ def _account_zip_bytes(items: list[dict[str, str]]) -> bytes:
 def create_router() -> APIRouter:
     router = APIRouter()
 
-    @router.get("/api/auth/users")
-    async def list_user_keys(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        return {"items": auth_service.list_keys(role="user")}
-
-    @router.post("/api/auth/users")
-    async def create_user_key(body: UserKeyCreateRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        try:
-            item, raw_key = auth_service.create_key(role="user", name=body.name)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
-        return {"item": item, "key": raw_key, "items": auth_service.list_keys(role="user")}
-
-    @router.post("/api/auth/users/{key_id}")
-    async def update_user_key(
-            key_id: str,
-            body: UserKeyUpdateRequest,
-            authorization: str | None = Header(default=None),
-    ):
-        require_admin(authorization)
-        updates = {
-            key: value
-            for key, value in {
-                "name": body.name,
-                "enabled": body.enabled,
-                "key": body.key,
-            }.items()
-            if value is not None
-        }
-        if not updates:
-            raise HTTPException(status_code=400, detail={"error": "还没有检测到改动，请修改后再保存"})
-        try:
-            item = auth_service.update_key(key_id, updates, role="user")
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
-        if item is None:
-            raise HTTPException(status_code=404, detail={"error": "这条用户密钥不存在，可能已经被删除"})
-        return {"item": item, "items": auth_service.list_keys(role="user")}
-
-    @router.delete("/api/auth/users/{key_id}")
-    async def delete_user_key(key_id: str, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        if not auth_service.delete_key(key_id, role="user"):
-            raise HTTPException(status_code=404, detail={"error": "这条用户密钥不存在，可能已经被删除"})
-        return {"items": auth_service.list_keys(role="user")}
-
     @router.get("/api/accounts")
-    async def get_accounts(authorization: str | None = Header(default=None)):
+    async def get_accounts(
+        authorization: str | None = Header(default=None),
+        q: str | None = Query(default=None),
+        status: str | None = Query(default=None),
+        plus: str | None = Query(default=None),
+        used: bool | None = Query(default=None),
+        page: int = Query(default=1, ge=1),
+        page_size: int = Query(default=10, ge=1, le=200),
+    ):
         require_admin(authorization)
         items = account_service.list_accounts()
         for item in items:
             item["mail_link"] = mailbox_service.get_fetch_url(str(item.get("email") or "")) or None
-        return {"items": items}
+
+        # 全库统计（过滤前），始终反映整库口径。
+        summary = {
+            "total": len(items),
+            "alive": sum(1 for a in items if a.get("status") in ("正常", "限流")),
+            "dead": sum(1 for a in items if a.get("status") in ("异常", "禁用")),
+            "activated": sum(1 for a in items if a.get("plus_status") == "已激活"),
+            "unused": sum(1 for a in items if not a.get("used")),
+        }
+
+        # 过滤
+        keyword = (q or "").strip().lower()
+        if keyword:
+            items = [
+                a
+                for a in items
+                if keyword in str(a.get("email") or "").lower()
+                or keyword in str(a.get("password") or "").lower()
+            ]
+        if status == "alive":
+            items = [a for a in items if a.get("status") in ("正常", "限流")]
+        elif status == "dead":
+            items = [a for a in items if a.get("status") in ("异常", "禁用")]
+        if plus == "activated":
+            items = [a for a in items if a.get("plus_status") == "已激活"]
+        elif plus == "inactive":
+            items = [a for a in items if a.get("plus_status") != "已激活"]
+        if used is not None:
+            items = [a for a in items if bool(a.get("used")) == used]
+
+        total = len(items)
+        return {
+            "items": _paginate(items, page, page_size),
+            "summary": summary,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        }
 
     @router.post("/api/accounts")
     async def create_accounts(body: AccountCreateRequest, authorization: str | None = Header(default=None)):
@@ -271,6 +277,44 @@ def create_router() -> APIRouter:
             headers={"Content-Disposition": f'attachment; filename="codex-accounts-{timestamp}.json"'},
         )
 
+    @router.post("/api/accounts/export-credentials")
+    async def export_credentials(body: AccountCredentialsExportRequest, authorization: str | None = Header(default=None)):
+        """导出账号凭据：每行 `邮箱----接码地址----密码----2FA密钥`。接码地址取自绑定邮箱的 fetch_url。"""
+        require_admin(authorization)
+        tokens = _unique_tokens(body.access_tokens)
+        accounts = account_service.list_accounts()
+        if tokens:
+            wanted = {account_service.resolve_access_token(t) for t in tokens}
+            accounts = [a for a in accounts if str(a.get("access_token") or "") in wanted]
+        if body.only_unused:
+            accounts = [a for a in accounts if not a.get("used")]
+        lines: list[str] = []
+        exported_tokens: list[str] = []
+        for acc in accounts:
+            email = str(acc.get("email") or "").strip()
+            fetch_url = (mailbox_service.get_fetch_url(email) or "") if email else ""
+            password = str(acc.get("password") or "").strip()
+            totp = str(acc.get("totp_secret") or "").strip()
+            lines.append("----".join([email, fetch_url, password, totp]))
+            exported_tokens.append(str(acc.get("access_token") or ""))
+        if body.mark_used and exported_tokens:
+            account_service.mark_used(exported_tokens, True)
+        text = "\n".join(lines) + ("\n" if lines else "")
+        timestamp = _download_timestamp()
+        return Response(
+            text,
+            media_type="text/plain; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="accounts-credentials-{timestamp}.txt"'},
+        )
+
+    @router.post("/api/accounts/mark-used")
+    async def mark_accounts_used(body: AccountMarkUsedRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        tokens = _unique_tokens(body.access_tokens)
+        if not tokens:
+            raise HTTPException(status_code=400, detail={"error": "access_tokens is required"})
+        return account_service.mark_used(tokens, bool(body.used))
+
     @router.post("/api/accounts/update")
     async def update_account(body: AccountUpdateRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
@@ -284,5 +328,31 @@ def create_router() -> APIRouter:
         if account is None:
             raise HTTPException(status_code=404, detail={"error": "account not found"})
         return {"item": account, "items": account_service.list_accounts()}
+
+    @router.post("/api/accounts/2fa/enable")
+    async def enable_account_2fa(body: Account2FARequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        access_token = str(body.access_token or "").strip()
+        if not access_token:
+            raise HTTPException(status_code=400, detail={"error": "access_token is required"})
+        progress_id = account_service.start_2fa_task("enable", access_token)
+        return {"progress_id": progress_id}
+
+    @router.post("/api/accounts/2fa/disable")
+    async def disable_account_2fa(body: Account2FARequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        access_token = str(body.access_token or "").strip()
+        if not access_token:
+            raise HTTPException(status_code=400, detail={"error": "access_token is required"})
+        progress_id = account_service.start_2fa_task("disable", access_token)
+        return {"progress_id": progress_id}
+
+    @router.get("/api/accounts/2fa/progress/{progress_id}")
+    async def get_2fa_progress(progress_id: str, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        progress = account_service.get_2fa_progress(progress_id)
+        if progress is None:
+            raise HTTPException(status_code=404, detail={"error": "progress not found"})
+        return progress
 
     return router

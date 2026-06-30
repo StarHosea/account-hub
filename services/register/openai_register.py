@@ -18,6 +18,14 @@ from curl_cffi import requests
 
 from services.account_service import account_service
 from services.register import mail_provider
+from services.register import fingerprint
+from services.register.fingerprint import (
+    build_identity,
+    common_headers_for,
+    navigate_headers_for,
+    normalize_proxy,
+    rotate_ipweb_proxy,
+)
 
 base_dir = Path(__file__).resolve().parent
 config = {
@@ -30,11 +38,14 @@ config = {
     "proxy": "",
     "total": 10,
     "threads": 3,
+    "enable_2fa": True,
+    "regions": ["US"],
+    "ipweb_rotate": False,
 }
 register_config_file = base_dir.parents[1] / "data" / "register.json"
 try:
     saved_config = json.loads(register_config_file.read_text(encoding="utf-8"))
-    config.update({key: saved_config[key] for key in ("mail", "proxy", "total", "threads") if key in saved_config})
+    config.update({key: saved_config[key] for key in ("mail", "proxy", "total", "threads", "regions", "ipweb_rotate") if key in saved_config})
 except Exception:
     pass
 
@@ -130,6 +141,11 @@ def step(index: int, text: str, color: str = "") -> None:
     log(f"[任务{index}] {text}", color)
 
 
+def _jitter_sleep(lo: float = 0.4, hi: float = 1.8) -> None:
+    """步间随机停顿，弱化机械时序。"""
+    time.sleep(random.uniform(lo, hi))
+
+
 def _make_trace_headers() -> dict[str, str]:
     trace_id = str(random.getrandbits(64))
     parent_id = str(random.getrandbits(64))
@@ -159,14 +175,13 @@ def _random_password(length: int = 16) -> str:
     return "".join(value)
 
 
-def _random_name() -> tuple[str, str]:
-    return random.choice(["James", "Robert", "John", "Michael", "David", "Mary", "Emma", "Olivia"]), random.choice(
-        ["Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller"]
-    )
+def _random_name(identity=None) -> tuple[str, str]:
+    return fingerprint.random_name(identity)
 
 
 def _random_birthdate() -> str:
-    return f"{random.randint(1996, 2006):04d}-{random.randint(1, 12):02d}-{random.randint(1, 28):02d}"
+    # 年龄 20–50 岁（2026 年 → 出生 1976–2006）
+    return f"{random.randint(1976, 2006):04d}-{random.randint(1, 12):02d}-{random.randint(1, 28):02d}"
 
 
 def _response_json(resp) -> dict:
@@ -245,14 +260,31 @@ def wait_for_code(mailbox: dict) -> str | None:
 from utils.sentinel import SentinelTokenGenerator, build_sentinel_token as _build_sentinel_token_tuple  # noqa: F401
 
 
-def build_sentinel_token(session: requests.Session, device_id: str, flow: str) -> str:
-    """请求 sentinel token，返回 sentinel header 字符串（兼容旧接口）。"""
+def build_sentinel_token(session: requests.Session, device_id: str, flow: str, identity=None) -> str:
+    """请求 sentinel token，返回 sentinel header 字符串。
+
+    传入 identity 时，sentinel 的 UA / 语言 / 时区 / 分辨率 / 并发数与请求头、地区保持一致；
+    未传时回退模块默认常量（向后兼容）。
+    """
+    if identity is not None:
+        sentinel_val, _ = _build_sentinel_token_tuple(
+            session, device_id, flow,
+            user_agent=identity.user_agent,
+            sec_ch_ua=identity.sec_ch_ua,
+            screen=identity.screen,
+            hardware_concurrency=identity.hardware_concurrency,
+            language=identity.sentinel_language,
+            gmt_offset=identity.gmt_offset,
+            tz_label=identity.tz_label,
+            sec_ch_ua_platform=identity.profile.platform,
+        )
+        return sentinel_val
     sentinel_val, _oai_sc_val = _build_sentinel_token_tuple(session, device_id, flow, user_agent=user_agent, sec_ch_ua=sec_ch_ua)
     return sentinel_val
 
 
-def create_session(proxy: str = "") -> Any:
-    kwargs = {"impersonate": "chrome", "verify": False}
+def create_session(proxy: str = "", impersonate: str = "chrome") -> Any:
+    kwargs = {"impersonate": impersonate, "verify": False}
     if proxy:
         kwargs["proxy"] = proxy
     return requests.Session(**kwargs)
@@ -260,24 +292,24 @@ def create_session(proxy: str = "") -> Any:
 
 def request_with_local_retry(session: requests.Session, method: str, url: str, retry_attempts: int = 3, **kwargs):
     last_error = ""
-    for _ in range(max(1, retry_attempts)):
+    for attempt in range(max(1, retry_attempts)):
         try:
             return session.request(method.upper(), url, timeout=default_timeout, **kwargs), ""
         except Exception as error:
             last_error = str(error)
-            time.sleep(1)
+            time.sleep(random.uniform(0.5, 1.5) * (attempt + 1))
     return None, last_error
 
 
-def validate_otp(session: requests.Session, device_id: str, code: str):
-    headers = dict(common_headers)
+def validate_otp(session: requests.Session, device_id: str, code: str, identity=None):
+    headers = common_headers_for(identity) if identity is not None else dict(common_headers)
     headers["referer"] = f"{auth_base}/email-verification"
     headers["oai-device-id"] = device_id
     headers.update(_make_trace_headers())
     resp, error = request_with_local_retry(session, "post", f"{auth_base}/api/accounts/email-otp/validate", json={"code": code}, headers=headers, verify=False)
     if resp is not None and resp.status_code == 200:
         return resp, ""
-    headers["openai-sentinel-token"] = build_sentinel_token(session, device_id, "authorize_continue")
+    headers["openai-sentinel-token"] = build_sentinel_token(session, device_id, "authorize_continue", identity)
     resp, error = request_with_local_retry(session, "post", f"{auth_base}/api/accounts/email-otp/validate", json={"code": code}, headers=headers, verify=False)
     return resp, error
 
@@ -295,7 +327,13 @@ def extract_oauth_callback_params_from_url(url: str) -> dict[str, str] | None:
     return {"code": code, "state": str((params.get("state") or [""])[0]).strip(), "scope": str((params.get("scope") or [""])[0]).strip()}
 
 
-def request_platform_oauth_token(session: requests.Session, code: str, code_verifier: str) -> dict | None:
+def request_platform_oauth_token(
+    session: requests.Session,
+    code: str,
+    code_verifier: str,
+    client_id: str = platform_oauth_client_id,
+    redirect_uri: str = platform_oauth_redirect_uri,
+) -> dict | None:
     headers = {
         "accept": "*/*",
         "accept-language": "zh-CN,zh;q=0.9",
@@ -318,11 +356,11 @@ def request_platform_oauth_token(session: requests.Session, code: str, code_veri
         f"{auth_base}/api/accounts/oauth/token",
         headers=headers,
         json={
-            "client_id": platform_oauth_client_id,
+            "client_id": client_id,
             "code_verifier": code_verifier,
             "grant_type": "authorization_code",
             "code": code,
-            "redirect_uri": platform_oauth_redirect_uri,
+            "redirect_uri": redirect_uri,
         },
         verify=False,
         timeout=60,
@@ -452,6 +490,42 @@ class PlatformRegistrar:
         step(index, "token 换取完成")
         return tokens
 
+    def _chatgpt_authorize(self, email: str, index: int) -> str:
+        """[已弃用] 早期尝试换 ChatGPT 网页端 client token；实测该 client 为机密客户端，
+        公开 PKCE 无法换 token。现注册流程直接用 platform token 调 mfa/enroll，不再需要本方法。
+        保留占位以防外部引用。"""
+        raise RuntimeError("deprecated: use platform access_token for mfa/enroll directly")
+
+    def _enroll_totp(self, chatgpt_token: str, email: str, index: int) -> dict:
+        """用 chatgpt token 开启 TOTP 2FA：enroll → 算码 → activate，返回 {totp_secret, otpauth_url}。"""
+        from utils.totp import build_otpauth_url, generate_totp
+
+        headers = {
+            "accept": "application/json",
+            "authorization": f"Bearer {chatgpt_token}",
+            "content-type": "application/json",
+            "oai-device-id": self.device_id,
+            "oai-language": "en-US",
+            "origin": chatgpt_base,
+            "referer": f"{chatgpt_base}/",
+            "user-agent": user_agent,
+        }
+        step(index, "开始申请 2FA 密钥")
+        resp, error = request_with_local_retry(self.session, "post", f"{chatgpt_base}/backend-api/accounts/mfa/enroll", json={"factor_type": "totp"}, headers=headers, verify=False)
+        data = _response_json(resp)
+        secret = str(data.get("secret") or "").strip()
+        session_id = str(data.get("session_id") or "").strip()
+        if resp is None or resp.status_code != 200 or not secret or not session_id:
+            raise RuntimeError(error or f"mfa_enroll_failed_{getattr(resp, 'status_code', 'unknown')}")
+        code = generate_totp(secret)
+        step(index, "提交 2FA 验证码")
+        resp2, error2 = request_with_local_retry(self.session, "post", f"{chatgpt_base}/backend-api/accounts/mfa/user/activate_enrollment", json={"code": code, "factor_type": "totp", "session_id": session_id}, headers=headers, verify=False)
+        data2 = _response_json(resp2)
+        if resp2 is None or resp2.status_code != 200 or not data2.get("success"):
+            raise RuntimeError(error2 or f"mfa_activate_failed_{getattr(resp2, 'status_code', 'unknown')}")
+        step(index, "2FA 开启完成")
+        return {"totp_secret": secret, "otpauth_url": build_otpauth_url(secret, email)}
+
     def register(self, index: int) -> dict:
         step(index, "开始创建邮箱")
         mailbox = create_mailbox()
@@ -475,6 +549,13 @@ class PlatformRegistrar:
             self._validate_otp(code, index)
             self._create_account(f"{first_name} {last_name}", _random_birthdate(), index)
             tokens = self._exchange_registered_tokens(index)
+            totp_info: dict = {}
+            if config.get("enable_2fa"):
+                try:
+                    # 注册刚拿到的 platform token pwd_auth_time 新鲜，直接可调 mfa/enroll。
+                    totp_info = self._enroll_totp(str(tokens.get("access_token") or ""), email, index)
+                except Exception as twofa_error:  # noqa: BLE001
+                    step(index, f"2FA 开启失败（不影响注册）：{twofa_error}", "yellow")
         except Exception as error:
             mail_provider.mark_mailbox_result(mailbox, success=False, error=error)
             raise
@@ -488,6 +569,7 @@ class PlatformRegistrar:
             "id_token": str(tokens.get("id_token") or "").strip(),
             "source_type": "web",
             "created_at": datetime.now(timezone.utc).isoformat(),
+            **totp_info,
         }
 
 

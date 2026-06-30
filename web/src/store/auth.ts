@@ -1,5 +1,3 @@
-"use client";
-
 import localforage from "localforage";
 
 export type AuthRole = "admin" | "user";

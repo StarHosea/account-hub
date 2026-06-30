@@ -1,5 +1,22 @@
 import { httpRequest, request } from "@/lib/request";
 
+/** 把参数对象拼成 query string，跳过 undefined/null/空串。 */
+function buildQuery(params: Record<string, string | number | boolean | undefined | null>): string {
+  const usp = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value === undefined || value === null || value === "") continue;
+    usp.set(key, String(value));
+  }
+  const qs = usp.toString();
+  return qs ? `?${qs}` : "";
+}
+
+export type PageParams = {
+  page?: number;
+  page_size?: number;
+};
+
+
 export type AccountType = string;
 export type AccountStatus = "正常" | "限流" | "异常" | "禁用";
 export type AuthRole = "admin" | "user";
@@ -22,6 +39,7 @@ export type Account = {
   }>;
   default_model_slug?: string | null;
   restore_at?: string | null;
+  last_refresh_error?: string | null;
   success: number;
   fail: number;
   image_inflight?: number;
@@ -30,6 +48,11 @@ export type Account = {
   password?: string | null;
   created_at?: string | null;
   mail_link?: string | null;
+  // 2FA (TOTP) 相关字段
+  totp_secret?: string | null;
+  otpauth_url?: string | null;
+  // 导出消费标记
+  used?: boolean;
   // Plus 激活相关字段
   plus_status?: PlusStatus;
   plus_attempts?: { UPI: number; IDEL: number };
@@ -48,8 +71,20 @@ export type AccountImportPayload = {
   [key: string]: unknown;
 };
 
+export type AccountSummary = {
+  total: number;
+  alive: number;
+  dead: number;
+  activated: number;
+  unused: number;
+};
+
 type AccountListResponse = {
   items: Account[];
+  summary: AccountSummary;
+  total: number;
+  page: number;
+  page_size: number;
 };
 
 type AccountMutationResponse = {
@@ -135,9 +170,15 @@ export type MailboxStats = {
   in_use: number;
 };
 
-type MailboxListResponse = {
+type MailboxListPayload = {
   items: Mailbox[];
   stats: MailboxStats;
+};
+
+type MailboxListResponse = MailboxListPayload & {
+  total: number;
+  page: number;
+  page_size: number;
 };
 
 // ── CDKs（Plus CDK 管理）───────────────────────────────────────────
@@ -145,11 +186,24 @@ type MailboxListResponse = {
 export type CdkType = "UPI" | "IDEL";
 export type CdkStatus = "available" | "used" | "invalid";
 
+export type CdkBoundAccount = {
+  email?: string | null;
+  password?: string | null;
+  totp_secret?: string | null;
+  otpauth_url?: string | null;
+  fetch_url?: string | null;
+  status?: string | null;
+  plus_status?: string | null;
+  source_type?: string | null;
+  created_at?: string | null;
+};
+
 export type Cdk = {
   cdk: string;
   type: CdkType;
   status: CdkStatus;
   bound_token: string | null;
+  bound_account?: CdkBoundAccount | null;
   used_at: string | null;
   imported_at: string | null;
   note: string;
@@ -170,9 +224,15 @@ export type CdkCounts = {
   total: number;
 };
 
-type CdkListResponse = {
+type CdkListPayload = {
   items: Cdk[];
   counts: CdkCounts;
+};
+
+type CdkListResponse = CdkListPayload & {
+  total: number;
+  page: number;
+  page_size: number;
 };
 
 // ── Activation（Plus 激活）─────────────────────────────────────────
@@ -252,6 +312,7 @@ export type RegisterConfig = {
   proxy: string;
   total: number;
   threads: number;
+  enable_2fa?: boolean;
   stats: {
     job_id?: string;
     success: number;
@@ -290,8 +351,15 @@ export async function login(authKey: string) {
 
 // ── Accounts ───────────────────────────────────────────────────────
 
-export async function fetchAccounts() {
-  return httpRequest<AccountListResponse>("/api/accounts");
+export type AccountListParams = PageParams & {
+  q?: string;
+  status?: "alive" | "dead";
+  plus?: "activated" | "inactive";
+  used?: boolean;
+};
+
+export async function fetchAccounts(params: AccountListParams = {}) {
+  return httpRequest<AccountListResponse>(`/api/accounts${buildQuery(params)}`);
 }
 
 export async function createAccounts(tokens: string[], accounts: AccountImportPayload[] = []) {
@@ -348,14 +416,69 @@ export async function updateAccount(
   });
 }
 
-// ── Mailboxes ──────────────────────────────────────────────────────
+export type Account2FAProgress = {
+  action: "enable" | "disable";
+  percent: number;
+  message: string;
+  done: boolean;
+  ok: boolean;
+  error?: string | null;
+  items?: Account[] | null;
+  secret?: string | null;
+  otpauth_url?: string | null;
+};
 
-export async function fetchMailboxes() {
-  return httpRequest<MailboxListResponse>("/api/mailboxes");
+export async function enable2FA(accessToken: string) {
+  return httpRequest<{ progress_id: string }>("/api/accounts/2fa/enable", {
+    method: "POST",
+    body: { access_token: accessToken },
+  });
+}
+
+export async function disable2FA(accessToken: string) {
+  return httpRequest<{ progress_id: string }>("/api/accounts/2fa/disable", {
+    method: "POST",
+    body: { access_token: accessToken },
+  });
+}
+
+export async function fetch2FAProgress(progressId: string) {
+  return httpRequest<Account2FAProgress>(`/api/accounts/2fa/progress/${progressId}`);
+}
+
+// 导出账号凭据文本：每行 `邮箱----接码----密码----2FA密钥`。传空数组导出全部。
+export async function exportCredentials(
+  accessTokens: string[],
+  opts: { onlyUnused?: boolean; markUsed?: boolean } = {},
+) {
+  const response = await request.request<string>({
+    url: "/api/accounts/export-credentials",
+    method: "POST",
+    data: { access_tokens: accessTokens, only_unused: !!opts.onlyUnused, mark_used: !!opts.markUsed },
+    responseType: "text",
+  });
+  return response.data;
+}
+
+export async function markAccountsUsed(accessTokens: string[], used: boolean) {
+  return httpRequest<{ updated: number; items: Account[] }>("/api/accounts/mark-used", {
+    method: "POST",
+    body: { access_tokens: accessTokens, used },
+  });
+}
+
+// ── Mailboxes ──────────────────────────────────────────────────────
+export type MailboxListParams = PageParams & {
+  q?: string;
+  status?: "unused" | "used" | "in_use";
+};
+
+export async function fetchMailboxes(params: MailboxListParams = {}) {
+  return httpRequest<MailboxListResponse>(`/api/mailboxes${buildQuery(params)}`);
 }
 
 export async function importMailboxes(text: string) {
-  return httpRequest<MailboxListResponse & { result: { added: number; updated: number; total: number } }>(
+  return httpRequest<MailboxListPayload & { result: { added: number; updated: number; total: number } }>(
     "/api/mailboxes",
     {
       method: "POST",
@@ -365,14 +488,14 @@ export async function importMailboxes(text: string) {
 }
 
 export async function deleteMailboxes(emails: string[]) {
-  return httpRequest<MailboxListResponse & { removed: number }>("/api/mailboxes", {
+  return httpRequest<MailboxListPayload & { removed: number }>("/api/mailboxes", {
     method: "DELETE",
     body: { emails },
   });
 }
 
 export async function markMailboxes(emails: string[], used: boolean) {
-  return httpRequest<MailboxListResponse & { changed: number }>("/api/mailboxes/mark", {
+  return httpRequest<MailboxListPayload & { changed: number }>("/api/mailboxes/mark", {
     method: "POST",
     body: { emails, used },
   });
@@ -380,19 +503,25 @@ export async function markMailboxes(emails: string[], used: boolean) {
 
 // ── CDKs ───────────────────────────────────────────────────────────
 
-export async function fetchCdks() {
-  return httpRequest<CdkListResponse>("/api/cdks");
+export type CdkListParams = PageParams & {
+  q?: string;
+  status?: CdkStatus;
+  type?: CdkType;
+};
+
+export async function fetchCdks(params: CdkListParams = {}) {
+  return httpRequest<CdkListResponse>(`/api/cdks${buildQuery(params)}`);
 }
 
 export async function importCdks(text: string, type: CdkType) {
-  return httpRequest<CdkListResponse & { result: { added: number; updated: number; total: number } }>("/api/cdks", {
+  return httpRequest<CdkListPayload & { result: { added: number; updated: number; total: number } }>("/api/cdks", {
     method: "POST",
     body: { text, type },
   });
 }
 
 export async function deleteCdks(cdks: string[]) {
-  return httpRequest<CdkListResponse & { removed: number }>("/api/cdks", {
+  return httpRequest<CdkListPayload & { removed: number }>("/api/cdks", {
     method: "DELETE",
     body: { cdks },
   });
@@ -542,4 +671,44 @@ export async function testProxy(url?: string) {
     method: "POST",
     body: { url: url ?? "" },
   });
+}
+
+// ── One-click Run（一键运行编排）─────────────────────────────────────
+export type RunStats = {
+  target: number;
+  registered: number;
+  activated: number;
+  failed: number;
+  running: number;
+  phase: string;
+  job_id?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+  updated_at?: string | null;
+};
+
+export type RunLog = { time: string; text: string; level: string };
+
+export type RunState = {
+  running: boolean;
+  stats: RunStats;
+  summary: { free: number; activated: number; activating: number; total: number };
+  cdk: CdkCounts;
+  mailbox_available: number;
+  logs: RunLog[];
+};
+
+export async function fetchRun() {
+  return httpRequest<RunState>("/api/run");
+}
+
+export async function startRun(target: number, autoReplenish: boolean) {
+  return httpRequest<RunState>("/api/run/start", {
+    method: "POST",
+    body: { target, auto_replenish: autoReplenish },
+  });
+}
+
+export async function stopRun() {
+  return httpRequest<RunState>("/api/run/stop", { method: "POST" });
 }

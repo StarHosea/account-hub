@@ -74,6 +74,9 @@ class AccountService:
     # 重新登录进度追踪
     _relogin_progress: dict[str, dict] = {}
     _relogin_progress_lock = Lock()
+    # 2FA 开/关进度追踪
+    _twofa_progress: dict[str, dict] = {}
+    _twofa_progress_lock = Lock()
 
     def __init__(self, storage_backend: StorageBackend):
         self.storage = storage_backend
@@ -275,6 +278,8 @@ class AccountService:
         # 2FA (TOTP) 相关：开启后保存 base32 secret 与 otpauth URL，用于展示和关闭时算码。
         normalized["totp_secret"] = normalized.get("totp_secret") or None
         normalized["otpauth_url"] = normalized.get("otpauth_url") or None
+        # 导出消费标记：账号导出给客户后标记「已用」，便于区分未用库存。
+        normalized["used"] = bool(normalized.get("used"))
         # Plus 激活相关字段（由 activation_service 维护）。
         plus_status = str(normalized.get("plus_status") or "未激活").strip() or "未激活"
         if plus_status not in {"未激活", "排队中", "激活中", "已激活", "激活失败"}:
@@ -638,6 +643,9 @@ class AccountService:
         redirect_uri: str | None = None,
         scope: str | None = None,
         keep_session: bool = False,
+        otp_fetch=None,
+        totp_secret: str | None = None,
+        on_progress=None,
     ) -> dict:
         """通过邮箱+密码登录，返回 {access_token, refresh_token, id_token, ...}
 
@@ -647,6 +655,14 @@ class AccountService:
         """
         from curl_cffi import requests
 
+        def prog(percent, message):
+            if on_progress:
+                try:
+                    on_progress(percent, message)
+                except Exception:
+                    pass
+
+        prog(15, "正在登录账号")
         # 常量
         auth_base = "https://auth.openai.com"
         platform_oauth_audience = "https://api.openai.com/v1"
@@ -804,8 +820,22 @@ class AccountService:
                     page_type = str(page_info.get("type") or "")
                 
                 if page_type == "email_otp_verification":
-                    # 需要验证码才能登录，直接标记为账号异常
-                    return {"ok": False, "error": "need_verification_code", "detail": login_data}
+                    # 登录触发邮箱 OTP 步进验证。若提供了取码回调（账号绑定了可读邮箱），
+                    # 自动发码 → 取码 → 校验，拿到 auth_code 后继续；否则标记需验证码。
+                    if otp_fetch is not None:
+                        prog(35, "等待邮箱验证码")
+                        auth_code = self._complete_login_email_otp(session, device_id, auth_base, user_agent, otp_fetch)
+                    if not auth_code:
+                        return {"ok": False, "error": "need_verification_code", "detail": login_data}
+                elif page_type == "mfa_challenge":
+                    # 账号已开 TOTP 2FA，登录要求验证器码。有存的 secret 时自动算码过 challenge。
+                    if totp_secret:
+                        prog(35, "校验 2FA 动态码")
+                        page_payload = page_info.get("payload") if isinstance(page_info, dict) else {}
+                        factor_id = str((page_payload or {}).get("factor_id") or "")
+                        auth_code = self._complete_login_mfa_challenge(session, device_id, auth_base, user_agent, factor_id, totp_secret)
+                    if not auth_code:
+                        return {"ok": False, "error": "need_mfa_code", "detail": login_data}
                 else:
                     return {"ok": False, "error": "no_auth_code", "detail": login_data}
             
@@ -902,16 +932,136 @@ class AccountService:
             if not keep_alive:
                 session.close()
 
-    def _establish_chatgpt_session(self, email: str, password: str) -> dict:
-        """密码登录拿到 ChatGPT 网页端 client 的新鲜会话 + token（开/关 2FA 用）。"""
-        return self._login_with_password(
-            email,
-            password,
-            client_id=self._OAUTH_CHATGPT_CLIENT_ID,
-            redirect_uri=self._OAUTH_CHATGPT_REDIRECT_URI,
-            scope=self._OAUTH_CHATGPT_SCOPE,
+    def _complete_login_email_otp(self, session, device_id: str, auth_base: str, user_agent: str, otp_fetch) -> str:
+        """登录遇到邮箱 OTP 步进时：发码 → 取码 → 校验，返回 auth_code（失败返回 ""）。"""
+        from urllib.parse import parse_qs, urlparse
+
+        common = {
+            "accept": "application/json",
+            "content-type": "application/json",
+            "oai-device-id": device_id,
+            "origin": auth_base,
+            "referer": f"{auth_base}/email-verification",
+            "user-agent": user_agent,
+        }
+        try:
+            session.get(
+                f"{auth_base}/api/accounts/email-otp/send",
+                headers={"accept": "application/json", "oai-device-id": device_id, "user-agent": user_agent,
+                         "referer": f"{auth_base}/email-verification"},
+                verify=False, timeout=30,
+            )
+        except Exception:
+            pass
+        try:
+            code = otp_fetch()
+        except Exception:
+            code = None
+        if not code:
+            return ""
+        headers = dict(common)
+        try:
+            from utils.sentinel import build_sentinel_token
+            sentinel_val, _ = build_sentinel_token(session, device_id, "authorize_continue")
+            headers["openai-sentinel-token"] = sentinel_val
+        except Exception:
+            pass
+        try:
+            resp = session.post(f"{auth_base}/api/accounts/email-otp/validate", headers=headers, json={"code": code}, verify=False, timeout=30)
+            data = resp.json() if resp.text else {}
+        except Exception:
+            return ""
+        continue_url = str(data.get("continue_url") or "").strip()
+        if not continue_url:
+            return ""
+        return str((parse_qs(urlparse(continue_url).query).get("code") or [""])[0]).strip()
+
+    def _complete_login_mfa_challenge(self, session, device_id: str, auth_base: str, user_agent: str, factor_id: str, totp_secret: str) -> str:
+        """登录遇到 TOTP MFA 挑战时：issue_challenge → 用存的 secret 算码 verify，返回 auth_code。"""
+        from urllib.parse import parse_qs, urlparse
+
+        from utils.totp import generate_totp
+
+        if not factor_id or not totp_secret:
+            return ""
+        headers = {
+            "accept": "application/json",
+            "content-type": "application/json",
+            "oai-device-id": device_id,
+            "origin": auth_base,
+            "referer": f"{auth_base}/mfa-challenge",
+            "user-agent": user_agent,
+        }
+        try:
+            from utils.sentinel import build_sentinel_token
+            sentinel_val, _ = build_sentinel_token(session, device_id, "authorize_continue")
+            headers["openai-sentinel-token"] = sentinel_val
+        except Exception:
+            pass
+        try:
+            session.post(f"{auth_base}/api/accounts/mfa/issue_challenge", headers=headers,
+                         json={"id": factor_id, "type": "totp", "force_fresh_challenge": False}, verify=False, timeout=30)
+        except Exception:
+            pass
+        try:
+            resp = session.post(f"{auth_base}/api/accounts/mfa/verify", headers=headers,
+                                json={"id": factor_id, "type": "totp", "code": generate_totp(totp_secret)}, verify=False, timeout=30)
+            data = resp.json() if resp.text else {}
+        except Exception:
+            return ""
+        continue_url = str(data.get("continue_url") or "").strip()
+        if not continue_url:
+            return ""
+        return str((parse_qs(urlparse(continue_url).query).get("code") or [""])[0]).strip()
+
+    def _mailbox_otp_fetcher(self, email: str):
+        """返回一个从账号绑定邮箱读取登录验证码的回调；无可用邮箱则返回 None。"""
+        try:
+            from services.mailbox_service import mailbox_service
+            from services.register import mail_provider
+        except Exception:
+            return None
+        fetch_url = mailbox_service.get_fetch_url(email)
+        if not fetch_url:
+            return None
+        mail_config = {
+            "request_timeout": 30,
+            "wait_timeout": 90,
+            "wait_interval": 3,
+            "providers": [{"type": mail_provider.API_MAILBOX_TYPE, "enable": True}],
+            "proxy": "",
+        }
+        mailbox = {"provider": mail_provider.API_MAILBOX_TYPE, "address": email, "fetch_url": fetch_url}
+
+        def _fetch():
+            return mail_provider.wait_for_code(mail_config, mailbox)
+
+        return _fetch
+
+    def _establish_chatgpt_session(self, email: str, password: str, totp_secret: str | None = None, on_progress=None) -> dict:
+        """密码登录拿到可调 mfa 接口的新鲜会话 + token（开/关 2FA 用）。
+
+        实测：密码登录（platform client + 必要时邮箱 OTP / TOTP 步进）拿到的 token，pwd_auth_time
+        新鲜，直接就能调 chatgpt.com/backend-api 的 mfa/enroll 等接口——无需再换 ChatGPT 网页端
+        client 的 token（后者是机密客户端，公开 PKCE 的 oauth/token 换不了）。
+
+        totp_secret：账号已开 2FA 时登录会要求验证器码（关闭流程用），传入以自动过 challenge。
+        """
+        login = self._login_with_password(
+            email, password,
             keep_session=True,
+            otp_fetch=self._mailbox_otp_fetcher(email),
+            totp_secret=totp_secret,
+            on_progress=on_progress,
         )
+        if not login.get("ok"):
+            return login
+        return {
+            "ok": True,
+            "session": login.get("session"),
+            "access_token": str(login.get("access_token") or ""),
+            "device_id": str(login.get("device_id") or ""),
+        }
 
     def _mfa_headers(self, token: str, device_id: str) -> dict:
         """chatgpt.com/backend-api 的 mfa 接口请求头（Bearer + device id）。"""
@@ -957,9 +1107,16 @@ class AccountService:
                     return str(item.get("id"))
         return ""
 
-    def enable_2fa(self, access_token: str) -> dict:
+    def enable_2fa(self, access_token: str, on_progress=None) -> dict:
         """为账号开启 TOTP 2FA：密码登录 → enroll → 算码 → activate → 存 secret。"""
         from utils.totp import build_otpauth_url, generate_totp
+
+        def prog(percent, message):
+            if on_progress:
+                try:
+                    on_progress(percent, message)
+                except Exception:
+                    pass
 
         account = self.get_account(access_token)
         if not account:
@@ -971,7 +1128,11 @@ class AccountService:
         if str(account.get("totp_secret") or "").strip():
             return {"ok": False, "error": "already_enabled", "items": self.list_accounts()}
 
-        login = self._establish_chatgpt_session(email, password)
+        prog(10, "正在登录账号")
+        try:
+            login = self._establish_chatgpt_session(email, password, on_progress=on_progress)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": "login_exception", "detail": str(exc), "items": self.list_accounts()}
         if not login.get("ok"):
             return {"ok": False, "error": login.get("error") or "login_failed", "detail": login.get("detail"), "items": self.list_accounts()}
         session = login.get("session")
@@ -979,6 +1140,7 @@ class AccountService:
         device_id = str(login.get("device_id") or "")
         try:
             headers = self._mfa_headers(token, device_id)
+            prog(60, "申请 2FA 密钥")
             resp = session.post(self._MFA_ENROLL_URL, headers=headers, json={"factor_type": "totp"}, timeout=30, verify=False)
             data = resp.json() if resp.text else {}
             secret = str(data.get("secret") or "").strip()
@@ -986,12 +1148,14 @@ class AccountService:
             if resp.status_code != 200 or not secret or not session_id:
                 return {"ok": False, "error": f"enroll_failed_{resp.status_code}", "detail": data, "items": self.list_accounts()}
             code = generate_totp(secret)
+            prog(85, "提交验证码确认开启")
             act = session.post(self._MFA_ACTIVATE_URL, headers=headers, json={"code": code, "factor_type": "totp", "session_id": session_id}, timeout=30, verify=False)
             act_data = act.json() if act.text else {}
             if act.status_code != 200 or not act_data.get("success"):
                 return {"ok": False, "error": f"activate_failed_{act.status_code}", "detail": act_data, "items": self.list_accounts()}
             otpauth = build_otpauth_url(secret, email)
             self.update_account(access_token, {"totp_secret": secret, "otpauth_url": otpauth}, quiet=True)
+            prog(100, "2FA 已开启")
             log_service.add(LOG_TYPE_ACCOUNT, "开启2FA成功", {"token": anonymize_token(access_token)})
             return {"ok": True, "secret": secret, "otpauth_url": otpauth, "items": self.list_accounts()}
         except Exception as exc:  # noqa: BLE001
@@ -1002,9 +1166,16 @@ class AccountService:
             except Exception:
                 pass
 
-    def disable_2fa(self, access_token: str) -> dict:
+    def disable_2fa(self, access_token: str, on_progress=None) -> dict:
         """关闭账号的 TOTP 2FA：密码登录 → 取 factor → (必要时重认证) → disable → 清 secret。"""
         from utils.totp import generate_totp
+
+        def prog(percent, message):
+            if on_progress:
+                try:
+                    on_progress(percent, message)
+                except Exception:
+                    pass
 
         account = self.get_account(access_token)
         if not account:
@@ -1015,7 +1186,11 @@ class AccountService:
         if not email or not password:
             return {"ok": False, "error": "missing_credentials", "items": self.list_accounts()}
 
-        login = self._establish_chatgpt_session(email, password)
+        prog(10, "正在登录账号")
+        try:
+            login = self._establish_chatgpt_session(email, password, totp_secret=secret, on_progress=on_progress)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": "login_exception", "detail": str(exc), "items": self.list_accounts()}
         if not login.get("ok"):
             return {"ok": False, "error": login.get("error") or "login_failed", "detail": login.get("detail"), "items": self.list_accounts()}
         session = login.get("session")
@@ -1023,18 +1198,21 @@ class AccountService:
         device_id = str(login.get("device_id") or "")
         try:
             headers = self._mfa_headers(token, device_id)
+            prog(60, "读取 2FA 信息")
             info = session.get(self._MFA_INFO_URL, headers=headers, timeout=30, verify=False)
             info_data = info.json() if info.text else {}
             factor_id = self._extract_totp_factor_id(info_data)
             if not factor_id:
                 # 远端已无 totp 因子，视为已关闭，清掉本地记录
                 self.update_account(access_token, {"totp_secret": None, "otpauth_url": None}, quiet=True)
+                prog(100, "2FA 已关闭")
                 return {"ok": True, "items": self.list_accounts()}
 
             def _disable():
                 r = session.post(self._MFA_DISABLE_URL, headers=headers, json={"factor_id": factor_id}, timeout=30, verify=False)
                 return r, (r.json() if r.text else {})
 
+            prog(85, "关闭 2FA")
             resp, data = _disable()
             if resp.status_code != 200 and secret:
                 # 需要重认证：issue_challenge + verify（用存的 secret 算当前码），再重试关闭
@@ -1045,6 +1223,7 @@ class AccountService:
             if resp.status_code != 200:
                 return {"ok": False, "error": f"disable_failed_{resp.status_code}", "detail": data, "items": self.list_accounts()}
             self.update_account(access_token, {"totp_secret": None, "otpauth_url": None}, quiet=True)
+            prog(100, "2FA 已关闭")
             log_service.add(LOG_TYPE_ACCOUNT, "关闭2FA成功", {"token": anonymize_token(access_token)})
             return {"ok": True, "items": self.list_accounts()}
         except Exception as exc:  # noqa: BLE001
@@ -1055,7 +1234,58 @@ class AccountService:
             except Exception:
                 pass
 
-    def list_expiring_access_tokens(self) -> list[str]:        with self._lock:
+    def start_2fa_task(self, action: str, access_token: str) -> str:
+        """后台线程跑 enable/disable 2FA，返回 progress_id 供前端轮询阶段进度。"""
+        progress_id = uuid.uuid4().hex
+        with self._twofa_progress_lock:
+            self._twofa_progress[progress_id] = {
+                "action": action, "percent": 0, "message": "准备中",
+                "done": False, "ok": False, "error": None, "items": None,
+                "secret": None, "otpauth_url": None,
+            }
+
+        def _on_progress(percent, message):
+            with self._twofa_progress_lock:
+                p = self._twofa_progress.get(progress_id)
+                if p is not None:
+                    p["percent"] = int(percent)
+                    p["message"] = str(message)
+
+        def _run():
+            try:
+                fn = self.enable_2fa if action == "enable" else self.disable_2fa
+                result = fn(access_token, on_progress=_on_progress)
+            except Exception as exc:  # noqa: BLE001
+                result = {"ok": False, "error": "task_exception", "detail": str(exc), "items": self.list_accounts()}
+            with self._twofa_progress_lock:
+                p = self._twofa_progress.get(progress_id)
+                if p is not None:
+                    err = result.get("error")
+                    detail = result.get("detail")
+                    fail_msg = f"失败：{err or '未知错误'}"
+                    if detail:
+                        fail_msg += f"（{str(detail)[:120]}）"
+                    p.update({
+                        "done": True, "percent": 100,
+                        "ok": bool(result.get("ok")),
+                        "error": err,
+                        "detail": (str(detail)[:300] if detail else None),
+                        "items": result.get("items"),
+                        "secret": result.get("secret"),
+                        "otpauth_url": result.get("otpauth_url"),
+                        "message": ("完成" if result.get("ok") else fail_msg),
+                    })
+
+        Thread(target=_run, daemon=True, name=f"twofa-{action}").start()
+        return progress_id
+
+    def get_2fa_progress(self, progress_id: str) -> dict | None:
+        with self._twofa_progress_lock:
+            progress = self._twofa_progress.get(progress_id)
+            return dict(progress) if progress else None
+
+    def list_expiring_access_tokens(self) -> list[str]:
+        with self._lock:
             return [
                 token
                 for account in self._accounts.values()
@@ -1404,6 +1634,27 @@ class AccountService:
                 log_service.add(LOG_TYPE_ACCOUNT, f"删除 {removed} 个账号", {"removed": removed})
             items = [dict(item) for item in self._accounts.values()]
         return {"removed": removed, "items": items}
+
+    def mark_used(self, tokens: list[str], used: bool) -> dict:
+        """批量标记账号「已用/未用」。返回 {updated, items}。"""
+        target = [t for t in (tokens or []) if t]
+        if not target:
+            return {"updated": 0, "items": self.list_accounts()}
+        updated = 0
+        with self._lock:
+            for token in target:
+                resolved = self._resolve_access_token_locked(token)
+                current = self._accounts.get(resolved)
+                if current is None:
+                    continue
+                if bool(current.get("used")) == bool(used):
+                    continue
+                current["used"] = bool(used)
+                updated += 1
+            if updated:
+                self._save_accounts()
+                log_service.add(LOG_TYPE_ACCOUNT, f"标记账号{'已用' if used else '未用'}", {"count": updated})
+        return {"updated": updated, "items": self.list_accounts()}
 
     def update_account(self, access_token: str, updates: dict, quiet: bool = False) -> dict | None:
         if not access_token:

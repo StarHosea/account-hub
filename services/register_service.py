@@ -36,6 +36,7 @@ def _default_config() -> dict:
         "total": 10,
         "threads": 3,
         "enabled": False,
+        "enable_2fa": True,
         "stats": {
             "success": 0,
             "fail": 0,
@@ -92,6 +93,8 @@ def _normalize(raw: dict) -> dict:
         "providers": _normalize_providers(mail),
     }
     cfg["enabled"] = bool(raw.get("enabled"))
+    # 缺失时回退到默认（现默认开），避免旧配置文件没有该键就被强制关掉。
+    cfg["enable_2fa"] = bool(raw.get("enable_2fa", cfg["enable_2fa"]))
     base_stats = _default_config()["stats"]
     raw_stats = raw.get("stats") if isinstance(raw.get("stats"), dict) else {}
     cfg["stats"] = {**base_stats, **{k: raw_stats[k] for k in base_stats if k in raw_stats}, "threads": cfg["threads"]}
@@ -124,7 +127,7 @@ class RegisterService:
             return json.loads(json.dumps({**self._config, "logs": self._logs[-300:]}, ensure_ascii=False))
 
     def _push_to_worker(self) -> None:
-        openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
+        openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads", "enable_2fa")})
 
     def update(self, updates: dict) -> dict:
         with self._lock:

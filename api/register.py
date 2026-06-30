@@ -16,6 +16,7 @@ class RegisterConfigRequest(BaseModel):
     proxy: str | None = None
     total: int | None = None
     threads: int | None = None
+    enable_2fa: bool | None = None
 
 
 def create_router() -> APIRouter:

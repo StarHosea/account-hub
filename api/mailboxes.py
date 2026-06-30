@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Header
+from fastapi import APIRouter, Header, Query
 from pydantic import BaseModel
 
 from api.support import require_admin
@@ -20,6 +20,11 @@ class MailboxMarkRequest(BaseModel):
     used: bool = True
 
 
+def _paginate(seq: list[dict], page: int, page_size: int) -> list[dict]:
+    start = (page - 1) * page_size
+    return seq[start : start + page_size]
+
+
 def _payload() -> dict:
     return {"items": mailbox_service.list_mailboxes(), "stats": mailbox_service.stats()}
 
@@ -28,9 +33,40 @@ def create_router() -> APIRouter:
     router = APIRouter()
 
     @router.get("/api/mailboxes")
-    async def list_mailboxes(authorization: str | None = Header(default=None)):
+    async def list_mailboxes(
+        authorization: str | None = Header(default=None),
+        q: str | None = Query(default=None),
+        status: str | None = Query(default=None),
+        page: int = Query(default=1, ge=1),
+        page_size: int = Query(default=10, ge=1, le=200),
+    ):
         require_admin(authorization)
-        return _payload()
+        items = mailbox_service.list_mailboxes()
+        stats = mailbox_service.stats()  # 全库口径，不随筛选变化
+
+        keyword = (q or "").strip().lower()
+        if keyword:
+            items = [
+                m
+                for m in items
+                if keyword in str(m.get("email") or "").lower()
+                or keyword in str(m.get("fetch_url") or "").lower()
+            ]
+        if status == "in_use":
+            items = [m for m in items if m.get("in_use") and not m.get("used")]
+        elif status == "used":
+            items = [m for m in items if m.get("used")]
+        elif status == "unused":
+            items = [m for m in items if not m.get("used") and not m.get("in_use")]
+
+        total = len(items)
+        return {
+            "items": _paginate(items, page, page_size),
+            "stats": stats,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        }
 
     @router.post("/api/mailboxes")
     async def import_mailboxes(body: MailboxImportRequest, authorization: str | None = Header(default=None)):

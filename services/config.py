@@ -250,6 +250,14 @@ class ConfigStore:
         return _normalize_auth_key(os.getenv("CHATGPT2API_AUTH_KEY") or self.data.get("auth-key"))
 
     @property
+    def admin_path(self) -> str:
+        """管理后台的隐藏访问路径（部署时用环境变量 ADMIN_PATH 配置一个私密路径）。
+        归一化为以 / 开头、无尾部斜杠。默认 /mhx-plus-admin（生产务必改成私密值）。"""
+        raw = str(os.getenv("ADMIN_PATH") or self.data.get("admin_path") or "/mhx-plus-admin").strip()
+        raw = "/" + raw.strip("/")
+        return raw if raw != "/" else "/mhx-plus-admin"
+
+    @property
     def cdk_activation(self) -> dict:
         """Plus CDK 兑换/激活配置。API Key 仅存后端，优先取环境变量。"""
         raw = self.data.get("cdk_activation")
@@ -262,12 +270,15 @@ class ConfigStore:
             "poll_timeout": max(30.0, float(raw.get("poll_timeout") or 1800.0)),
             "max_attempts_per_type": max(1, int(raw.get("max_attempts_per_type") or 3)),
             "auto_activate_after_register": bool(raw.get("auto_activate_after_register")),
+            # 一键运行编排：目标激活数（消耗 CDK 数）、账号不足是否自动补注册
+            "target": max(0, int(raw.get("target") or 0)),
+            "auto_replenish": bool(raw.get("auto_replenish", True)),
         }
 
     def update_cdk_activation(self, updates: dict) -> dict:
         current = self.data.get("cdk_activation")
         current = dict(current) if isinstance(current, dict) else {}
-        for key in ("base_url", "api_key", "concurrency", "poll_interval", "poll_timeout", "max_attempts_per_type", "auto_activate_after_register"):
+        for key in ("base_url", "api_key", "concurrency", "poll_interval", "poll_timeout", "max_attempts_per_type", "auto_activate_after_register", "target", "auto_replenish"):
             if key in updates and updates[key] is not None:
                 current[key] = updates[key]
         self.data["cdk_activation"] = current
@@ -356,17 +367,13 @@ class ConfigStore:
 
     @property
     def auto_remove_invalid_accounts(self) -> bool:
-        value = self.data.get("auto_remove_invalid_accounts", False)
-        if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "yes", "on"}
-        return bool(value)
+        # 已下线：失效账号不再自动移除（保留库存，由人工/导出流程处理）。
+        return False
 
     @property
     def auto_remove_rate_limited_accounts(self) -> bool:
-        value = self.data.get("auto_remove_rate_limited_accounts", False)
-        if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "yes", "on"}
-        return bool(value)
+        # 已下线：限流账号不再自动移除（限流仅是额度问题，账号仍存活）。
+        return False
 
     @property
     def auto_relogin_after_refresh(self) -> bool:

@@ -261,12 +261,13 @@ class ConfigStore:
             "poll_interval": max(1.0, float(raw.get("poll_interval") or 5.0)),
             "poll_timeout": max(30.0, float(raw.get("poll_timeout") or 1800.0)),
             "max_attempts_per_type": max(1, int(raw.get("max_attempts_per_type") or 3)),
+            "auto_activate_after_register": bool(raw.get("auto_activate_after_register")),
         }
 
     def update_cdk_activation(self, updates: dict) -> dict:
         current = self.data.get("cdk_activation")
         current = dict(current) if isinstance(current, dict) else {}
-        for key in ("base_url", "api_key", "concurrency", "poll_interval", "poll_timeout", "max_attempts_per_type"):
+        for key in ("base_url", "api_key", "concurrency", "poll_interval", "poll_timeout", "max_attempts_per_type", "auto_activate_after_register"):
             if key in updates and updates[key] is not None:
                 current[key] = updates[key]
         self.data["cdk_activation"] = current

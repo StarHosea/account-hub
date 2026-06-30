@@ -79,6 +79,7 @@ type SettingsStore = {
     key: "base_url" | "api_key" | "concurrency" | "poll_interval" | "poll_timeout" | "max_attempts_per_type",
     value: string,
   ) => void;
+  setActivationAutoActivate: (value: boolean) => void;
   saveActivationConfig: () => Promise<void>;
 };
 
@@ -347,6 +348,14 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     });
   },
 
+  setActivationAutoActivate: (value) => {
+    set((state) =>
+      state.activationConfig
+        ? { activationConfig: { ...state.activationConfig, auto_activate_after_register: value } }
+        : {},
+    );
+  },
+
   saveActivationConfig: async () => {
     const { activationConfig } = get();
     if (!activationConfig) return;
@@ -358,6 +367,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         poll_interval: Math.max(1, Number(activationConfig.poll_interval) || 1),
         poll_timeout: Math.max(1, Number(activationConfig.poll_timeout) || 1),
         max_attempts_per_type: Math.max(1, Number(activationConfig.max_attempts_per_type) || 1),
+        auto_activate_after_register: Boolean(activationConfig.auto_activate_after_register),
         // 仅在用户填写了新 api_key 时提交（写入式字段）
         ...(activationConfig.api_key ? { api_key: activationConfig.api_key } : {}),
       });

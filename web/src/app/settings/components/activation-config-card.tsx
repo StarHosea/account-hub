@@ -14,6 +14,7 @@ export function ActivationConfigCard() {
   const isLoading = useSettingsStore((state) => state.isLoadingActivationConfig);
   const isSaving = useSettingsStore((state) => state.isSavingActivationConfig);
   const setField = useSettingsStore((state) => state.setActivationConfigField);
+  const setAutoActivate = useSettingsStore((state) => state.setActivationAutoActivate);
   const save = useSettingsStore((state) => state.saveActivationConfig);
 
   return (
@@ -94,6 +95,21 @@ export function ActivationConfigCard() {
                 />
               </div>
             </div>
+
+            <label className="flex items-start gap-3 rounded-xl border border-stone-200 bg-stone-50/60 p-4">
+              <input
+                type="checkbox"
+                checked={Boolean(config?.auto_activate_after_register)}
+                onChange={(event) => setAutoActivate(event.target.checked)}
+                className="mt-0.5 size-4 accent-stone-900"
+              />
+              <span className="text-sm">
+                <span className="font-medium text-stone-800">注册成功后自动激活 Plus</span>
+                <span className="mt-0.5 block text-xs text-stone-500">
+                  注册机每注册成功一个账号，若有可用 CDK 且已配置 API Key，自动匹配 CDK 尝试激活 Plus（UPI/IDEL 各 3 次）。
+                </span>
+              </span>
+            </label>
 
             <div className="flex justify-end">
               <Button

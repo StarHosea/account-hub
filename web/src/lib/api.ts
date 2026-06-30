@@ -207,6 +207,7 @@ export type ActivationConfig = {
   max_attempts_per_type: number;
   api_key: string;
   has_api_key: boolean;
+  auto_activate_after_register: boolean;
 };
 
 export type ActivationState = {
@@ -425,6 +426,7 @@ export async function updateActivationConfig(updates: Partial<{
   poll_interval: number;
   poll_timeout: number;
   max_attempts_per_type: number;
+  auto_activate_after_register: boolean;
 }>) {
   return httpRequest<{ config: ActivationConfig }>("/api/activation/config", {
     method: "POST",

@@ -110,6 +110,35 @@ class ActivationService:
         self._append_log("已请求停止激活任务，正在等待当前任务结束", "yellow")
         return self.get()
 
+    def activate_token_async(self, token: str) -> bool:
+        """注册成功后由注册机调用：若开启「注册后自动激活」且配置了 API Key，
+        起一个后台线程对单个账号尝试激活（不影响批量激活任务）。返回是否已派发。
+        """
+        cfg = config.cdk_activation
+        if not cfg.get("auto_activate_after_register"):
+            return False
+        if not cfg["api_key"]:
+            self._append_log("已开启注册后自动激活，但未配置 CDK API Key，跳过", "yellow")
+            return False
+        if cdk_service.counts().get("available", 0) <= 0:
+            self._append_log("已开启注册后自动激活，但当前无可用 CDK，跳过", "yellow")
+            return False
+
+        def _worker():
+            client = CdkRedeemClient(cfg["base_url"], cfg["api_key"])
+            try:
+                self._activate_account(client, token, cfg)
+            except AuthError as exc:
+                self._append_log(f"自动激活鉴权失败：{exc}", "red")
+            except Exception as exc:  # noqa: BLE001
+                self._append_log(f"自动激活异常：{exc}", "red")
+            finally:
+                client.close()
+
+        threading.Thread(target=_worker, daemon=True, name=f"auto-activate-{token[:8]}").start()
+        self._append_log(f"注册成功后已自动派发激活：{token[:8]}…", "")
+        return True
+
     def _resolve_targets(self, tokens: list[str] | None) -> list[str]:
         accounts = account_service.list_accounts()
         by_token = {a.get("access_token"): a for a in accounts}

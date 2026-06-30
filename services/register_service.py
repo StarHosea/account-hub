@@ -174,6 +174,17 @@ class RegisterService:
             self._logs.append({"time": _now(), "text": str(text), "level": str(color or "info")})
             self._logs = self._logs[-300:]
 
+    def _maybe_auto_activate(self, result: dict) -> None:
+        """注册成功后，若开启「注册后自动激活」，派发该账号的 Plus 激活（懒加载避免循环依赖）。"""
+        token = str((result.get("result") or {}).get("access_token") or "").strip()
+        if not token:
+            return
+        try:
+            from services.activation_service import activation_service
+            activation_service.activate_token_async(token)
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"自动激活派发失败：{exc}", "red")
+
     def _pool_metrics(self) -> dict:
         items = account_service.list_accounts()
         normal = [item for item in items if item.get("status") == "正常"]
@@ -215,8 +226,11 @@ class RegisterService:
                     done += 1
                     try:
                         result = future.result()
-                        success += 1 if result.get("ok") else 0
-                        fail += 0 if result.get("ok") else 1
+                        if result.get("ok"):
+                            success += 1
+                            self._maybe_auto_activate(result)
+                        else:
+                            fail += 1
                     except Exception:
                         fail += 1
         self._bump(running=0, done=done, success=success, fail=fail, finished_at=_now(), **self._pool_metrics())

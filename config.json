@@ -76,6 +76,9 @@
   "auto_relogin_after_refresh": false,
   "image_timeout_retry_secs": 30,
   "cdk_activation": {
-    "auto_activate_after_register": false
+    "auto_activate_after_register": false,
+    "base_url": "https://chong.nerver.cc",
+    "api_key": "mock-key",
+    "poll_interval": 2.0
   }
 }

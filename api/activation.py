@@ -23,6 +23,7 @@ class ActivationConfigRequest(BaseModel):
     poll_interval: float | None = None
     poll_timeout: float | None = None
     max_attempts_per_type: int | None = None
+    auto_activate_after_register: bool | None = None
 
 
 def _safe_config() -> dict:

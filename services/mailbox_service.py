@@ -115,6 +115,12 @@ class MailboxService:
         with self._lock:
             return [self._public(item) for item in self._mailboxes.values()]
 
+    def get_fetch_url(self, email: str) -> str | None:
+        """按邮箱取「取件地址」，供号池列表展示邮件链接。"""
+        with self._lock:
+            item = self._mailboxes.get(_norm_email(email))
+            return item["fetch_url"] if item else None
+
     def stats(self) -> dict[str, int]:
         with self._lock:
             total = len(self._mailboxes)

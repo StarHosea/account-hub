@@ -27,6 +27,9 @@ export type Account = {
   image_inflight?: number;
   last_used_at?: string | null;
   proxy?: string | null;
+  password?: string | null;
+  created_at?: string | null;
+  mail_link?: string | null;
   // Plus 激活相关字段
   plus_status?: PlusStatus;
   plus_attempts?: { UPI: number; IDEL: number };

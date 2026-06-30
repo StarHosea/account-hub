@@ -18,6 +18,7 @@ from services.auth_service import auth_service
 
 from api.support import require_admin
 from services.account_service import account_service
+from services.mailbox_service import mailbox_service
 
 
 
@@ -147,7 +148,10 @@ def create_router() -> APIRouter:
     @router.get("/api/accounts")
     async def get_accounts(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"items": account_service.list_accounts()}
+        items = account_service.list_accounts()
+        for item in items:
+            item["mail_link"] = mailbox_service.get_fetch_url(str(item.get("email") or "")) or None
+        return {"items": items}
 
     @router.post("/api/accounts")
     async def create_accounts(body: AccountCreateRequest, authorization: str | None = Header(default=None)):

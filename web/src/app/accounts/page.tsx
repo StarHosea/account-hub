@@ -145,9 +145,18 @@ function formatRestoreAt(value?: string | null) {
   return { absolute, relative };
 }
 
+function formatDateTime(value?: string | null) {
+  if (!value) return "—";
+  // 后端时间为不带时区的 UTC ISO 串，补 Z 以本地时区显示。
+  const raw = /[zZ]|[+-]\d{2}:?\d{2}$/.test(value) ? value : `${value}Z`;
+  const date = new Date(raw);
+  if (Number.isNaN(date.getTime())) return String(value).slice(0, 16).replace("T", " ");
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
 function maskToken(token?: string) {
-  if (!token) return "—";
-  if (token.length <= 18) return token;
+  if (!token) return "—";  if (token.length <= 18) return token;
   return `${token.slice(0, 16)}...${token.slice(-8)}`;
 }
 
@@ -1153,24 +1162,17 @@ function AccountsPageContent() {
                         onCheckedChange={(checked) => toggleSelectAll(Boolean(checked))}
                       />
                     </th>
-                    <th className="w-56 px-4 py-3">token</th>
-                    <th className="w-28 px-4 py-3">类型</th>
-                    <th className="w-24 px-4 py-3">来源</th>
-                    <th className="w-24 px-4 py-3">状态</th>
-                    <th className="w-56 px-4 py-3">账号信息</th>
+                    <th className="w-64 px-4 py-3">邮箱</th>
+                    <th className="w-56 px-4 py-3">状态</th>
+                    <th className="w-44 px-4 py-3">密码</th>
+                    <th className="w-44 px-4 py-3">邮件链接</th>
                     <th className="w-32 px-4 py-3">创建时间</th>
-                    <th className="w-40 px-4 py-3">Plus进度</th>
-                    <th className="w-40 px-4 py-3">恢复时间</th>
-                    <th className="w-18 px-4 py-3">成功</th>
-                    <th className="w-18 px-4 py-3">失败</th>
+                    <th className="w-32 px-4 py-3">激活时间</th>
                     <th className="w-24 px-4 py-3">操作</th>
                   </tr>
                 </thead>
                 <tbody>
                   {currentRows.map((account) => {
-                    const status = statusMeta[account.status];
-                    const StatusIcon = status.icon;
-
                     return (
                       <tr
                         key={account.access_token}
@@ -1190,87 +1192,102 @@ function AccountsPageContent() {
                         </td>
                         <td className="px-4 py-3">
                           <div className="flex items-center gap-2">
-                            <span className="font-medium tracking-tight text-stone-700">
-                              {maskToken(account.access_token)}
+                            <span className="text-sm font-medium tracking-tight text-stone-700">
+                              {account.email ?? "—"}
                             </span>
-                            <button
-                              type="button"
-                              className="rounded-lg p-1 text-stone-400 transition hover:bg-stone-100 hover:text-stone-700"
-                              onClick={() => {
-                                void navigator.clipboard.writeText(account.access_token);
-                                toast.success("token 已复制");
-                              }}
-                            >
-                              <Copy className="size-4" />
-                            </button>
+                            {account.email ? (
+                              <button
+                                type="button"
+                                className="rounded-lg p-1 text-stone-400 transition hover:bg-stone-100 hover:text-stone-700"
+                                onClick={() => {
+                                  void navigator.clipboard.writeText(account.email ?? "");
+                                  toast.success("邮箱已复制");
+                                }}
+                              >
+                                <Copy className="size-4" />
+                              </button>
+                            ) : null}
                           </div>
-                        </td>
-                        <td className="px-4 py-3">
-                          <Badge variant="secondary" className="rounded-md bg-stone-100 text-stone-700">
-                            {displayAccountType(account)}
-                          </Badge>
-                        </td>
-                        <td className="px-4 py-3">
-                          <Badge variant="outline" className="rounded-md border-stone-200 text-stone-600">
-                            {displayAccountSource(account)}
-                          </Badge>
-                        </td>
-                        <td className="px-4 py-3">
-                          <Badge
-                            variant={status.badge}
-                            className="inline-flex items-center gap-1 rounded-md px-2 py-1"
-                          >
-                            <StatusIcon className="size-3.5" />
-                            {account.status}
-                          </Badge>
-                        </td>
-                        <td className="px-4 py-3">
-                          <div className="text-xs leading-5 text-stone-500">{account.email ?? "—"}</div>
-                        </td>
-                        <td className="px-4 py-3 text-xs leading-5 text-stone-500">
-                          {(() => {
-                            const raw = (account as any).created_at;
-                            if (!raw) return "—";
-                            try {
-                              const d = new Date(raw + "Z");
-                              if (isNaN(d.getTime())) return String(raw).slice(0, 10);
-                              return d.toLocaleDateString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
-                            } catch { return String(raw).slice(0, 10); }
-                          })()}
                         </td>
                         <td className="px-4 py-3">
                           {(() => {
                             const plusStatus: PlusStatus = account.plus_status ?? "未激活";
+                            const valid = account.status === "正常";
                             return (
-                              <div className="space-y-0.5">
-                                <Badge variant={plusStatusBadge[plusStatus]} className="rounded-md">
-                                  {plusStatus}
+                              <div className="flex flex-wrap items-center gap-1">
+                                <Badge variant="success" className="rounded-md">注册成功</Badge>
+                                {plusStatus === "已激活" ? (
+                                  <Badge variant="success" className="rounded-md">激活成功</Badge>
+                                ) : (
+                                  <Badge variant={plusStatusBadge[plusStatus]} className="rounded-md" title={account.plus_last_message ?? undefined}>
+                                    {plusStatus}
+                                  </Badge>
+                                )}
+                                <Badge variant={valid ? "secondary" : "destructive"} className="rounded-md">
+                                  {valid ? "有效" : account.status}
                                 </Badge>
-                                {account.plus_last_message ? (
-                                  <div
-                                    className="max-w-[160px] truncate text-[11px] leading-4 text-stone-400"
-                                    title={account.plus_last_message}
-                                  >
-                                    {account.plus_last_message}
-                                  </div>
-                                ) : null}
+                              </div>
+                            );
+                          })()}
+                        </td>
+                        <td className="px-4 py-3">
+                          {(() => {
+                            const pwd = (account as { password?: string }).password;
+                            if (!pwd) return <span className="text-xs text-stone-400">—</span>;
+                            return (
+                              <div className="flex items-center gap-2">
+                                <span className="font-mono text-xs text-stone-600">{pwd}</span>
+                                <button
+                                  type="button"
+                                  className="rounded-lg p-1 text-stone-400 transition hover:bg-stone-100 hover:text-stone-700"
+                                  onClick={() => {
+                                    void navigator.clipboard.writeText(pwd);
+                                    toast.success("密码已复制");
+                                  }}
+                                >
+                                  <Copy className="size-4" />
+                                </button>
+                              </div>
+                            );
+                          })()}
+                        </td>
+                        <td className="px-4 py-3">
+                          {(() => {
+                            const link = (account as { mail_link?: string | null }).mail_link;
+                            if (!link) return <span className="text-xs text-stone-400">—</span>;
+                            return (
+                              <div className="flex items-center gap-2">
+                                <a
+                                  href={link}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="max-w-[150px] truncate text-xs text-blue-600 hover:underline"
+                                  title={link}
+                                >
+                                  查看收件
+                                </a>
+                                <button
+                                  type="button"
+                                  className="rounded-lg p-1 text-stone-400 transition hover:bg-stone-100 hover:text-stone-700"
+                                  onClick={() => {
+                                    void navigator.clipboard.writeText(link);
+                                    toast.success("邮件链接已复制");
+                                  }}
+                                >
+                                  <Copy className="size-4" />
+                                </button>
                               </div>
                             );
                           })()}
                         </td>
                         <td className="px-4 py-3 text-xs leading-5 text-stone-500">
-                          {(() => {
-                            const restore = formatRestoreAt(account.restore_at);
-                            return (
-                              <div className="space-y-0.5">
-                                {restore.relative ? <div className="font-medium text-stone-700">{restore.relative}</div> : null}
-                                <div>{restore.absolute}</div>
-                              </div>
-                            );
-                          })()}
+                          {formatDateTime((account as { created_at?: string }).created_at)}
                         </td>
-                        <td className="px-4 py-3 text-stone-500">{account.success}</td>
-                        <td className="px-4 py-3 text-stone-500">{account.fail}</td>
+                        <td className="px-4 py-3 text-xs leading-5 text-stone-500">
+                          {account.plus_status === "已激活"
+                            ? formatDateTime(account.plus_updated_at ?? undefined)
+                            : "—"}
+                        </td>
                         <td className="px-4 py-3">
                           <div className="flex items-center gap-1 text-stone-400">
                             <button

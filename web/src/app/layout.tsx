@@ -5,8 +5,8 @@ import { ThemeScript } from "@/components/theme-script";
 import { TopNav } from "@/components/top-nav";
 
 export const metadata: Metadata = {
-  title: "航海一号",
-  description: "航海一号 管理后台",
+  title: "小海豚",
+  description: "小海豚 管理后台",
 };
 
 export const viewport: Viewport = {

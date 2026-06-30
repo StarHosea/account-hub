@@ -15,7 +15,7 @@ const adminNavItems = [
   { href: "/accounts", label: "号池管理" },
   { href: "/register", label: "注册机" },
   { href: "/mailboxes", label: "邮箱管理" },
-  { href: "/cdks", label: "Plus CDK管理" },
+  { href: "/cdks", label: "CDK 管理" },
   { href: "/settings", label: "设置" },
 ];
 
@@ -76,7 +76,7 @@ export function TopNav() {
             </SheetTrigger>
             <SheetContent side="left">
               <SheetHeader>
-                <SheetTitle>航海一号</SheetTitle>
+                <SheetTitle>小海豚</SheetTitle>
                 <span className="text-xs text-stone-500 dark:text-stone-400">{roleLabel} · {displayName}</span>
               </SheetHeader>
               <nav className="mt-8 flex flex-col gap-1">
@@ -110,7 +110,7 @@ export function TopNav() {
             href="/accounts"
             className="shrink-0 py-1 text-[15px] font-bold tracking-tight text-stone-950 transition hover:text-stone-700 dark:text-stone-50 dark:hover:text-white"
           >
-            航海一号
+            小海豚
           </Link>
           <HeaderActions className="ml-auto sm:hidden" />
         </div>

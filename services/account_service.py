@@ -48,6 +48,20 @@ class AccountService:
     _TOKEN_REFRESH_ERROR_BACKOFF_SECONDS = 5 * 60
     _OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
     _OAUTH_CLIENT_ID = "app_2SKx67EdpoN0G6j64rFvigXD"
+    # ChatGPT 网页端 OAuth client：开/关 2FA 的 mfa 接口要求此 client 签发的 token，
+    # 与上面 platform client 不通用（抓包逆向自 chatgpt.com 网页端）。
+    _OAUTH_CHATGPT_CLIENT_ID = "app_X8zY6vW2pQ9tR3dE7nK1jL5gH"
+    _OAUTH_CHATGPT_REDIRECT_URI = "https://chatgpt.com/api/auth/callback/openai"
+    _OAUTH_CHATGPT_SCOPE = (
+        "openid email profile offline_access model.request model.read "
+        "organization.read organization.write"
+    )
+    _MFA_ENROLL_URL = "https://chatgpt.com/backend-api/accounts/mfa/enroll"
+    _MFA_ACTIVATE_URL = "https://chatgpt.com/backend-api/accounts/mfa/user/activate_enrollment"
+    _MFA_INFO_URL = "https://chatgpt.com/backend-api/accounts/mfa_info"
+    _MFA_DISABLE_URL = "https://chatgpt.com/backend-api/accounts/mfa/user/disable_in_house"
+    _MFA_ISSUE_CHALLENGE_URL = "https://auth.openai.com/api/accounts/mfa/issue_challenge"
+    _MFA_VERIFY_URL = "https://auth.openai.com/api/accounts/mfa/verify"
     _OAUTH_USER_AGENT = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -258,6 +272,9 @@ class AccountService:
         normalized["last_token_refresh_error"] = normalized.get("last_token_refresh_error") or None
         normalized["last_token_refresh_error_at"] = normalized.get("last_token_refresh_error_at") or None
         normalized["created_at"] = normalized.get("created_at") or AccountService._now()
+        # 2FA (TOTP) 相关：开启后保存 base32 secret 与 otpauth URL，用于展示和关闭时算码。
+        normalized["totp_secret"] = normalized.get("totp_secret") or None
+        normalized["otpauth_url"] = normalized.get("otpauth_url") or None
         # Plus 激活相关字段（由 activation_service 维护）。
         plus_status = str(normalized.get("plus_status") or "未激活").strip() or "未激活"
         if plus_status not in {"未激活", "排队中", "激活中", "已激活", "激活失败"}:
@@ -612,18 +629,35 @@ class AccountService:
             if progress_id:
                 self.update_relogin_progress(progress_id, access_token, "异常", str(exc))
 
-    def _login_with_password(self, email: str, password: str) -> dict:
-        """通过邮箱+密码登录，返回 {access_token, refresh_token, id_token, ...}"""
+    def _login_with_password(
+        self,
+        email: str,
+        password: str,
+        *,
+        client_id: str | None = None,
+        redirect_uri: str | None = None,
+        scope: str | None = None,
+        keep_session: bool = False,
+    ) -> dict:
+        """通过邮箱+密码登录，返回 {access_token, refresh_token, id_token, ...}
+
+        默认走 platform client（与注册流程一致）。传入 client_id/redirect_uri/scope
+        可换成 ChatGPT 网页端 client（开/关 2FA 用）。keep_session=True 时成功返回里
+        附带存活的 session（调用方负责 close），用于后续带 cookie 的 mfa 重认证请求。
+        """
         from curl_cffi import requests
-        
+
         # 常量
         auth_base = "https://auth.openai.com"
         platform_oauth_audience = "https://api.openai.com/v1"
         platform_auth0_client = "eyJuYW1lIjoiYXV0aDAtc3BhLWpzIiwidmVyc2lvbiI6IjEuMjEuMCJ9"
-        platform_oauth_client_id = self._OAUTH_CLIENT_ID
-        platform_oauth_redirect_uri = "https://platform.openai.com/auth/callback"
+        platform_oauth_client_id = client_id or self._OAUTH_CLIENT_ID
+        platform_oauth_redirect_uri = redirect_uri or "https://platform.openai.com/auth/callback"
+        oauth_scope = scope or "openid profile email offline_access"
+        app_base = "https://chatgpt.com" if "chatgpt.com" in platform_oauth_redirect_uri else "https://platform.openai.com"
         user_agent = self._OAUTH_USER_AGENT
-        
+        keep_alive = False  # 仅在成功且 keep_session 时置 True，避免 finally 误关存活 session
+
         # 创建 session
         session_kwargs = {"impersonate": "chrome110", "verify": False}
         proxy = config.get_proxy_settings()
@@ -652,7 +686,7 @@ class AccountService:
                 "screen_hint": "login_or_signup",
                 "max_age": "0",
                 "login_hint": email,
-                "scope": "openid profile email offline_access",
+                "scope": oauth_scope,
                 "response_type": "code",
                 "response_mode": "query",
                 "state": secrets.token_urlsafe(32),
@@ -776,7 +810,7 @@ class AccountService:
                     return {"ok": False, "error": "no_auth_code", "detail": login_data}
             
             # ④ 用 code 换 token (使用 Platform Client + code_verifier，与注册流程相同)
-            platform_base = "https://platform.openai.com"
+            platform_base = app_base
             token_resp = session.post(
                 f"{auth_base}/api/accounts/oauth/token",
                 headers={
@@ -856,15 +890,172 @@ class AccountService:
                 "id_token": id_token,
                 "expires_at": jwt_payload.get("exp"),
                 "source_type": "password",
+                "device_id": device_id,
             }
-            
-            return result
-        
-        finally:
-            session.close()
+            if keep_session:
+                result["session"] = session
+                keep_alive = True
 
-    def list_expiring_access_tokens(self) -> list[str]:
-        with self._lock:
+            return result
+
+        finally:
+            if not keep_alive:
+                session.close()
+
+    def _establish_chatgpt_session(self, email: str, password: str) -> dict:
+        """密码登录拿到 ChatGPT 网页端 client 的新鲜会话 + token（开/关 2FA 用）。"""
+        return self._login_with_password(
+            email,
+            password,
+            client_id=self._OAUTH_CHATGPT_CLIENT_ID,
+            redirect_uri=self._OAUTH_CHATGPT_REDIRECT_URI,
+            scope=self._OAUTH_CHATGPT_SCOPE,
+            keep_session=True,
+        )
+
+    def _mfa_headers(self, token: str, device_id: str) -> dict:
+        """chatgpt.com/backend-api 的 mfa 接口请求头（Bearer + device id）。"""
+        return {
+            "accept": "application/json",
+            "authorization": f"Bearer {token}",
+            "content-type": "application/json",
+            "oai-device-id": device_id,
+            "oai-language": "en-US",
+            "origin": "https://chatgpt.com",
+            "referer": "https://chatgpt.com/",
+            "user-agent": self._OAUTH_USER_AGENT,
+        }
+
+    def _mfa_auth_headers(self, device_id: str, session) -> dict:
+        """auth.openai.com 上 challenge/verify 重认证请求头（带 sentinel）。"""
+        headers = {
+            "accept": "application/json",
+            "content-type": "application/json",
+            "oai-device-id": device_id,
+            "origin": "https://auth.openai.com",
+            "referer": "https://auth.openai.com/",
+            "user-agent": self._OAUTH_USER_AGENT,
+        }
+        try:
+            from utils.sentinel import build_sentinel_token
+            sentinel_val, _ = build_sentinel_token(session, device_id, "authorize_continue")
+            headers["openai-sentinel-token"] = sentinel_val
+        except Exception:
+            pass
+        return headers
+
+    @staticmethod
+    def _extract_totp_factor_id(info_data: dict) -> str:
+        """从 mfa_info 响应里取已激活的 totp 因子 id。"""
+        if not isinstance(info_data, dict):
+            return ""
+        factors = info_data.get("factors")
+        totp_list = factors.get("totp") if isinstance(factors, dict) else None
+        if isinstance(totp_list, list):
+            for item in totp_list:
+                if isinstance(item, dict) and item.get("id"):
+                    return str(item.get("id"))
+        return ""
+
+    def enable_2fa(self, access_token: str) -> dict:
+        """为账号开启 TOTP 2FA：密码登录 → enroll → 算码 → activate → 存 secret。"""
+        from utils.totp import build_otpauth_url, generate_totp
+
+        account = self.get_account(access_token)
+        if not account:
+            return {"ok": False, "error": "account_not_found", "items": self.list_accounts()}
+        email = str(account.get("email") or "").strip()
+        password = str(account.get("password") or "").strip()
+        if not email or not password:
+            return {"ok": False, "error": "missing_credentials", "items": self.list_accounts()}
+        if str(account.get("totp_secret") or "").strip():
+            return {"ok": False, "error": "already_enabled", "items": self.list_accounts()}
+
+        login = self._establish_chatgpt_session(email, password)
+        if not login.get("ok"):
+            return {"ok": False, "error": login.get("error") or "login_failed", "detail": login.get("detail"), "items": self.list_accounts()}
+        session = login.get("session")
+        token = str(login.get("access_token") or "")
+        device_id = str(login.get("device_id") or "")
+        try:
+            headers = self._mfa_headers(token, device_id)
+            resp = session.post(self._MFA_ENROLL_URL, headers=headers, json={"factor_type": "totp"}, timeout=30, verify=False)
+            data = resp.json() if resp.text else {}
+            secret = str(data.get("secret") or "").strip()
+            session_id = str(data.get("session_id") or "").strip()
+            if resp.status_code != 200 or not secret or not session_id:
+                return {"ok": False, "error": f"enroll_failed_{resp.status_code}", "detail": data, "items": self.list_accounts()}
+            code = generate_totp(secret)
+            act = session.post(self._MFA_ACTIVATE_URL, headers=headers, json={"code": code, "factor_type": "totp", "session_id": session_id}, timeout=30, verify=False)
+            act_data = act.json() if act.text else {}
+            if act.status_code != 200 or not act_data.get("success"):
+                return {"ok": False, "error": f"activate_failed_{act.status_code}", "detail": act_data, "items": self.list_accounts()}
+            otpauth = build_otpauth_url(secret, email)
+            self.update_account(access_token, {"totp_secret": secret, "otpauth_url": otpauth}, quiet=True)
+            log_service.add(LOG_TYPE_ACCOUNT, "开启2FA成功", {"token": anonymize_token(access_token)})
+            return {"ok": True, "secret": secret, "otpauth_url": otpauth, "items": self.list_accounts()}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": "enable_exception", "detail": str(exc), "items": self.list_accounts()}
+        finally:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+    def disable_2fa(self, access_token: str) -> dict:
+        """关闭账号的 TOTP 2FA：密码登录 → 取 factor → (必要时重认证) → disable → 清 secret。"""
+        from utils.totp import generate_totp
+
+        account = self.get_account(access_token)
+        if not account:
+            return {"ok": False, "error": "account_not_found", "items": self.list_accounts()}
+        email = str(account.get("email") or "").strip()
+        password = str(account.get("password") or "").strip()
+        secret = str(account.get("totp_secret") or "").strip()
+        if not email or not password:
+            return {"ok": False, "error": "missing_credentials", "items": self.list_accounts()}
+
+        login = self._establish_chatgpt_session(email, password)
+        if not login.get("ok"):
+            return {"ok": False, "error": login.get("error") or "login_failed", "detail": login.get("detail"), "items": self.list_accounts()}
+        session = login.get("session")
+        token = str(login.get("access_token") or "")
+        device_id = str(login.get("device_id") or "")
+        try:
+            headers = self._mfa_headers(token, device_id)
+            info = session.get(self._MFA_INFO_URL, headers=headers, timeout=30, verify=False)
+            info_data = info.json() if info.text else {}
+            factor_id = self._extract_totp_factor_id(info_data)
+            if not factor_id:
+                # 远端已无 totp 因子，视为已关闭，清掉本地记录
+                self.update_account(access_token, {"totp_secret": None, "otpauth_url": None}, quiet=True)
+                return {"ok": True, "items": self.list_accounts()}
+
+            def _disable():
+                r = session.post(self._MFA_DISABLE_URL, headers=headers, json={"factor_id": factor_id}, timeout=30, verify=False)
+                return r, (r.json() if r.text else {})
+
+            resp, data = _disable()
+            if resp.status_code != 200 and secret:
+                # 需要重认证：issue_challenge + verify（用存的 secret 算当前码），再重试关闭
+                auth_headers = self._mfa_auth_headers(device_id, session)
+                session.post(self._MFA_ISSUE_CHALLENGE_URL, headers=auth_headers, json={"id": factor_id, "type": "totp", "force_fresh_challenge": False}, timeout=30, verify=False)
+                session.post(self._MFA_VERIFY_URL, headers=auth_headers, json={"id": factor_id, "type": "totp", "code": generate_totp(secret)}, timeout=30, verify=False)
+                resp, data = _disable()
+            if resp.status_code != 200:
+                return {"ok": False, "error": f"disable_failed_{resp.status_code}", "detail": data, "items": self.list_accounts()}
+            self.update_account(access_token, {"totp_secret": None, "otpauth_url": None}, quiet=True)
+            log_service.add(LOG_TYPE_ACCOUNT, "关闭2FA成功", {"token": anonymize_token(access_token)})
+            return {"ok": True, "items": self.list_accounts()}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": "disable_exception", "detail": str(exc), "items": self.list_accounts()}
+        finally:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+    def list_expiring_access_tokens(self) -> list[str]:        with self._lock:
             return [
                 token
                 for account in self._accounts.values()

@@ -40,9 +40,15 @@ except Exception:
 
 auth_base = "https://auth.openai.com"
 platform_base = "https://platform.openai.com"
+chatgpt_base = "https://chatgpt.com"
 platform_oauth_client_id = "app_2SKx67EdpoN0G6j64rFvigXD"
 platform_oauth_redirect_uri = f"{platform_base}/auth/callback"
 platform_oauth_audience = "https://api.openai.com/v1"
+# ChatGPT 网页端 OAuth：开启 2FA 的 mfa/enroll 接口要求 chatgpt client 签发的 token，
+# 与上面 platform client 不通用（client_id 抓包逆向自 chatgpt.com 网页端）。
+chatgpt_oauth_client_id = "app_X8zY6vW2pQ9tR3dE7nK1jL5gH"
+chatgpt_oauth_redirect_uri = f"{chatgpt_base}/api/auth/callback/openai"
+chatgpt_oauth_scope = "openid email profile offline_access model.request model.read organization.read organization.write"
 platform_auth0_client = "eyJuYW1lIjoiYXV0aDAtc3BhLWpzIiwidmVyc2lvbiI6IjEuMjEuMCJ9"
 user_agent = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "

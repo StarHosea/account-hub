@@ -11,7 +11,7 @@
     "info",
     "warning"
   ],
-  "proxy": "http://127.0.0.1:7890",
+  "proxy": "",
   "base_url": "",
   "sensitive_words": [],
   "global_system_prompt": "",
@@ -77,7 +77,7 @@
   "image_timeout_retry_secs": 30,
   "cdk_activation": {
     "auto_activate_after_register": false,
-    "base_url": "http://127.0.0.1:8199",
+    "base_url": "",
     "api_key": "mock-key",
     "poll_interval": 2.0,
     "target": 10,

@@ -263,7 +263,7 @@ class ConfigStore:
         raw = self.data.get("cdk_activation")
         raw = raw if isinstance(raw, dict) else {}
         return {
-            "base_url": str(os.getenv("CDK_API_BASE_URL") or raw.get("base_url") or "https://chong.nerver.cc").strip().rstrip("/"),
+            "base_url": str(os.getenv("CDK_API_BASE_URL") or raw.get("base_url") or "").strip().rstrip("/"),
             "api_key": str(os.getenv("CDK_API_KEY") or raw.get("api_key") or "").strip(),
             "concurrency": max(1, min(10, int(raw.get("concurrency") or 3))),
             "poll_interval": max(1.0, float(raw.get("poll_interval") or 5.0)),

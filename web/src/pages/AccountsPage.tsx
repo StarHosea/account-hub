@@ -46,11 +46,14 @@ import {
   fetch2FAProgress,
   exportAccounts,
   markAccountsUsed,
+  startActivation,
+  fetchActivation,
   type Account,
   type AccountImportPayload,
   type AccountStatus,
   type AccountSummary,
   type AccountListParams,
+  type ActivationLog,
 } from "@/lib/api";
 import { useDebouncedValue } from "@/lib/use-debounced-value";
 import { useIsMobile } from "@/lib/use-is-mobile";
@@ -153,6 +156,7 @@ export default function AccountsPage() {
   const [twofaPending, setTwofaPending] = useState<Record<string, TwoFAAction>>({});
   const [refreshing, setRefreshing] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
+  const [activating, setActivating] = useState(false);
 
   // 搜索 / 筛选
   const [query, setQuery] = useState("");
@@ -365,6 +369,82 @@ export default function AccountsPage() {
       Toast.error(e instanceof Error ? e.message : "标记失败");
     } finally {
       setBusy(false);
+    }
+  };
+
+  // 批量激活 Plus：对已注册但未激活的账号做补偿激活（走 CDK 兑换，直连不走代理）。
+  // 选中优先——勾了账号就激活这些（后端会重置尝试次数给新机会）；没勾就激活号池内全部未激活。
+  // 激活是全局单例任务，进度通过轮询 fetchActivation 增量汇入右下角共享日志面板。
+  const forwardActivationLogs = (() => {
+    // 闭包内维护「已转发条数」，跨 tick 增量转发；日志被裁剪（后端仅留末 300 条）则重放。
+    return (scope: string, logs: ActivationLog[], state: { seen: number }) => {
+      if (logs.length < state.seen) state.seen = 0;
+      for (let i = state.seen; i < logs.length; i++) {
+        const { text, level } = logs[i];
+        if (!text) continue;
+        if (level === "green") log.success(scope, text);
+        else if (level === "red") log.error(scope, text);
+        else log.info(scope, text); // yellow / info / 中性
+      }
+      state.seen = logs.length;
+    };
+  })();
+
+  const pollActivation = (scope: string, initial: ActivationLog[]) =>
+    new Promise<void>((resolve) => {
+      const cursor = { seen: 0 };
+      forwardActivationLogs(scope, initial, cursor);
+      const timer = setInterval(async () => {
+        try {
+          const s = await fetchActivation();
+          forwardActivationLogs(scope, s.activation.logs, cursor);
+          if (!s.activation.running) {
+            clearInterval(timer);
+            const st = s.activation.stats;
+            const done = `激活结束：成功 ${st.success}，失败 ${st.fail}`;
+            log.success(scope, done);
+            Toast.success(done);
+            resolve();
+          }
+        } catch (err) {
+          clearInterval(timer);
+          log.error(scope, err instanceof Error ? err.message : "获取激活进度失败");
+          resolve();
+        }
+      }, 1000);
+    });
+
+  const handleActivate = async (tokens: string[]) => {
+    const scope = tokens.length ? `激活 Plus · 选中 ${tokens.length} 个` : "激活 Plus · 全部未激活";
+    setActivating(true);
+    log.info(scope, "开始激活");
+    try {
+      const { activation } = await startActivation(tokens);
+      // 未真正起线程：无目标 / 未配置 API Key 等，后端把原因写在最后一条日志里。
+      if (!activation.running) {
+        const last = activation.logs[activation.logs.length - 1];
+        const msg = last?.text || "没有需要激活的账号";
+        if (last?.level === "red") {
+          log.error(scope, msg);
+          openLog(true);
+          Toast.error(msg);
+        } else {
+          log.info(scope, msg);
+          Toast.warning(msg);
+        }
+        return;
+      }
+      openLog(true);
+      Toast.success("已开始激活，进度见日志面板");
+      await pollActivation(scope, activation.logs);
+      await load(true);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "激活失败";
+      log.error(scope, msg);
+      openLog(true);
+      Toast.error(msg);
+    } finally {
+      setActivating(false);
     }
   };
 
@@ -791,6 +871,19 @@ export default function AccountsPage() {
               <span style={{ width: 1, height: 18, background: "var(--semi-color-border)", display: "inline-block" }} />
             </>
           ) : null}
+          <Popconfirm
+            title="批量激活 Plus"
+            content={
+              selectedKeys.length
+                ? `对选中的 ${selectedKeys.length} 个账号发起 Plus 激活（已激活的自动跳过，直连不走代理）？`
+                : "对号池内【全部未激活】账号发起 Plus 激活？激活直连、不走代理。"
+            }
+            onConfirm={() => void handleActivate(selectedKeys)}
+          >
+            <Button icon={<IconTickCircle />} theme="light" type="primary" loading={activating}>
+              {selectedKeys.length ? `激活选中 (${selectedKeys.length})` : "激活未激活"}
+            </Button>
+          </Popconfirm>
           <Button icon={<IconRefresh />} onClick={() => void load()} loading={loading}>
             刷新
           </Button>

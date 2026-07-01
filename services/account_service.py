@@ -2134,7 +2134,8 @@ class AccountService:
                 or str(account.get("user_id") or "").strip()
             )
             item = {
-                "type": str(account.get("export_type") or "codex"),
+                # 导出真实套餐类型（而非硬编码 codex），保证导入端 _normalize_account 往返一致。
+                "type": str(account.get("type") or "free"),
                 "email": email,
                 "account_id": account_id,
                 "access_token": access_token,
@@ -2143,6 +2144,10 @@ class AccountService:
                 "expired": self._timestamp_to_iso(access_payload.get("exp")),
                 "last_refresh": self._timestamp_to_iso(access_payload.get("iat")),
             }
+            # 账号来源（如 codex），导入端据此还原 source_type。
+            source_type = str(account.get("source_type") or "").strip()
+            if source_type:
+                item["source_type"] = source_type
             password = str(account.get("password") or "").strip()
             if password:
                 item["password"] = password
@@ -2156,6 +2161,17 @@ class AccountService:
             exit_ip = str(account.get("exit_ip") or "").strip()
             if exit_ip:
                 item["exit_ip"] = exit_ip
+            # 2FA (TOTP)：迁移时保留 base32 secret 与 otpauth URL，否则目标系统无法算码。
+            totp_secret = str(account.get("totp_secret") or "").strip()
+            if totp_secret:
+                item["totp_secret"] = totp_secret
+            otpauth_url = str(account.get("otpauth_url") or "").strip()
+            if otpauth_url:
+                item["otpauth_url"] = otpauth_url
+            # 保留原始注册时间，便于迁移后区分库存新旧。
+            created_at = str(account.get("created_at") or "").strip()
+            if created_at:
+                item["created_at"] = created_at
             items.append(item)
         return items
 

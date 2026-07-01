@@ -19,6 +19,7 @@ import { IconRefresh, IconUpload, IconDelete, IconCopy, IconSearch, IconLink, Ic
 import type { ColumnProps } from "@douyinfe/semi-ui-19/lib/es/table";
 
 import { fetchMailboxes, importMailboxes, deleteMailboxes, markMailboxes, type Mailbox, type MailboxStats, type MailboxListParams } from "@/lib/api";
+import { copyToClipboard as copy } from "@/lib/clipboard";
 import { useDebouncedValue } from "@/lib/use-debounced-value";
 import { useIsMobile } from "@/lib/use-is-mobile";
 import { MAX_IMPORT_ROWS, countImportRows } from "@/lib/utils";
@@ -29,15 +30,6 @@ const { Title, Text } = Typography;
 
 const PAGE_SIZE = 10;
 const EMPTY_STATS: MailboxStats = { total: 0, used: 0, unused: 0, in_use: 0 };
-
-async function copy(text: string, label: string) {
-  try {
-    await navigator.clipboard.writeText(text);
-    Toast.success(`${label}已复制`);
-  } catch {
-    Toast.error("复制失败，请检查浏览器剪贴板权限");
-  }
-}
 
 function statusTag(m: Mailbox) {
   if (m.in_use) return <Tag color="blue" type="light">占用中</Tag>;
@@ -342,6 +334,7 @@ export default function MailboxesPage() {
         onOk={() => void handleImport()}
         okText="导入"
         confirmLoading={busy}
+        maskClosable={false}
         fullScreen={isMobile}
       >
         <Text type="tertiary">按邮箱池约定格式粘贴，一行一个 <Text code>邮箱----接码地址</Text>。</Text>

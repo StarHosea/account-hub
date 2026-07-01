@@ -96,6 +96,7 @@ type AccountMutationResponse = {
   removed?: number;
   refreshed?: number;
   relogined?: number;
+  refresh_progress_id?: string;
   errors?: Array<{ access_token: string; error: string }>;
 };
 

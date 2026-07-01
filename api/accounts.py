@@ -177,12 +177,20 @@ def create_router() -> APIRouter:
                 result["skipped"] = int(result.get("skipped") or 0) + int(extra_result.get("skipped") or 0)
         else:
             result = account_service.add_accounts(tokens)
-        refresh_result = account_service.refresh_accounts(tokens)
+        # 导入后在后台异步校验，避免大量账号（尤其走代理时）阻塞导入请求造成前端长时间转圈。
+        progress_id = str(uuid.uuid4())
+
+        async def _do_refresh():
+            try:
+                await run_in_threadpool(account_service.refresh_accounts, tokens, progress_id, False)
+            except Exception as e:
+                account_service.finish_refresh_progress(progress_id, error=str(e))
+
+        asyncio.create_task(_do_refresh())
         return {
             **result,
-            "refreshed": refresh_result.get("refreshed", 0),
-            "errors": refresh_result.get("errors", []),
-            "items": refresh_result.get("items", result.get("items", [])),
+            "refresh_progress_id": progress_id,
+            "items": result.get("items", []),
         }
 
     @router.delete("/api/accounts")

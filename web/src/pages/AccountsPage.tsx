@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Table,
   Card,
@@ -20,6 +20,7 @@ import {
 } from "@douyinfe/semi-ui-19";
 import {
   IconRefresh,
+  IconSync,
   IconDownload,
   IconUpload,
   IconShield,
@@ -43,7 +44,6 @@ import {
   enable2FA,
   disable2FA,
   fetch2FAProgress,
-  exportCredentials,
   exportAccounts,
   markAccountsUsed,
   type Account,
@@ -54,6 +54,7 @@ import {
 } from "@/lib/api";
 import { useDebouncedValue } from "@/lib/use-debounced-value";
 import { useIsMobile } from "@/lib/use-is-mobile";
+import { copyToClipboard as copy } from "@/lib/clipboard";
 import { StatCards } from "@/components/StatCards";
 import { MobileFilters } from "@/components/MobileFilters";
 import { log, useLogStore } from "@/store/logs";
@@ -65,15 +66,6 @@ type TwoFAAction = "enable" | "disable";
 
 const PAGE_SIZE = 10;
 const EMPTY_SUMMARY: AccountSummary = { total: 0, alive: 0, dead: 0, activated: 0, unused: 0 };
-
-async function copy(text: string, label: string) {
-  try {
-    await navigator.clipboard.writeText(text);
-    Toast.success(`${label}已复制`);
-  } catch {
-    Toast.error("复制失败，请检查浏览器剪贴板权限");
-  }
-}
 
 // 真实订阅档位（OpenAI 返回的 type），与「状态」的激活流程区分开。供表格与卡片共用。
 function tierTag(type: string | null | undefined) {
@@ -174,6 +166,21 @@ export default function AccountsPage() {
   const [editProxy, setEditProxy] = useState("");
   const [importOpen, setImportOpen] = useState(false);
   const [importText, setImportText] = useState("");
+  const [importFileName, setImportFileName] = useState("");
+  const [importDragging, setImportDragging] = useState(false);
+  const importFileRef = useRef<HTMLInputElement>(null);
+
+  // 读取本地文件内容填入导入文本框（点击选择 / 拖拽共用）。
+  const readImportFile = (file: File | null | undefined) => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      setImportText(String(reader.result ?? ""));
+      setImportFileName(file.name);
+    };
+    reader.onerror = () => Toast.error("读取文件失败");
+    reader.readAsText(file);
+  };
 
   const openLog = useLogStore((s) => s.setOpen);
   // 按 token 反查邮箱，作为日志 scope，定位到具体账号。
@@ -361,29 +368,6 @@ export default function AccountsPage() {
     }
   };
 
-  const handleExport = async (opts: { onlyUnused?: boolean; markUsed?: boolean; selected?: boolean }) => {
-    const tokens = opts.selected ? selectedKeys : [];
-    if (opts.selected && !tokens.length) {
-      Toast.warning("请先选择账号");
-      return;
-    }
-    setBusy(true);
-    try {
-      const text = await exportCredentials(tokens, { onlyUnused: opts.onlyUnused, markUsed: opts.markUsed });
-      if (!text.trim()) {
-        Toast.warning("没有可导出的账号");
-        return;
-      }
-      downloadText(text, `accounts-${Date.now()}.txt`);
-      Toast.success("已导出账号信息");
-      if (opts.markUsed) void load(true);
-    } catch (e) {
-      Toast.error(e instanceof Error ? e.message : "导出失败");
-    } finally {
-      setBusy(false);
-    }
-  };
-
   // 迁移导出：选中则导出选中，未选中则导出全部；下载完整 JSON（含代理），不标记已出库。
   const handleExportMigration = async () => {
     setBusy(true);
@@ -473,8 +457,41 @@ export default function AccountsPage() {
       const data = await createAccounts(tokens, accounts);
       setImportOpen(false);
       setImportText("");
+      setImportFileName("");
       await load(true);
-      Toast.success(`导入完成，新增 ${data.added ?? 0} 个`);
+      Toast.success(`导入完成，新增 ${data.added ?? 0} 个，正在后台校验…`);
+      // 导入已即时返回；账号校验在后台异步进行，这里轮询进度并在完成后刷新列表。
+      const progressId = data.refresh_progress_id;
+      if (progressId) {
+        const scope = "导入校验";
+        void (async () => {
+          try {
+            let lastProcessed = -1;
+            await new Promise<void>((resolve) => {
+              const timer = setInterval(async () => {
+                try {
+                  const p = await fetchRefreshProgress(progressId);
+                  if (p.processed !== lastProcessed) {
+                    lastProcessed = p.processed;
+                    log.info(scope, `校验进度 ${p.processed}/${p.total}`);
+                  }
+                  if (p.done) {
+                    clearInterval(timer);
+                    resolve();
+                  }
+                } catch {
+                  clearInterval(timer);
+                  resolve();
+                }
+              }, 800);
+            });
+            await load(true);
+            log.success(scope, "导入账号校验完成");
+          } catch {
+            /* 后台校验失败不打断导入流程 */
+          }
+        })();
+      }
     } catch (e) {
       Toast.error(e instanceof Error ? e.message : "导入失败");
     } finally {
@@ -761,7 +778,7 @@ export default function AccountsPage() {
           <div style={{ display: "flex", flexWrap: "wrap", gap: 12, alignItems: "center" }}>{filterControls}</div>
         )}
 
-        {/* 列表操作：刷新 / 导入(入库) / 导出选中(自动置为已出库)；选中时可删除 */}
+        {/* 列表操作：刷新 / 同步(导入·导出，同一份迁移 JSON)；选中时可删除 */}
         <Space wrap>
           {selectedKeys.length > 0 ? (
             <>
@@ -777,28 +794,24 @@ export default function AccountsPage() {
           <Button icon={<IconRefresh />} onClick={() => void load()} loading={loading}>
             刷新
           </Button>
-          <Button icon={<IconUpload />} onClick={() => setImportOpen(true)}>
-            导入入库
-          </Button>
-          <Button
-            icon={<IconDownload />}
-            loading={busy}
-            // 迁移导出：完整 JSON（含代理），选中则导出选中，否则全部；不标记已出库。
-            onClick={() => void handleExportMigration()}
+          {/* 同步：导入 / 导出共用同一份迁移 JSON 格式，往返一致。 */}
+          <Dropdown
+            trigger="click"
+            render={
+              <Dropdown.Menu>
+                <Dropdown.Item icon={<IconUpload />} onClick={() => setImportOpen(true)}>
+                  导入
+                </Dropdown.Item>
+                <Dropdown.Item icon={<IconDownload />} onClick={() => void handleExportMigration()}>
+                  导出{selectedKeys.length ? `（选中 ${selectedKeys.length}）` : "（全部）"}
+                </Dropdown.Item>
+              </Dropdown.Menu>
+            }
           >
-            导出迁移文件{selectedKeys.length ? `（${selectedKeys.length}）` : "（全部）"}
-          </Button>
-          <Button
-            icon={<IconDownload />}
-            theme="solid"
-            type="primary"
-            disabled={!selectedKeys.length}
-            loading={busy}
-            // 导出选中账号，并把它们置为「已出库」（交付即出库）。
-            onClick={() => void handleExport({ selected: true, markUsed: true })}
-          >
-            导出账号信息{selectedKeys.length ? `（${selectedKeys.length}）` : ""}
-          </Button>
+            <Button icon={<IconSync />} loading={busy}>
+              同步
+            </Button>
+          </Dropdown>
         </Space>
       </div>
 
@@ -882,25 +895,84 @@ export default function AccountsPage() {
         </div>
       </Modal>
 
-      {/* 导入弹窗 */}
+      {/* 导入弹窗：选择「导出」下载的迁移 JSON 文件导入（也可直接粘贴内容）。 */}
       <Modal
         title="导入账号"
         visible={importOpen}
-        onCancel={() => setImportOpen(false)}
+        onCancel={() => {
+          setImportOpen(false);
+          setImportFileName("");
+          setImportDragging(false);
+        }}
         onOk={() => void handleImport()}
         okText="导入"
         confirmLoading={busy}
+        maskClosable={false}
         fullScreen={isMobile}
       >
         <Text type="tertiary">
-          一行一个 access_token；或直接粘贴「导出迁移文件」的 JSON（含代理会一并导入）。
+          选择「导出」下载的迁移 JSON 文件导入；也可直接粘贴文件内容或每行一个 access_token。
         </Text>
+        <input
+          type="file"
+          accept=".json,application/json,.txt,text/plain"
+          style={{ display: "none" }}
+          ref={importFileRef}
+          onChange={(e) => {
+            const file = e.target.files?.[0];
+            e.target.value = ""; // 允许再次选择同一文件
+            readImportFile(file);
+          }}
+        />
+        {/* 点击选择 + 拖拽上传：拖入迁移 JSON 文件即读取内容。 */}
+        <div
+          role="button"
+          tabIndex={0}
+          onClick={() => importFileRef.current?.click()}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") importFileRef.current?.click();
+          }}
+          onDragOver={(e) => {
+            e.preventDefault();
+            if (!importDragging) setImportDragging(true);
+          }}
+          onDragLeave={(e) => {
+            e.preventDefault();
+            setImportDragging(false);
+          }}
+          onDrop={(e) => {
+            e.preventDefault();
+            setImportDragging(false);
+            readImportFile(e.dataTransfer.files?.[0]);
+          }}
+          style={{
+            marginTop: 8,
+            padding: "20px 12px",
+            border: `1px dashed ${importDragging ? "var(--semi-color-primary)" : "var(--semi-color-border)"}`,
+            borderRadius: 6,
+            textAlign: "center",
+            cursor: "pointer",
+            background: importDragging ? "var(--semi-color-primary-light-default)" : "var(--semi-color-fill-0)",
+            transition: "all .15s",
+          }}
+        >
+          <IconUpload style={{ fontSize: 22, color: "var(--semi-color-text-2)" }} />
+          <div style={{ marginTop: 6 }}>
+            <Text>点击选择文件，或将迁移 JSON 文件拖拽到此处</Text>
+          </div>
+          <Text type="tertiary" size="small" ellipsis={{ showTooltip: true }} style={{ maxWidth: "100%", display: "block", marginTop: 4 }}>
+            {importFileName ? `已选择：${importFileName}` : "未选择文件"}
+          </Text>
+        </div>
         <TextArea
           value={importText}
-          onChange={(v) => setImportText(v)}
-          rows={10}
+          onChange={(v) => {
+            setImportText(v);
+            if (importFileName) setImportFileName("");
+          }}
+          rows={8}
           style={{ marginTop: 8, fontFamily: "monospace" }}
-          placeholder={"粘贴 access_token（每行一个），或迁移导出的 JSON..."}
+          placeholder={"选择文件后内容显示在此，或直接粘贴迁移 JSON / access_token（每行一个）..."}
         />
       </Modal>
     </div>

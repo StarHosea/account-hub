@@ -1,0 +1,33 @@
+# 服务器部署用 compose（140.238.56.209，~/apps/account-hub/docker-compose.yml 的版本记录）
+#
+# 敏感值不入库，放在同目录 .env（chmod 600）：
+#   STORAGE_BACKEND=postgres
+#   DATABASE_URL=postgresql://account_hub:<password>@sub2api-postgres:5432/account_hub
+#   ACCOUNT_HUB_AUTH_KEY=<key>
+#
+# 说明：
+# - 应用只绑定 127.0.0.1:8090，由 1Panel OpenResty 反代 hao.shuangdeng.space (80/443)
+# - restart: unless-stopped + docker.service 已 enabled → 服务器重启自动拉起
+# - 复用 sub2api-postgres 的 docker 网络，用容器名 sub2api-postgres 连库
+services:
+  app:
+    image: ghcr.io/starhosea/account-hub:latest
+    container_name: account-hub
+    restart: unless-stopped
+    pull_policy: always
+    ports:
+      - "127.0.0.1:8090:80"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    networks:
+      - sub2api
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+networks:
+  sub2api:
+    external: true
+    name: sub2api-deploy_sub2api-network

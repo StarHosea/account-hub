@@ -15,6 +15,7 @@ const { Text } = Typography;
 
 const NAV_ITEMS = [
   { itemKey: "/accounts", text: "号池管理" },
+  { itemKey: "/finished-accounts", text: "成品号管理" },
   { itemKey: "/dispatch", text: "发号管理" },
   { itemKey: "/mailboxes", text: "邮箱管理" },
   { itemKey: "/phones", text: "手机号管理" },

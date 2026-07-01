@@ -43,6 +43,31 @@ def _is_tls_connection_error(message: str) -> bool:
     )
 
 
+def _normalize_checkout_meta(value: object) -> dict[str, str] | None:
+    if not isinstance(value, dict):
+        return None
+    customer = str(value.get("customer") or "").strip()
+    wechat = str(value.get("wechat") or "").strip()
+    xianyu = str(value.get("xianyu") or "").strip()
+    plan = str(value.get("plan") or "").strip()
+    note = str(value.get("note") or "").strip()
+    checkout_at = str(value.get("checkout_at") or "").strip()
+    dispatch_no = str(value.get("dispatch_no") or "").strip()
+    phone = str(value.get("phone") or "").strip()
+    if not (customer or wechat or xianyu or plan or note or checkout_at or dispatch_no or phone):
+        return None
+    return {
+        "customer": customer,
+        "wechat": wechat,
+        "xianyu": xianyu,
+        "plan": plan,
+        "note": note,
+        "dispatch_no": dispatch_no,
+        "phone": phone,
+        "checkout_at": checkout_at or datetime.now(timezone.utc).isoformat(),
+    }
+
+
 class AccountService:
     """账号池服务，使用 token -> account 的 dict 保存账号。"""
 
@@ -253,6 +278,14 @@ class AccountService:
         normalized = dict(item)
         normalized.pop("accessToken", None)
         normalized["access_token"] = access_token
+        # 兼容早期成品号数据：曾把整行「邮箱/密码/2FA 文本」误存进 access_token，
+        # 这里在归一化时反解析一次，自动补回 email/password/totp_secret/mail_link。
+        if " ---- " in str(access_token):
+            legacy_accounts, _ = self.parse_import_blob(str(access_token))
+            legacy = legacy_accounts[0] if legacy_accounts else {}
+            for key in ("email", "mail_link", "password", "totp_secret"):
+                if legacy.get(key) and not normalized.get(key):
+                    normalized[key] = legacy.get(key)
         if str(normalized.get("type") or "").strip().lower() == "codex":
             normalized["export_type"] = "codex"
             normalized.pop("type", None)
@@ -289,6 +322,8 @@ class AccountService:
         normalized["otpauth_url"] = normalized.get("otpauth_url") or None
         # 导出消费标记：账号导出给客户后标记「已用」，便于区分未用库存。
         normalized["used"] = bool(normalized.get("used"))
+        normalized["checkout_at"] = normalized.get("checkout_at") or None
+        normalized["checkout_meta"] = _normalize_checkout_meta(normalized.get("checkout_meta")) or None
         # Plus 激活相关字段（由 activation_service 维护）。
         plus_status = str(normalized.get("plus_status") or "未激活").strip() or "未激活"
         if plus_status not in {"未激活", "排队中", "激活中", "已激活", "激活失败"}:
@@ -1580,6 +1615,75 @@ class AccountService:
         return str(item.get("access_token") or item.get("accessToken") or "").strip()
 
     @staticmethod
+    def _looks_like_email(value: str) -> bool:
+        return bool(value and "@" in value and "." in value.split("@")[-1])
+
+    @staticmethod
+    def _looks_like_totp_secret(value: str) -> bool:
+        raw = str(value or "").strip().replace(" ", "")
+        if len(raw) < 16:
+            return False
+        import re
+        return bool(re.fullmatch(r"[A-Z2-7=]+", raw.upper()))
+
+    @staticmethod
+    def _extract_access_token(text: str) -> str:
+        import re
+        raw = str(text or "")
+        match = re.search(r"(eyJ[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+)", raw)
+        return match.group(1).strip() if match else ""
+
+    @classmethod
+    def parse_import_blob(cls, text: str) -> tuple[list[dict], list[str]]:
+        import re
+
+        items: list[dict] = []
+        tokens: list[str] = []
+        for raw_line in str(text or "").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            payload: dict[str, str] = {}
+            access_token = cls._extract_access_token(line)
+            if access_token:
+                payload["access_token"] = access_token
+
+            email_match = re.search(r"(?:邮箱|email)\s*[:：]\s*(.+?)(?=(?:\s*----\s*(?:接码邮箱|Recv URL|密码|2FA密钥|2FA密匙|token|access[_ ]?token)\s*[:：])|$)", line, flags=re.IGNORECASE)
+            if email_match:
+                payload["email"] = email_match.group(1).strip()
+
+            mail_link_match = re.search(r"(?:接码邮箱|Recv URL|接码)\s*[:：]\s*(.+?)(?=(?:\s*----\s*(?:邮箱|email|密码|2FA密钥|2FA密匙|token|access[_ ]?token)\s*[:：])|$)", line, flags=re.IGNORECASE)
+            if mail_link_match:
+                payload["mail_link"] = mail_link_match.group(1).strip()
+
+            password_match = re.search(r"(?:密码|password)\s*[:：]\s*(.+?)(?=(?:\s*----\s*(?:邮箱|email|接码邮箱|Recv URL|2FA密钥|2FA密匙|token|access[_ ]?token)\s*[:：])|$)", line, flags=re.IGNORECASE)
+            if password_match:
+                payload["password"] = password_match.group(1).strip()
+
+            totp_match = re.search(r"(?:2FA密钥|2FA密匙|2fa|totp|totp_secret|secret)\s*[:：]\s*(.+?)(?=(?:\s*----\s*(?:邮箱|email|接码邮箱|Recv URL|密码|token|access[_ ]?token)\s*[:：])|$)", line, flags=re.IGNORECASE)
+            if totp_match:
+                payload["totp_secret"] = totp_match.group(1).strip()
+
+            parts = [part.strip() for part in re.split(r"[\s,|;]+", line) if part.strip()]
+            for part in parts:
+                if cls._looks_like_email(part) and not payload.get("email"):
+                    payload["email"] = part
+                elif cls._looks_like_totp_secret(part) and not payload.get("totp_secret"):
+                    payload["totp_secret"] = part
+                elif not payload.get("password") and not cls._looks_like_email(part) and not part.startswith("http") and part != payload.get("access_token"):
+                    payload["password"] = part
+
+            if payload.get("access_token"):
+                items.append(payload)
+            elif payload.get("email") or payload.get("password") or payload.get("totp_secret") or payload.get("mail_link"):
+                payload["access_token"] = f"manual::{payload.get('email') or uuid.uuid4().hex[:12]}"
+                items.append(payload)
+            elif access_token:
+                tokens.append(access_token)
+        return items, tokens
+
+    @staticmethod
     def _prepare_account_payload(item: dict) -> dict | None:
         if not isinstance(item, dict):
             return None
@@ -1713,21 +1817,31 @@ class AccountService:
             items = [dict(item) for item in self._accounts.values()]
         return {"removed": removed, "items": items}
 
-    def mark_used(self, tokens: list[str], used: bool) -> dict:
+    def mark_used(self, tokens: list[str], used: bool, meta_by_token: dict[str, dict[str, str]] | None = None) -> dict:
         """批量标记账号「已用/未用」。返回 {updated, items}。"""
         target = [t for t in (tokens or []) if t]
         if not target:
             return {"updated": 0, "items": self.list_accounts()}
         updated = 0
+        meta_by_token = meta_by_token or {}
         with self._lock:
             for token in target:
                 resolved = self._resolve_access_token_locked(token)
                 current = self._accounts.get(resolved)
                 if current is None:
                     continue
-                if bool(current.get("used")) == bool(used):
+                incoming_meta = _normalize_checkout_meta(meta_by_token.get(token) or meta_by_token.get(resolved))
+                state_changed = bool(current.get("used")) != bool(used)
+                meta_changed = incoming_meta != _normalize_checkout_meta(current.get("checkout_meta"))
+                if not state_changed and not meta_changed:
                     continue
                 current["used"] = bool(used)
+                if used:
+                    current["checkout_at"] = current.get("checkout_at") or datetime.now(timezone.utc).isoformat()
+                    current["checkout_meta"] = incoming_meta
+                else:
+                    current["checkout_at"] = None
+                    current["checkout_meta"] = None
                 updated += 1
             if updated:
                 self._save_accounts()

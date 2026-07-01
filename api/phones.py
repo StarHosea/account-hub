@@ -24,6 +24,7 @@ class PhoneUsedRequest(BaseModel):
 class PhoneUseRequest(BaseModel):
     phones: list[str]
     delta: int = 1
+    meta_by_phone: dict[str, dict[str, str]] = {}
 
 
 def _paginate(seq: list[dict], page: int, page_size: int) -> list[dict]:
@@ -61,6 +62,11 @@ def create_router() -> APIRouter:
                 for p in items
                 if keyword in str(p.get("phone") or "").lower()
                 or keyword in str(p.get("fetch_url") or "").lower()
+                or keyword in str((p.get("checkout_meta") or {}).get("customer") or "").lower()
+                or keyword in str((p.get("checkout_meta") or {}).get("wechat") or "").lower()
+                or keyword in str((p.get("checkout_meta") or {}).get("xianyu") or "").lower()
+                or keyword in str((p.get("checkout_meta") or {}).get("plan") or "").lower()
+                or keyword in str((p.get("checkout_meta") or {}).get("note") or "").lower()
             ]
 
         total = len(items)
@@ -93,7 +99,7 @@ def create_router() -> APIRouter:
     @router.post("/api/phones/use")
     async def add_usage(body: PhoneUseRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        changed = phone_service.add_usage(body.phones, body.delta)
+        changed = phone_service.add_usage(body.phones, body.delta, body.meta_by_phone)
         return {**_payload(), "changed": changed}
 
     @router.get("/api/phones/export")

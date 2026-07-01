@@ -44,6 +44,31 @@ def _cooldown_until(now: datetime) -> str:
     return datetime.fromtimestamp(now.timestamp() + COOLDOWN_SECONDS, tz=timezone.utc).isoformat()
 
 
+def _normalize_checkout_meta(value: object) -> dict[str, str] | None:
+    if not isinstance(value, dict):
+        return None
+    customer = str(value.get("customer") or "").strip()
+    wechat = str(value.get("wechat") or "").strip()
+    xianyu = str(value.get("xianyu") or "").strip()
+    plan = str(value.get("plan") or "").strip()
+    note = str(value.get("note") or "").strip()
+    checkout_at = str(value.get("checkout_at") or "").strip()
+    dispatch_no = str(value.get("dispatch_no") or "").strip()
+    account_token = str(value.get("account_token") or "").strip()
+    if not (customer or wechat or xianyu or plan or note or checkout_at or dispatch_no or account_token):
+        return None
+    return {
+        "customer": customer,
+        "wechat": wechat,
+        "xianyu": xianyu,
+        "plan": plan,
+        "note": note,
+        "dispatch_no": dispatch_no,
+        "account_token": account_token,
+        "checkout_at": checkout_at or _now(),
+    }
+
+
 def _norm_phone(phone: str) -> str:
     """去除空白，作为去重键（保留 + 前缀）。"""
     return "".join(str(phone or "").split())
@@ -130,6 +155,13 @@ class PhoneService:
             "last_used_at": item.get("last_used_at") or None,
             "imported_at": item.get("imported_at") or _now(),
             "note": str(item.get("note") or ""),
+            "checkout_at": item.get("checkout_at") or None,
+            "checkout_meta": _normalize_checkout_meta(item.get("checkout_meta")) or None,
+            "checkout_records": [
+                normalized
+                for record in (item.get("checkout_records") if isinstance(item.get("checkout_records"), list) else [])
+                if (normalized := _normalize_checkout_meta(record)) is not None
+            ],
         }
 
     # ----------------------------- 状态判定 ----------------------------- #
@@ -234,14 +266,17 @@ class PhoneService:
                     item["cooldown_until"] = None
                     item["invalid"] = False
                     item["reserved_at"] = None
+                    item["checkout_at"] = None
+                    item["checkout_meta"] = None
                 changed += 1
             if changed:
                 self._save()
         return changed
 
-    def add_usage(self, phones: list[str], delta: int = 1) -> int:
+    def add_usage(self, phones: list[str], delta: int = 1, meta_by_phone: dict[str, dict[str, str]] | None = None) -> int:
         """累计使用次数 +delta（默认 +1）。已使用的号不再累加；满 MAX_USES 自动标记已使用。"""
         changed = 0
+        meta_by_phone = meta_by_phone or {}
         with self._lock:
             for phone in phones or []:
                 item = self._phones.get(_norm_phone(phone))
@@ -249,6 +284,13 @@ class PhoneService:
                     continue
                 item["used_count"] = min(MAX_USES, item["used_count"] + delta)
                 item["last_used_at"] = _now()
+                meta = _normalize_checkout_meta(meta_by_phone.get(phone) or meta_by_phone.get(_norm_phone(phone)))
+                if meta:
+                    item["checkout_at"] = meta["checkout_at"]
+                    item["checkout_meta"] = meta
+                    records = item.get("checkout_records") if isinstance(item.get("checkout_records"), list) else []
+                    records.append(meta)
+                    item["checkout_records"] = records
                 if item["used_count"] >= MAX_USES:
                     item["used"] = True
                 changed += 1
@@ -290,7 +332,7 @@ class PhoneService:
             self._save()
             return dict(chosen)
 
-    def checkout(self, phone: str) -> dict | None:
+    def checkout(self, phone: str, meta: dict[str, str] | None = None) -> dict | None:
         """出库：次数 +1、记录时间、自动冷却 1h、解除预占；满 MAX_USES 标记已使用。"""
         with self._lock:
             item = self._phones.get(_norm_phone(phone))
@@ -301,6 +343,13 @@ class PhoneService:
             item["last_used_at"] = now.isoformat()
             item["cooldown_until"] = _cooldown_until(now)
             item["reserved_at"] = None
+            normalized_meta = _normalize_checkout_meta({**(meta or {}), "checkout_at": (meta or {}).get("checkout_at") or now.isoformat()})
+            if normalized_meta:
+                item["checkout_at"] = normalized_meta["checkout_at"]
+                item["checkout_meta"] = normalized_meta
+                records = item.get("checkout_records") if isinstance(item.get("checkout_records"), list) else []
+                records.append(normalized_meta)
+                item["checkout_records"] = records
             if item["used_count"] >= MAX_USES:
                 item["used"] = True
             self._save()

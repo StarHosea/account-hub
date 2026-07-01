@@ -55,6 +55,17 @@ export type Account = {
   otpauth_url?: string | null;
   // 导出消费标记
   used?: boolean;
+  checkout_at?: string | null;
+  checkout_meta?: {
+    customer?: string;
+    wechat?: string;
+    xianyu?: string;
+    plan?: string;
+    note?: string;
+    dispatch_no?: string;
+    phone?: string;
+    checkout_at?: string;
+  } | null;
   // Plus 激活相关字段
   plus_status?: PlusStatus;
   plus_attempts?: { UPI: number; IDEL: number };
@@ -254,6 +265,27 @@ export type Phone = {
   last_used_at: string | null;
   imported_at: string | null;
   note: string;
+  checkout_at?: string | null;
+  checkout_meta?: {
+    customer?: string;
+    wechat?: string;
+    xianyu?: string;
+    plan?: string;
+    note?: string;
+    dispatch_no?: string;
+    account_token?: string;
+    checkout_at?: string;
+  } | null;
+  checkout_records?: Array<{
+    customer?: string;
+    wechat?: string;
+    xianyu?: string;
+    plan?: string;
+    note?: string;
+    dispatch_no?: string;
+    account_token?: string;
+    checkout_at?: string;
+  }>;
 };
 
 export type PhoneCounts = {
@@ -406,10 +438,10 @@ export async function fetchAccounts(params: AccountListParams = {}) {
   return httpRequest<AccountListResponse>(`/api/accounts${buildQuery(params)}`);
 }
 
-export async function createAccounts(tokens: string[], accounts: AccountImportPayload[] = []) {
+export async function createAccounts(tokens: string[], accounts: AccountImportPayload[] = [], text = "") {
   return httpRequest<AccountMutationResponse>("/api/accounts", {
     method: "POST",
-    body: { tokens, accounts },
+    body: { tokens, accounts, text },
   });
 }
 
@@ -518,10 +550,14 @@ export async function exportAccounts(
   return response.data;
 }
 
-export async function markAccountsUsed(accessTokens: string[], used: boolean) {
+export async function markAccountsUsed(
+  accessTokens: string[],
+  used: boolean,
+  metaByToken: Record<string, { customer?: string; wechat?: string; xianyu?: string; plan?: string; note?: string }> = {},
+) {
   return httpRequest<{ updated: number; items: Account[] }>("/api/accounts/mark-used", {
     method: "POST",
-    body: { access_tokens: accessTokens, used },
+    body: { access_tokens: accessTokens, used, meta_by_token: metaByToken },
   });
 }
 
@@ -636,10 +672,14 @@ export async function setPhonesUsed(phones: string[], used: boolean) {
 }
 
 /** 累计使用次数 +delta（默认 +1），后端自动标记为已使用。 */
-export async function addPhoneUsage(phones: string[], delta = 1) {
+export async function addPhoneUsage(
+  phones: string[],
+  delta = 1,
+  metaByPhone: Record<string, { customer?: string; wechat?: string; xianyu?: string; plan?: string; note?: string; dispatch_no?: string; account_token?: string }> = {},
+) {
   return httpRequest<PhoneListPayload & { changed: number }>("/api/phones/use", {
     method: "POST",
-    body: { phones, delta },
+    body: { phones, delta, meta_by_phone: metaByPhone },
   });
 }
 
@@ -690,6 +730,40 @@ export async function dispatchAction(kind: DispatchKind, id: string, action: Dis
   return httpRequest<{ ok: boolean; summary: DispatchSummary }>("/api/dispatch/action", {
     method: "POST",
     body: { kind, id, action },
+  });
+}
+
+export async function dispatchCheckout(
+  kind: DispatchKind,
+  id: string,
+  payload: {
+    customer?: string;
+    wechat?: string;
+    xianyu?: string;
+    plan?: string;
+    note?: string;
+    dispatchNo?: string;
+    relatedPhone?: string;
+    relatedAccountToken?: string;
+    pairCheckout?: boolean;
+  },
+) {
+  return httpRequest<{ ok: boolean; summary: DispatchSummary }>("/api/dispatch/action", {
+    method: "POST",
+    body: {
+      kind,
+      id,
+      action: "checkout",
+      customer: payload.customer,
+      wechat: payload.wechat,
+      xianyu: payload.xianyu,
+      plan: payload.plan,
+      note: payload.note,
+      dispatch_no: payload.dispatchNo,
+      related_phone: payload.relatedPhone,
+      related_account_token: payload.relatedAccountToken,
+      pair_checkout: payload.pairCheckout,
+    },
   });
 }
 

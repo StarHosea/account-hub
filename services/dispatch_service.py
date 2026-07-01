@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import uuid
 from datetime import datetime, timezone
 
 from services.account_service import account_service
@@ -101,6 +102,15 @@ class DispatchService:
         self.release_account(token)
         return True
 
+    def checkout_account_with_meta(self, token: str, meta: dict[str, str] | None = None) -> bool:
+        token = str(token or "")
+        if not token:
+            return False
+        payload = meta or {}
+        account_service.mark_used([token], True, {token: payload})
+        self.release_account(token)
+        return True
+
     def invalid_account(self, token: str) -> bool:
         """标记账号无效：置禁用并解除预占。"""
         token = str(token or "")
@@ -151,6 +161,9 @@ class DispatchService:
     def checkout_phone(self, phone: str) -> bool:
         return phone_service.checkout(phone) is not None
 
+    def checkout_phone_with_meta(self, phone: str, meta: dict[str, str] | None = None) -> bool:
+        return phone_service.checkout(phone, meta) is not None
+
     def cooldown_phone(self, phone: str) -> bool:
         return phone_service.cooldown(phone) is not None
 
@@ -159,6 +172,29 @@ class DispatchService:
 
     def release_phone(self, phone: str) -> None:
         phone_service.release(phone)
+
+    @staticmethod
+    def build_dispatch_meta(
+        customer: str = "",
+        wechat: str = "",
+        xianyu: str = "",
+        plan: str = "",
+        note: str = "",
+        dispatch_no: str = "",
+        phone: str = "",
+        account_token: str = "",
+    ) -> dict[str, str]:
+        return {
+            "customer": str(customer or "").strip(),
+            "wechat": str(wechat or "").strip(),
+            "xianyu": str(xianyu or "").strip(),
+            "plan": str(plan or "").strip(),
+            "note": str(note or "").strip(),
+            "dispatch_no": str(dispatch_no or "").strip() or f"dispatch-{uuid.uuid4().hex[:10]}",
+            "phone": str(phone or "").strip(),
+            "account_token": str(account_token or "").strip(),
+            "checkout_at": datetime.now(timezone.utc).isoformat(),
+        }
 
 
 dispatch_service = DispatchService()

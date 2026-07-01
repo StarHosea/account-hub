@@ -17,6 +17,15 @@ class ActionRequest(BaseModel):
     kind: str  # phone | account
     id: str
     action: str  # checkout | cooldown | invalid | release
+    customer: str | None = None
+    wechat: str | None = None
+    xianyu: str | None = None
+    plan: str | None = None
+    note: str | None = None
+    dispatch_no: str | None = None
+    related_phone: str | None = None
+    related_account_token: str | None = None
+    pair_checkout: bool = False
 
 
 def _summary() -> dict:
@@ -59,9 +68,21 @@ def create_router() -> APIRouter:
         kind = (body.kind or "").strip()
         act = (body.action or "").strip()
         ok = False
+        meta = dispatch_service.build_dispatch_meta(
+            customer=body.customer or "",
+            wechat=body.wechat or "",
+            xianyu=body.xianyu or "",
+            plan=body.plan or "",
+            note=body.note or "",
+            dispatch_no=body.dispatch_no or "",
+            phone=body.related_phone or (body.id if kind == "phone" else ""),
+            account_token=body.related_account_token or (body.id if kind == "account" else ""),
+        )
         if kind == "account":
             if act == "checkout":
-                ok = dispatch_service.checkout_account(body.id)
+                ok = dispatch_service.checkout_account_with_meta(body.id, meta)
+                if ok and body.pair_checkout and body.related_phone:
+                    dispatch_service.checkout_phone_with_meta(body.related_phone, meta)
             elif act == "invalid":
                 ok = dispatch_service.invalid_account(body.id)
             elif act == "release":
@@ -73,7 +94,9 @@ def create_router() -> APIRouter:
                 ok = True
         elif kind == "phone":
             if act == "checkout":
-                ok = dispatch_service.checkout_phone(body.id)
+                ok = dispatch_service.checkout_phone_with_meta(body.id, meta)
+                if ok and body.pair_checkout and body.related_account_token:
+                    dispatch_service.checkout_account_with_meta(body.related_account_token, meta)
             elif act == "cooldown":
                 ok = dispatch_service.cooldown_phone(body.id)
             elif act == "invalid":

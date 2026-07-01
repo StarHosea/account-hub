@@ -1,11 +1,12 @@
 import { useEffect, useState } from "react";
-import { Card, Button, Typography, Toast, Space, Tag, RadioGroup, Radio, Spin, Popconfirm } from "@douyinfe/semi-ui-19";
+import { Card, Button, Typography, Toast, Space, Tag, RadioGroup, Radio, Spin, Popconfirm, Modal, Input, Checkbox } from "@douyinfe/semi-ui-19";
 import { IconCopy, IconSend, IconTickCircle, IconClose, IconRefresh, IconClock } from "@douyinfe/semi-icons";
 
 import {
   fetchDispatchSummary,
   acquireDispatch,
   dispatchAction,
+  dispatchCheckout,
   type DispatchKind,
   type DispatchItem,
   type DispatchSummary,
@@ -23,6 +24,15 @@ export default function DispatchPage() {
   const [item, setItem] = useState<DispatchItem | null>(null);
   const [summary, setSummary] = useState<DispatchSummary>(EMPTY_SUMMARY);
   const [busy, setBusy] = useState(false);
+  const [checkoutOpen, setCheckoutOpen] = useState(false);
+  const [customer, setCustomer] = useState("");
+  const [wechat, setWechat] = useState("");
+  const [xianyu, setXianyu] = useState("");
+  const [plan, setPlan] = useState("");
+  const [note, setNote] = useState("");
+  const [pairCheckout, setPairCheckout] = useState(false);
+  const [relatedPhone, setRelatedPhone] = useState("");
+  const [relatedAccountToken, setRelatedAccountToken] = useState("");
 
   const refreshSummary = async () => {
     try {
@@ -65,14 +75,14 @@ export default function DispatchPage() {
     }
   };
 
-  const act = async (action: "checkout" | "cooldown" | "invalid") => {
+  const act = async (action: "cooldown" | "invalid") => {
     if (!item) return;
     setBusy(true);
     try {
       const res = await dispatchAction(kind, item.id, action);
       setSummary(res.summary);
       setItem(null);
-      Toast.success(action === "checkout" ? "已出库" : action === "cooldown" ? "已置冷却" : "已标记无效");
+      Toast.success(action === "cooldown" ? "已置冷却" : "已标记无效");
     } catch (e) {
       Toast.error(e instanceof Error ? e.message : "操作失败");
     } finally {
@@ -82,6 +92,44 @@ export default function DispatchPage() {
 
   // 当前号不可用 → 释放并取下一个，不消耗当前号。
   const next = () => void acquire(item?.id);
+
+  const openCheckout = () => {
+    if (!item) return;
+    setCustomer("");
+    setWechat("");
+    setXianyu("");
+    setPlan("");
+    setNote("");
+    setPairCheckout(false);
+    setRelatedPhone(kind === "phone" ? item.id : "");
+    setRelatedAccountToken(kind === "account" ? item.id : "");
+    setCheckoutOpen(true);
+  };
+
+  const submitCheckout = async () => {
+    if (!item) return;
+    setBusy(true);
+    try {
+      const res = await dispatchCheckout(kind, item.id, {
+        customer: customer.trim(),
+        wechat: wechat.trim(),
+        xianyu: xianyu.trim(),
+        plan: plan.trim(),
+        note: note.trim(),
+        relatedPhone: kind === "phone" ? item.id : relatedPhone.trim(),
+        relatedAccountToken: kind === "account" ? item.id : relatedAccountToken.trim(),
+        pairCheckout,
+      });
+      setSummary(res.summary);
+      setItem(null);
+      setCheckoutOpen(false);
+      Toast.success(pairCheckout ? "已完成成套出库" : "已出库");
+    } catch (e) {
+      Toast.error(e instanceof Error ? e.message : "出库失败");
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const copyAll = () => {
     if (!item) return;
@@ -189,21 +237,16 @@ export default function DispatchPage() {
 
           {/* 标记动作 */}
           <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 16 }}>
-            <Popconfirm
-              title="确认出库？"
-              content={`出库后该${kindLabel}将被标记消耗，不可撤销`}
-              onConfirm={() => void act("checkout")}
+            <Button
+              theme="solid"
+              type="primary"
+              icon={<IconTickCircle />}
+              loading={busy}
+              style={{ flex: 1, minWidth: 96 }}
+              onClick={openCheckout}
             >
-              <Button
-                theme="solid"
-                type="primary"
-                icon={<IconTickCircle />}
-                loading={busy}
-                style={{ flex: 1, minWidth: 96 }}
-              >
-                出库
-              </Button>
-            </Popconfirm>
+              出库
+            </Button>
             {kind === "phone" ? (
               <Button icon={<IconClock />} loading={busy} style={{ flex: 1, minWidth: 96 }} onClick={() => void act("cooldown")}>
                 冷却
@@ -238,6 +281,34 @@ export default function DispatchPage() {
           {busy ? <Spin /> : <Text type="tertiary">点击上方「发一个{kindLabel}」开始</Text>}
         </Card>
       )}
+
+      <Modal
+        title={pairCheckout ? "成套出库" : "记录出库信息"}
+        visible={checkoutOpen}
+        onCancel={() => setCheckoutOpen(false)}
+        onOk={() => void submitCheckout()}
+        okText="确认出库"
+        confirmLoading={busy}
+        fullScreen={isMobile}
+      >
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          <Input value={customer} onChange={setCustomer} placeholder="客户名 / 卖给谁了（选填）" />
+          <Input value={wechat} onChange={setWechat} placeholder="微信号（选填）" />
+          <Input value={xianyu} onChange={setXianyu} placeholder="闲鱼号（选填）" />
+          <Input value={plan} onChange={setPlan} placeholder="套餐（选填）" />
+          <Input value={note} onChange={setNote} placeholder="备注（选填）" />
+          <Checkbox checked={pairCheckout} onChange={(e) => setPairCheckout(Boolean(e.target.checked))}>
+            这次是成套发货（成品号 + 手机号一起）
+          </Checkbox>
+          {pairCheckout ? (
+            kind === "account" ? (
+              <Input value={relatedPhone} onChange={setRelatedPhone} placeholder="关联手机号（成套发货时填写）" />
+            ) : (
+              <Input value={relatedAccountToken} onChange={setRelatedAccountToken} placeholder="关联成品号 access_token（成套发货时填写）" />
+            )
+          ) : null}
+        </div>
+      </Modal>
     </div>
   );
 }

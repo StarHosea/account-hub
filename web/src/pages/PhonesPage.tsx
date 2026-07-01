@@ -295,6 +295,31 @@ export default function PhonesPage() {
       ),
     },
     {
+      title: "发货信息",
+      width: 220,
+      render: (_: unknown, p: Phone) => {
+        const meta = p.checkout_meta;
+        if (!meta) return <Text type="tertiary">—</Text>;
+        return (
+          <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+            <Text size="small">{meta.customer || "—"}</Text>
+            <Text type="tertiary" size="small">
+              {[meta.wechat, meta.xianyu, meta.plan].filter(Boolean).join(" / ") || "—"}
+            </Text>
+          </div>
+        );
+      },
+    },
+    {
+      title: "发货时间",
+      width: 170,
+      render: (_: unknown, p: Phone) => (
+        <Text type="tertiary" size="small">
+          {fmtTime(p.checkout_at || p.checkout_meta?.checkout_at || null)}
+        </Text>
+      ),
+    },
+    {
       title: "导入时间",
       dataIndex: "imported_at",
       width: 160,
@@ -356,7 +381,7 @@ export default function PhonesPage() {
           setPage(1);
         }}
         showClear
-        placeholder="搜索手机号 / 接码地址"
+        placeholder="搜索手机号 / 接码地址 / 客户 / 微信 / 闲鱼 / 套餐"
         style={{ width: isMobile ? "100%" : 240 }}
       />
       <Select
@@ -610,6 +635,17 @@ function MobileList({
                   最近 {fmtTime(p.last_used_at)}
                 </Text>
               </div>
+
+              {p.checkout_meta ? (
+                <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 8 }}>
+                  <Text type="tertiary" size="small">
+                    发货 {p.checkout_meta.customer || "—"}
+                  </Text>
+                  <Text type="tertiary" size="small">
+                    {[p.checkout_meta.wechat, p.checkout_meta.xianyu, p.checkout_meta.plan].filter(Boolean).join(" / ") || "—"}
+                  </Text>
+                </div>
+              ) : null}
 
               {/* 操作行：大按钮拇指可点 */}
               <div style={{ display: "flex", gap: 8, marginTop: 12 }}>

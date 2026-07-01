@@ -22,6 +22,7 @@ from services.mailbox_service import mailbox_service
 class AccountCreateRequest(BaseModel):
     tokens: list[str] = Field(default_factory=list)
     accounts: list[dict[str, Any]] = Field(default_factory=list)
+    text: str = ""
 
 
 class AccountDeleteRequest(BaseModel):
@@ -52,6 +53,7 @@ class Account2FARequest(BaseModel):
 class AccountMarkUsedRequest(BaseModel):
     access_tokens: list[str] = Field(default_factory=list)
     used: bool = True
+    meta_by_token: dict[str, dict[str, str]] = Field(default_factory=dict)
 
 
 class AccountCredentialsExportRequest(BaseModel):
@@ -66,6 +68,11 @@ def _account_payload_token(item: dict[str, Any]) -> str:
 
 def _unique_tokens(tokens: list[str]) -> list[str]:
     return list(dict.fromkeys(str(token or "").strip() for token in tokens if str(token or "").strip()))
+
+
+def _looks_like_jwt(token: str) -> bool:
+    token = str(token or "").strip()
+    return token.startswith("eyJ") and token.count(".") == 2
 
 
 def _paginate(seq: list[Any], page: int, page_size: int) -> list[Any]:
@@ -162,11 +169,12 @@ def create_router() -> APIRouter:
     @router.post("/api/accounts")
     async def create_accounts(body: AccountCreateRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        account_payloads = [item for item in body.accounts if isinstance(item, dict)]
+        parsed_accounts, parsed_tokens = account_service.parse_import_blob(body.text)
+        account_payloads = [item for item in body.accounts if isinstance(item, dict)] + parsed_accounts
         payload_tokens = [_account_payload_token(item) for item in account_payloads]
-        tokens = _unique_tokens([*body.tokens, *payload_tokens])
+        tokens = _unique_tokens([*body.tokens, *parsed_tokens, *payload_tokens])
         if not tokens:
-            raise HTTPException(status_code=400, detail={"error": "tokens is required"})
+            raise HTTPException(status_code=400, detail={"error": "未识别到可导入的账号信息"})
         if account_payloads:
             result = account_service.add_account_items(account_payloads)
             payload_token_set = set(_unique_tokens(payload_tokens))
@@ -321,7 +329,7 @@ def create_router() -> APIRouter:
         tokens = _unique_tokens(body.access_tokens)
         if not tokens:
             raise HTTPException(status_code=400, detail={"error": "access_tokens is required"})
-        return account_service.mark_used(tokens, bool(body.used))
+        return account_service.mark_used(tokens, bool(body.used), body.meta_by_token)
 
     @router.post("/api/accounts/update")
     async def update_account(body: AccountUpdateRequest, authorization: str | None = Header(default=None)):

@@ -8,6 +8,7 @@ import MailboxesPage from "@/pages/MailboxesPage";
 import PhonesPage from "@/pages/PhonesPage";
 import DispatchPage from "@/pages/DispatchPage";
 import SettingsPage from "@/pages/SettingsPage";
+import FinishedAccountsPage from "@/pages/FinishedAccountsPage";
 
 export default function App() {
   return (
@@ -17,6 +18,7 @@ export default function App() {
         <Route path="/" element={<Navigate to="/accounts" replace />} />
         <Route path="/dashboard" element={<Navigate to="/accounts" replace />} />
         <Route path="/accounts" element={<AccountsPage />} />
+        <Route path="/finished-accounts" element={<FinishedAccountsPage />} />
         <Route path="/cdks" element={<CdksPage />} />
         <Route path="/phones" element={<PhonesPage />} />
         <Route path="/dispatch" element={<DispatchPage />} />

@@ -971,14 +971,14 @@ class AccountService:
             "referer": f"{auth_base}/email-verification",
             "user-agent": user_agent,
         }
-        # 发码前先记录信箱里已有的验证码（可能是上一次残留的旧码）。邮件常有延迟，
-        # 若不排除旧码，会在发码后立刻抓到旧码提交，导致校验异常/拿不到 auth code。
-        baseline = None
+        # 发码前先记录信箱里当前最新邮件的到达时间。邮件常有延迟，且 OpenAI 有时重发相同的码，
+        # 故不能按码值判断新旧——发码后只接受「到达时间晚于此基线」的邮件里的验证码。
+        baseline_time = None
         if hasattr(otp_fetch, "peek"):
             try:
-                baseline = otp_fetch.peek()
+                baseline_time = otp_fetch.peek()
             except Exception:
-                baseline = None
+                baseline_time = None
         try:
             session.get(
                 f"{auth_base}/api/accounts/email-otp/send",
@@ -989,9 +989,9 @@ class AccountService:
         except Exception:
             pass
         try:
-            code = otp_fetch(exclude=baseline)  # 等待与旧码不同的新码（覆盖邮件迟到）
+            code = otp_fetch(after=baseline_time)  # 只接受发码后新到达的邮件里的码（按到达时间判断）
         except TypeError:
-            code = otp_fetch()  # 兼容不支持 exclude 的回调
+            code = otp_fetch()  # 兼容不支持 after 的回调
         except Exception:
             code = None
         if not code:
@@ -1071,13 +1071,13 @@ class AccountService:
         mailbox = {"provider": mail_provider.API_MAILBOX_TYPE, "address": email, "fetch_url": fetch_url}
 
         class _OtpFetcher:
-            """取码回调：__call__ 等待验证码（可排除发码前的旧码）；peek() 立即读当前旧码基线。"""
+            """取码回调：__call__ 等待验证码（可只接受某到达时间之后的新邮件）；peek() 读当前最新邮件到达时间。"""
 
-            def peek(self) -> str | None:
-                return mail_provider.peek_code(mail_config, mailbox)
+            def peek(self):
+                return mail_provider.peek_received_at(mail_config, mailbox)
 
-            def __call__(self, exclude: str | None = None) -> str | None:
-                return mail_provider.wait_for_code(mail_config, mailbox, exclude_code=exclude)
+            def __call__(self, after=None):
+                return mail_provider.wait_for_code(mail_config, mailbox, after_received_at=after)
 
         return _OtpFetcher()
 

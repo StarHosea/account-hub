@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from services.config import DATA_DIR
@@ -95,6 +95,9 @@ class MailboxService:
             "registered_at": item.get("registered_at") or None,
             "imported_at": item.get("imported_at") or _now(),
             "in_use_at": item.get("in_use_at") or None,
+            # 冷却截止时间：环境类失败（Cloudflare/超时等，与邮箱本身无关）释放回池后短暂冷却，
+            # 避免同一邮箱被下个任务立刻重领而空转。到点自动重新可用。
+            "cooldown_until": item.get("cooldown_until") or None,
             "note": str(item.get("note") or ""),
         }
 
@@ -191,15 +194,27 @@ class MailboxService:
     def _is_available(self, item: dict) -> bool:
         if item["used"]:
             return False
+        # 环境类失败释放后的冷却期：未到点则暂不可领用。
+        cooldown_until = str(item.get("cooldown_until") or "")
+        if cooldown_until:
+            try:
+                cd = datetime.fromisoformat(cooldown_until)
+                cd = cd if cd.tzinfo else cd.replace(tzinfo=timezone.utc)
+                if datetime.now(timezone.utc) < cd:
+                    return False
+            except Exception:
+                pass  # 冷却时间戳非法：忽略冷却，按占用态逻辑继续判断
         if item.get("in_use"):
             in_use_at = str(item.get("in_use_at") or "")
+            if not in_use_at:
+                return False  # 占用中但无时间戳：保守视为不可用（原来错误 return True 会导致重复领取）
             try:
                 ts = datetime.fromisoformat(in_use_at)
                 ts = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
                 age = (datetime.now(timezone.utc) - ts).total_seconds()
                 return age >= IN_USE_STALE_SECONDS
             except Exception:
-                return True
+                return False  # 时间戳非法：保守视为占用中（原来错误 return True）
         return True
 
     def acquire_unused(self) -> dict | None:
@@ -209,18 +224,44 @@ class MailboxService:
                 if self._is_available(item):
                     item["in_use"] = True
                     item["in_use_at"] = _now()
+                    item["cooldown_until"] = None  # 领用即清冷却（能被领说明冷却已过或无冷却）
                     self._save()
                     return {"email": item["email"], "fetch_url": item["fetch_url"]}
         return None
 
-    def release(self, email: str) -> None:
-        """把占用态释放回未使用（用于流程主动放弃且未消费验证码时）。"""
+    def release(self, email: str, cooldown_seconds: float = 0) -> None:
+        """把占用态释放回未使用（用于流程主动放弃、或环境类失败可重试时）。
+
+        cooldown_seconds>0 时写冷却截止时间，冷却期内 _is_available 返回 False，
+        避免刚失败的邮箱被下一个任务立刻重领而空转（如 Cloudflare 拦截、网络超时）。
+        """
         with self._lock:
             item = self._mailboxes.get(_norm_email(email))
             if item is not None and item.get("in_use") and not item["used"]:
                 item["in_use"] = False
                 item["in_use_at"] = None
+                if cooldown_seconds and cooldown_seconds > 0:
+                    until = datetime.now(timezone.utc) + timedelta(seconds=cooldown_seconds)
+                    item["cooldown_until"] = until.isoformat()
+                else:
+                    item["cooldown_until"] = None
                 self._save()
+
+    def mark_used_bad(self, email: str, note: str = "") -> None:
+        """把邮箱标记为不可再用（used=True）：用于「邮箱疑似已注册过账号」等永久性失败，
+        避免注册机反复领用同一坏邮箱空转。不绑定账号 token。
+        """
+        with self._lock:
+            item = self._mailboxes.get(_norm_email(email))
+            if item is None:
+                return
+            item["used"] = True
+            item["in_use"] = False
+            item["in_use_at"] = None
+            item["cooldown_until"] = None
+            if note:
+                item["note"] = note
+            self._save()
 
     def bind_account(self, email: str, account_token: str) -> None:
         """注册成功：标记 used 并记录绑定账号。"""

@@ -73,10 +73,16 @@ class ActivationService:
                 "logs": self._logs[-300:],
             }
 
-    def _append_log(self, text: str, level: str = "info") -> None:
+    def _append_log(self, text: str, level: str = "info", log_sink=None) -> None:
         with self._lock:
             self._logs.append({"time": _now(), "text": scrub(text), "level": level})
             self._logs = self._logs[-300:]
+        # 自动激活链路：把同一条进度转发到注册机日志面板（前缀区分来源）。
+        if log_sink is not None:
+            try:
+                log_sink(f"[自动激活] {scrub(text)}", level or "info")
+            except Exception:
+                pass
 
     def _bump(self, **updates) -> None:
         with self._lock:
@@ -110,33 +116,36 @@ class ActivationService:
         self._append_log("已请求停止激活任务，正在等待当前任务结束", "yellow")
         return self.get()
 
-    def activate_token_async(self, token: str) -> bool:
+    def activate_token_async(self, token: str, log_sink=None) -> bool:
         """注册成功后由注册机调用：若开启「注册后自动激活」且配置了 API Key，
         起一个后台线程对单个账号尝试激活（不影响批量激活任务）。返回是否已派发。
+
+        log_sink：可选回调 (text, level)，用于把本次自动激活的进度**同时**转发到注册机
+        日志面板（注册机与激活是同一条链路，用户在同一面板追踪全过程）。
         """
         cfg = config.cdk_activation
         if not cfg.get("auto_activate_after_register"):
             return False
         if not cfg["api_key"]:
-            self._append_log("已开启注册后自动激活，但未配置 CDK API Key，跳过", "yellow")
+            self._append_log("已开启注册后自动激活，但未配置 CDK API Key，跳过", "yellow", log_sink)
             return False
         if cdk_service.counts().get("available", 0) <= 0:
-            self._append_log("已开启注册后自动激活，但当前无可用 CDK，跳过", "yellow")
+            self._append_log("已开启注册后自动激活，但当前无可用 CDK，跳过", "yellow", log_sink)
             return False
 
         def _worker():
             client = CdkRedeemClient(cfg["base_url"], cfg["api_key"])
             try:
-                self._activate_account(client, token, cfg)
+                self._activate_account(client, token, cfg, log_sink=log_sink)
             except AuthError as exc:
-                self._append_log(f"自动激活鉴权失败：{exc}", "red")
+                self._append_log(f"自动激活鉴权失败：{exc}", "red", log_sink)
             except Exception as exc:  # noqa: BLE001
-                self._append_log(f"自动激活异常：{exc}", "red")
+                self._append_log(f"自动激活异常：{exc}", "red", log_sink)
             finally:
                 client.close()
 
         threading.Thread(target=_worker, daemon=True, name=f"auto-activate-{token[:8]}").start()
-        self._append_log(f"注册成功后已自动派发激活：{token[:8]}…", "")
+        self._append_log(f"注册成功后已自动派发激活：{token[:8]}…", "", log_sink)
         return True
 
     def _resolve_targets(self, tokens: list[str] | None) -> list[str]:
@@ -196,7 +205,7 @@ class ActivationService:
         fields["plus_updated_at"] = _now()
         account_service.update_account(token, fields, quiet=True)
 
-    def _activate_account(self, client: CdkRedeemClient, token: str, cfg: dict) -> bool:
+    def _activate_account(self, client: CdkRedeemClient, token: str, cfg: dict, log_sink=None) -> bool:
         if self._stop.is_set():
             return False
         acct = account_service.get_account(token)
@@ -210,12 +219,12 @@ class ActivationService:
             while attempts.get(cdk_type, 0) < max_attempts and not self._stop.is_set():
                 cdk = cdk_service.acquire_available(cdk_type, exclude=tried)
                 if not cdk:
-                    self._append_log(f"[{email}] 无可用 {cdk_type} CDK，跳过该类型", "yellow")
+                    self._append_log(f"[{email}] 无可用 {cdk_type} CDK，跳过该类型", "yellow", log_sink)
                     break
                 tried.add(cdk)
                 any_attempt = True
                 self._set_account(token, plus_status=STATUS_QUEUED, plus_cdk=cdk, plus_last_message=f"提交 {cdk_type} CDK 兑换")
-                self._append_log(f"[{email}] 尝试 {cdk_type} CDK（第 {attempts.get(cdk_type, 0) + 1}/{max_attempts} 次）", "")
+                self._append_log(f"[{email}] 尝试 {cdk_type} CDK（第 {attempts.get(cdk_type, 0) + 1}/{max_attempts} 次）", "", log_sink)
                 try:
                     cls, status, message, task_id = self._attempt(client, token, cdk, cfg)
                 except AuthError:
@@ -226,19 +235,21 @@ class ActivationService:
                 if cls == "success":
                     cdk_service.consume(cdk, token)
                     self._set_account(token, plus_status=STATUS_ACTIVATED, type="Plus", plus_task_id=task_id, plus_last_message=message or "兑换成功")
-                    self._append_log(f"[{email}] 激活成功（{cdk_type}）", "green")
+                    self._append_log(f"[{email}] 激活成功（{cdk_type}）", "green", log_sink)
                     return True
                 if cls == "cdk_invalid":
                     cdk_service.mark_invalid(cdk)
-                    self._append_log(f"[{email}] CDK {scrub(cdk)} 无效(not_found)，换下一个", "yellow")
+                    self._append_log(f"[{email}] CDK {scrub(cdk)} 无效(not_found)，换下一个", "yellow", log_sink)
                     continue  # 不计入尝试次数
                 # fail / pending(timeout) / unknown → 计一次失败尝试，CDK 保持可用
                 attempts[cdk_type] = attempts.get(cdk_type, 0) + 1
                 self._set_account(token, plus_attempts=attempts, plus_last_message=message or status)
-                self._append_log(f"[{email}] {cdk_type} 第 {attempts[cdk_type]} 次失败：{scrub(message or status)}", "red")
+                self._append_log(f"[{email}] {cdk_type} 第 {attempts[cdk_type]} 次失败：{scrub(message or status)}", "red", log_sink)
 
         self._set_account(token, plus_status=STATUS_FAILED,
                           plus_last_message=("两种类型 CDK 均激活失败" if any_attempt else "无可用 CDK"))
+        if any_attempt:
+            self._append_log(f"[{email}] 两种类型 CDK 均激活失败，标记激活失败", "red", log_sink)
         return False
 
     def _attempt(self, client: CdkRedeemClient, token: str, cdk: str, cfg: dict) -> tuple[str, str, str, str]:

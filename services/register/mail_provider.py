@@ -105,6 +105,32 @@ def _extract_code(message: dict[str, Any]) -> str | None:
     return None
 
 
+_TS_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?")
+
+
+def _extract_received_at(content: str) -> datetime | None:
+    """从收件页 HTML 里解析邮件的真实到达时间（provider 本地时区的朴素时间，仅用于相对先后比较）。
+
+    优先取「时间/日期/Date/Received」标签后的时间戳；否则取页面里第一个时间戳。解析失败返回 None。
+    """
+    text = content or ""
+    match = None
+    for label in ("时间", "日期", "Date", "Received", "Time"):
+        match = re.search(re.escape(label) + r"[：:\s]*" + _TS_RE.pattern, text)
+        if match:
+            break
+    if match is None:
+        match = _TS_RE.search(text)
+    if match is None:
+        return None
+    try:
+        year, month, day, hour, minute = (int(match.group(i)) for i in range(1, 6))
+        second = int(match.group(6) or 0)
+        return datetime(year, month, day, hour, minute, second)
+    except Exception:
+        return None
+
+
 def _message_tracking_ref(message: dict[str, Any]) -> str:
     provider = str(message.get("provider") or "").strip()
     mailbox = str(message.get("mailbox") or "").strip()
@@ -204,34 +230,31 @@ class BaseMailProvider:
             time.sleep(max(0.2, self.conf["wait_interval"]))
         return None
 
-    def peek_code(self, mailbox: dict[str, Any]) -> str | None:
-        """立即取一次信箱里当前最新的验证码（不等待），用于发码前记录旧码基线。"""
+    def peek_received_at(self, mailbox: dict[str, Any]) -> datetime | None:
+        """立即读一次信箱里当前最新邮件的到达时间（不等待），用于发码前记录时间基线。"""
         message = self.fetch_latest_message(mailbox)
-        return _extract_code(message) if message else None
+        return message.get("received_at") if message else None
 
-    def wait_for_code(self, mailbox: dict[str, Any], exclude_code: str | None = None) -> str | None:
-        """轮询取验证码。exclude_code 给定时，跳过与其相同的码（发码前的旧码），
-        继续等待新码到达——用于邮件迟到、信箱里残留上一次验证码的场景。"""
-        seen_value = mailbox.setdefault("_seen_code_message_refs", [])
-        if not isinstance(seen_value, list):
-            seen_value = []
-            mailbox["_seen_code_message_refs"] = seen_value
-        seen_refs = {str(item) for item in seen_value}
-        exclude = str(exclude_code or "").strip()
+    def wait_for_code(self, mailbox: dict[str, Any], after_received_at: datetime | None = None) -> str | None:
+        """轮询取验证码，最长等待由 conf['wait_timeout'] 限定。
 
-        def extract_unseen_code(message: dict[str, Any]) -> str | None:
-            ref = _message_tracking_ref(message)
-            if ref in seen_refs:
-                return None
+        after_received_at 给定时，只接受「到达时间晚于它」的邮件的验证码（即发码之后新到的邮件），
+        避免抓到发码前残留在信箱里的旧码。按到达时间判断而非码值——OpenAI 有时会重发相同的码，
+        码值相同不代表是旧码。到达时间无法解析时退回接受当前码（避免死等）。
+        """
+
+        def pick_fresh_code(message: dict[str, Any]) -> str | None:
             code = _extract_code(message)
-            if code and exclude and code == exclude:
-                return None  # 与发码前的旧码相同，视为尚未收到新码，继续等待
-            if code:
-                seen_value.append(ref)
-                seen_refs.add(ref)
+            if not code:
+                return None
+            if isinstance(after_received_at, datetime):
+                received = message.get("received_at")
+                if isinstance(received, datetime) and received <= after_received_at:
+                    return None  # 发码前就在信箱里的旧邮件，继续等新邮件到达
             return code
 
-        return self.wait_for(mailbox, extract_unseen_code)
+        return self.wait_for(mailbox, pick_fresh_code)
+
 
 
 class ApiMailboxProvider(BaseMailProvider):
@@ -286,7 +309,8 @@ class ApiMailboxProvider(BaseMailProvider):
             "subject": "",
             "text_content": "",
             "html_content": html,
-            "received_at": datetime.now(timezone.utc),
+            # 解析邮件页里的真实到达时间（用于判断是否为发码后新到的邮件）；解析不到则 None。
+            "received_at": _extract_received_at(html),
         }
 
     def close(self) -> None:
@@ -445,27 +469,43 @@ def create_mailbox(mail_config: dict, username: str | None = None) -> dict:
         provider.close()
 
 
-def wait_for_code(mail_config: dict, mailbox: dict, exclude_code: str | None = None) -> str | None:
+def wait_for_code(mail_config: dict, mailbox: dict, after_received_at: datetime | None = None) -> str | None:
     provider = _create_provider(mail_config, str(mailbox.get("provider") or ""), str(mailbox.get("provider_ref") or ""))
     try:
-        return provider.wait_for_code(mailbox, exclude_code=exclude_code)
+        return provider.wait_for_code(mailbox, after_received_at=after_received_at)
     finally:
         provider.close()
 
 
-def peek_code(mail_config: dict, mailbox: dict) -> str | None:
-    """立即取一次信箱当前最新验证码（不等待），失败/无则返回 None。"""
+def peek_received_at(mail_config: dict, mailbox: dict) -> datetime | None:
+    """立即读一次信箱当前最新邮件的到达时间（不等待），失败/无则返回 None。"""
     provider = _create_provider(mail_config, str(mailbox.get("provider") or ""), str(mailbox.get("provider_ref") or ""))
     try:
-        return provider.peek_code(mailbox)
+        return provider.peek_received_at(mailbox)
     except Exception:
         return None
     finally:
         provider.close()
 
 
+# 环境类失败释放后的冷却秒数（Cloudflare/网络/验证码超时等，与邮箱本身无关，稍后可重试）。
+_RELEASE_COOLDOWN_SECONDS = 120
+
+# 「邮箱疑似已注册过账号」的失败特征：命中则永久标坏邮箱，不再领用。
+# invalid_auth_step = platform authorize 落到登录页（该邮箱已存在账号），继续提交注册必失败。
+_BAD_MAILBOX_MARKERS = ("invalid_auth_step", "invalid authorization step", "already exists", "email_exists")
+
+
+def _is_bad_mailbox_error(error: Exception | str | None) -> bool:
+    text = str(error or "").lower()
+    return any(marker in text for marker in _BAD_MAILBOX_MARKERS)
+
+
 def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str | None = None) -> None:
-    """注册流程结束后更新邮箱池状态（仅 API 邮箱池）：成功则绑定账号并标 used；失败则释放占用。
+    """注册流程结束后更新邮箱池状态（仅 API 邮箱池）：
+    - 成功：绑定账号并标 used；
+    - 邮箱疑似已注册（invalid_auth_step 等）：标坏邮箱（used=True），不再领用；
+    - 其它（环境类）失败：释放并短暂冷却，避免下个任务立刻重领同一邮箱空转。
 
     CloudMail 为按需生成地址、非池化，无需回写状态。
     """
@@ -476,8 +516,10 @@ def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str 
         return
     if success:
         mailbox_service.bind_account(address, str(mailbox.get("access_token") or ""))
+    elif _is_bad_mailbox_error(error):
+        mailbox_service.mark_used_bad(address, note="疑似已注册过账号，注册机自动标记不可用")
     else:
-        mailbox_service.release(address)
+        mailbox_service.release(address, cooldown_seconds=_RELEASE_COOLDOWN_SECONDS)
 
 
 def release_mailbox(mailbox: dict) -> None:

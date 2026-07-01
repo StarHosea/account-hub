@@ -1573,6 +1573,9 @@ class AccountService:
         payload = dict(item)
         payload.pop("accessToken", None)
         payload["access_token"] = access_token
+        # 接码地址不落在账号对象上（GET 时按邮箱动态挂 mail_link），仅用于导入端登记邮箱，此处剥离。
+        payload.pop("mail_link", None)
+        payload.pop("fetch_url", None)
         # CPA/Codex 导出文件里的 `type=codex` 是导出格式，不是号池套餐类型。
         if str(payload.get("type") or "").strip().lower() == "codex":
             payload["export_type"] = "codex"
@@ -1590,7 +1593,31 @@ class AccountService:
             for item in items
             if (payload := self._prepare_account_payload(item)) is not None
         ]
-        return self._add_account_payloads(payloads)
+        result = self._add_account_payloads(payloads)
+        self._register_imported_mailboxes(items)
+        return result
+
+    def _register_imported_mailboxes(self, items: list[dict]) -> None:
+        """迁移导入时，把随账号带入的邮箱接码地址登记进邮箱管理（mailbox_service）。
+
+        兼容读取 `mail_link`（新）与 `fetch_url`（旧/凭据格式）两种键；登记失败不影响导入主流程。
+        """
+        pairs: list[tuple[str, str, str]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            email = str(item.get("email") or "").strip()
+            fetch_url = str(item.get("mail_link") or item.get("fetch_url") or "").strip()
+            if email and fetch_url:
+                pairs.append((email, fetch_url, self._account_payload_token(item)))
+        if not pairs:
+            return
+        try:
+            from services.mailbox_service import mailbox_service
+            for email, fetch_url, token in pairs:
+                mailbox_service.register_imported(email, fetch_url, token)
+        except Exception:
+            pass
 
     def add_accounts(self, tokens: list[str], source_type: str = "web") -> dict:
         tokens = list(dict.fromkeys(token for token in tokens if token))
@@ -2151,6 +2178,16 @@ class AccountService:
             password = str(account.get("password") or "").strip()
             if password:
                 item["password"] = password
+            # 邮箱接码地址存在独立的 mailbox_service（按邮箱为键），不在账号对象上。
+            # 迁移时一并带出，否则目标系统无法自动取邮箱 OTP（开启 2FA / 重新登录会卡 need_verification_code）。
+            if email:
+                try:
+                    from services.mailbox_service import mailbox_service
+                    mail_link = str(mailbox_service.get_fetch_url(email) or "").strip()
+                except Exception:
+                    mail_link = ""
+                if mail_link:
+                    item["mail_link"] = mail_link
             # 迁移到另一套系统时保留账号级代理及其地区信息，导入端 _normalize_account 会原样收下。
             proxy = str(account.get("proxy") or "").strip()
             if proxy:

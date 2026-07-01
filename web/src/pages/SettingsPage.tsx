@@ -87,7 +87,7 @@ export default function SettingsPage() {
         ) : (
           <>
             <Row label="全局代理">
-              <Input value={config.proxy ?? ""} onChange={setProxy} placeholder="http://127.0.0.1:7890" />
+              <Input value={config.proxy ?? ""} onChange={setProxy} placeholder="留空则不使用代理，例：http://host:port" />
             </Row>
             <Row label="账号刷新间隔（分钟）">
               <InputNumber

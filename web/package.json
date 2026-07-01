@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "postbuild": "rm -rf ../web_dist && cp -r dist ../web_dist",
     "preview": "vite preview"
   },
   "dependencies": {

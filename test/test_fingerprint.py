@@ -71,6 +71,14 @@ class RotateIpwebTest(unittest.TestCase):
         self.assertEqual(sid, "Ab000001")
         self.assertIn("Ab000001", url)
 
+    def test_duration_override(self):
+        url, _ = fp.rotate_ipweb_proxy(IPWEB_RAW, "US", duration=120)
+        segs = fp.parse_proxy(url).user.split("_")
+        self.assertEqual(segs[5], "120")  # 时长段被覆盖
+        # 不传 duration 时保留模板原值 10
+        url2, _ = fp.rotate_ipweb_proxy(IPWEB_RAW, "US")
+        self.assertEqual(fp.parse_proxy(url2).user.split("_")[5], "10")
+
     def test_non_ipweb_unchanged(self):
         url, sid = fp.rotate_ipweb_proxy("socks5://user:pass@1.2.3.4:1080", "US")
         self.assertIsNone(sid)

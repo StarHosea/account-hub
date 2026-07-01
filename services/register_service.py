@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 import threading
 import time
 import uuid
@@ -37,6 +38,9 @@ def _default_config() -> dict:
         "threads": 3,
         "enabled": False,
         "enable_2fa": True,
+        "regions": ["US"],
+        "ipweb_rotate": False,
+        "ip_duration": 120,
         "stats": {
             "success": 0,
             "fail": 0,
@@ -95,6 +99,11 @@ def _normalize(raw: dict) -> dict:
     cfg["enabled"] = bool(raw.get("enabled"))
     # 缺失时回退到默认（现默认开），避免旧配置文件没有该键就被强制关掉。
     cfg["enable_2fa"] = bool(raw.get("enable_2fa", cfg["enable_2fa"]))
+    valid_regions = set(openai_register.fingerprint.REGIONS.keys())
+    raw_regions = raw.get("regions") if isinstance(raw.get("regions"), list) else []
+    cfg["regions"] = [r for r in raw_regions if r in valid_regions] or ["US"]
+    cfg["ipweb_rotate"] = bool(raw.get("ipweb_rotate"))
+    cfg["ip_duration"] = min(2880, max(1, int(raw.get("ip_duration") or 120)))
     base_stats = _default_config()["stats"]
     raw_stats = raw.get("stats") if isinstance(raw.get("stats"), dict) else {}
     cfg["stats"] = {**base_stats, **{k: raw_stats[k] for k in base_stats if k in raw_stats}, "threads": cfg["threads"]}
@@ -127,7 +136,7 @@ class RegisterService:
             return json.loads(json.dumps({**self._config, "logs": self._logs[-300:]}, ensure_ascii=False))
 
     def _push_to_worker(self) -> None:
-        openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads", "enable_2fa")})
+        openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads", "enable_2fa", "regions", "ipweb_rotate", "ip_duration")})
 
     def update(self, updates: dict) -> dict:
         with self._lock:
@@ -177,11 +186,27 @@ class RegisterService:
             self._logs.append({"time": _now(), "text": str(text), "level": str(color or "info")})
             self._logs = self._logs[-300:]
 
+    # 自动激活错峰参数：避免「注册成功秒充 Plus」这种非自然行为聚类
+    _ACT_MIN_DELAY = 30.0
+    _ACT_MAX_DELAY = 180.0
+    _ACT_GAP_MIN = 20.0
+    _ACT_GAP_MAX = 60.0
+
     def _maybe_auto_activate(self, result: dict) -> None:
-        """注册成功后，若开启「注册后自动激活」，派发该账号的 Plus 激活（懒加载避免循环依赖）。"""
+        """注册成功后，若开启「注册后自动激活」，延迟 + 跨账号错峰派发 Plus 激活。"""
         token = str((result.get("result") or {}).get("access_token") or "").strip()
         if not token:
             return
+        delay = random.uniform(self._ACT_MIN_DELAY, self._ACT_MAX_DELAY)
+        with self._lock:
+            base = max(time.time(), float(getattr(self, "_act_next_floor", 0.0)))
+            fire_at = base + delay
+            self._act_next_floor = fire_at + random.uniform(self._ACT_GAP_MIN, self._ACT_GAP_MAX)
+        timer = threading.Timer(max(0.0, fire_at - time.time()), self._dispatch_activation, args=(token,))
+        timer.daemon = True
+        timer.start()
+
+    def _dispatch_activation(self, token: str) -> None:
         try:
             from services.activation_service import activation_service
             activation_service.activate_token_async(token)

@@ -41,11 +41,12 @@ config = {
     "enable_2fa": True,
     "regions": ["US"],
     "ipweb_rotate": False,
+    "ip_duration": 120,
 }
 register_config_file = base_dir.parents[1] / "data" / "register.json"
 try:
     saved_config = json.loads(register_config_file.read_text(encoding="utf-8"))
-    config.update({key: saved_config[key] for key in ("mail", "proxy", "total", "threads", "regions", "ipweb_rotate") if key in saved_config})
+    config.update({key: saved_config[key] for key in ("mail", "proxy", "total", "threads", "regions", "ipweb_rotate", "ip_duration") if key in saved_config})
 except Exception:
     pass
 
@@ -333,10 +334,11 @@ def request_platform_oauth_token(
     code_verifier: str,
     client_id: str = platform_oauth_client_id,
     redirect_uri: str = platform_oauth_redirect_uri,
+    identity=None,
 ) -> dict | None:
     headers = {
         "accept": "*/*",
-        "accept-language": "zh-CN,zh;q=0.9",
+        "accept-language": identity.accept_language if identity is not None else "en-US,en;q=0.9",
         "auth0-client": platform_auth0_client,
         "cache-control": "no-cache",
         "content-type": "application/json",
@@ -344,13 +346,13 @@ def request_platform_oauth_token(
         "pragma": "no-cache",
         "priority": "u=1, i",
         "referer": f"{platform_base}/",
-        "sec-ch-ua": sec_ch_ua,
+        "sec-ch-ua": identity.sec_ch_ua if identity is not None else sec_ch_ua,
         "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
+        "sec-ch-ua-platform": identity.profile.platform if identity is not None else '"Windows"',
         "sec-fetch-dest": "empty",
         "sec-fetch-mode": "cors",
         "sec-fetch-site": "same-site",
-        "user-agent": user_agent,
+        "user-agent": identity.user_agent if identity is not None else user_agent,
     }
     resp = session.post(
         f"{auth_base}/api/accounts/oauth/token",
@@ -372,8 +374,11 @@ def request_platform_oauth_token(
 
 
 class PlatformRegistrar:
-    def __init__(self, proxy: str = "") -> None:
-        self.session = create_session(proxy)
+    def __init__(self, proxy: str = "", identity=None) -> None:
+        self.identity = identity or build_identity("US")
+        self.proxy = proxy
+        self.exit_ip = ""
+        self.session = create_session(proxy, impersonate=self.identity.impersonate)
         self.device_id = str(uuid.uuid4())
         self.code_verifier = ""
         self.platform_auth_code = ""
@@ -381,14 +386,45 @@ class PlatformRegistrar:
     def close(self) -> None:
         self.session.close()
 
+    def _capture_exit_ip(self, index: int) -> None:
+        """注册会话建立后，经代理探一次出口 IP（非 GPT 官方接口，失败不影响注册）。
+
+        住宅代理偶发抖动，故多端点 + 重试，尽量拿到 IP；最终拿不到也只是不展示。
+        """
+        endpoints = [
+            ("https://ipinfo.io/json", True),
+            ("https://api.ipify.org?format=json", True),
+            ("https://ipinfo.io/ip", False),
+            ("https://api.ip.sb/ip", False),
+        ]
+        for url, is_json in endpoints:
+            try:
+                resp, _ = request_with_local_retry(self.session, "get", url, retry_attempts=2, verify=False)
+                if resp is None or getattr(resp, "status_code", 0) != 200:
+                    continue
+                if is_json:
+                    data = _response_json(resp)
+                    ip = str(data.get("ip") or "").strip()
+                    country = str(data.get("country") or "").strip()
+                else:
+                    ip = str(getattr(resp, "text", "") or "").strip()
+                    country = ""
+                if ip:
+                    self.exit_ip = ip
+                    step(index, f"出口 IP: {ip}{(' / ' + country) if country else ''}")
+                    return
+            except Exception:
+                continue
+        step(index, "出口 IP 探测失败（不影响注册）", "yellow")
+
     def _navigate_headers(self, referer: str = "") -> dict[str, str]:
-        headers = dict(navigate_headers)
+        headers = navigate_headers_for(self.identity)
         if referer:
             headers["referer"] = referer
         return headers
 
     def _json_headers(self, referer: str) -> dict[str, str]:
-        headers = dict(common_headers)
+        headers = common_headers_for(self.identity)
         headers["referer"] = referer
         headers["oai-device-id"] = self.device_id
         headers.update(_make_trace_headers())
@@ -437,7 +473,7 @@ class PlatformRegistrar:
     def _register_user(self, email: str, password: str, index: int) -> None:
         step(index, "开始提交注册密码")
         headers = self._json_headers(f"{auth_base}/create-account/password")
-        headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "username_password_create")
+        headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "username_password_create", self.identity)
         resp, error = request_with_local_retry(self.session, "post", f"{auth_base}/api/accounts/user/register", json={"username": email, "password": password}, headers=headers, verify=False)
         if resp is None or resp.status_code != 200:
             data = _response_json(resp) if resp is not None else {}
@@ -456,7 +492,7 @@ class PlatformRegistrar:
 
     def _validate_otp(self, code: str, index: int) -> None:
         step(index, f"开始校验验证码 {code}")
-        resp, error = validate_otp(self.session, self.device_id, code)
+        resp, error = validate_otp(self.session, self.device_id, code, self.identity)
         if resp is None or resp.status_code != 200:
             body = ""
             try:
@@ -469,7 +505,7 @@ class PlatformRegistrar:
     def _create_account(self, name: str, birthdate: str, index: int) -> None:
         step(index, "开始创建账号资料")
         headers = self._json_headers(f"{auth_base}/about-you")
-        headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "oauth_create_account")
+        headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "oauth_create_account", self.identity)
         resp, error = request_with_local_retry(self.session, "post", f"{auth_base}/api/accounts/create_account", json={"name": name, "birthdate": birthdate}, headers=headers, verify=False)
         if resp is None or resp.status_code not in (200, 302):
             data = _response_json(resp) if resp is not None else {}
@@ -484,7 +520,7 @@ class PlatformRegistrar:
 
     def _exchange_registered_tokens(self, index: int) -> dict:
         step(index, "开始换 token")
-        tokens = request_platform_oauth_token(self.session, self.platform_auth_code, self.code_verifier)
+        tokens = request_platform_oauth_token(self.session, self.platform_auth_code, self.code_verifier, identity=self.identity)
         if not tokens:
             raise RuntimeError("token换取失败")
         step(index, "token 换取完成")
@@ -505,10 +541,10 @@ class PlatformRegistrar:
             "authorization": f"Bearer {chatgpt_token}",
             "content-type": "application/json",
             "oai-device-id": self.device_id,
-            "oai-language": "en-US",
+            "oai-language": self.identity.oai_language,
             "origin": chatgpt_base,
             "referer": f"{chatgpt_base}/",
-            "user-agent": user_agent,
+            "user-agent": self.identity.user_agent,
         }
         step(index, "开始申请 2FA 密钥")
         resp, error = request_with_local_retry(self.session, "post", f"{chatgpt_base}/backend-api/accounts/mfa/enroll", json={"factor_type": "totp"}, headers=headers, verify=False)
@@ -536,10 +572,13 @@ class PlatformRegistrar:
         label = str(mailbox.get("label") or "")
         step(index, f"邮箱创建完成[{label}]: {email}")
         try:
+            self._capture_exit_ip(index)
             password = _random_password()
-            first_name, last_name = _random_name()
+            first_name, last_name = _random_name(self.identity)
             self._platform_authorize(email, index)
+            _jitter_sleep()
             self._register_user(email, password, index)
+            _jitter_sleep()
             self._send_otp(index)
             step(index, "开始等待注册验证码")
             code = wait_for_code(mailbox)
@@ -547,12 +586,16 @@ class PlatformRegistrar:
                 raise RuntimeError("等待注册验证码超时")
             step(index, f"收到注册验证码: {code}")
             self._validate_otp(code, index)
+            _jitter_sleep()
             self._create_account(f"{first_name} {last_name}", _random_birthdate(), index)
+            _jitter_sleep()
             tokens = self._exchange_registered_tokens(index)
             totp_info: dict = {}
             if config.get("enable_2fa"):
                 try:
                     # 注册刚拿到的 platform token pwd_auth_time 新鲜，直接可调 mfa/enroll。
+                    # 仅做小幅抖动（受 token 新鲜度限制，不能挪远）。
+                    time.sleep(random.uniform(2.0, 8.0))
                     totp_info = self._enroll_totp(str(tokens.get("access_token") or ""), email, index)
                 except Exception as twofa_error:  # noqa: BLE001
                     step(index, f"2FA 开启失败（不影响注册）：{twofa_error}", "yellow")
@@ -561,6 +604,7 @@ class PlatformRegistrar:
             raise
         mailbox["access_token"] = str(tokens.get("access_token") or "").strip()
         mail_provider.mark_mailbox_result(mailbox, success=True)
+        prof = self.identity.profile
         return {
             "email": email,
             "password": password,
@@ -569,13 +613,44 @@ class PlatformRegistrar:
             "id_token": str(tokens.get("id_token") or "").strip(),
             "source_type": "web",
             "created_at": datetime.now(timezone.utc).isoformat(),
+            # 号一号一 IP：把专属代理与地区/出口 IP 持久化到账号，后续官方接口复用同一出口
+            "proxy": self.proxy,
+            "country": self.identity.region.code,
+            "exit_ip": self.exit_ip,
+            # 指纹持久化（与 openai_backend_api._build_fp 字段对齐），后续对话/relogin 复用同一指纹
+            "impersonate": self.identity.impersonate,
+            "user-agent": self.identity.user_agent,
+            "oai-device-id": self.device_id,
+            "sec-ch-ua": self.identity.sec_ch_ua,
+            "sec-ch-ua-mobile": prof.sec_ch_ua_mobile,
+            "sec-ch-ua-platform": prof.platform,
             **totp_info,
         }
 
 
+def _resolve_account_proxy(identity) -> str:
+    """按账号解析专属出口代理：ipweb 开启则换国家段 + 全新 SID（号一号一 IP），否则归一化沿用。
+
+    duration 取 config["ip_duration"]（分钟），延长同 IP 粘性，覆盖注册全程及后续单次操作。
+    """
+    base = config.get("proxy") or ""
+    if not base:
+        return ""
+    if config.get("ipweb_rotate"):
+        dur = int(config.get("ip_duration") or 120)
+        rotated, sid = rotate_ipweb_proxy(base, identity.region.ipweb_country, duration=dur)
+        if sid is not None:
+            return rotated
+        # 非 ipweb 代理：无法做号一号一 IP，归一化后沿用
+        return normalize_proxy(base)
+    return normalize_proxy(base)
+
+
 def worker(index: int) -> dict:
     start = time.time()
-    registrar = PlatformRegistrar(config["proxy"])
+    identity = build_identity(enabled_regions=config.get("regions") or ["US"])
+    acct_proxy = _resolve_account_proxy(identity)
+    registrar = PlatformRegistrar(acct_proxy, identity=identity)
     try:
         step(index, "任务启动")
         result = registrar.register(index)

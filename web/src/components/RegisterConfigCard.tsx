@@ -7,8 +7,8 @@ import type { RegisterProviderType } from "@/lib/api";
 const { Text } = Typography;
 
 /**
- * 注册机「配置」部分（注册参数 + 邮箱配置）。
- * 原本在独立的「注册机」页，现拆到「设置」页；启动控制见 RegisterControl。
+ * 注册机「配置」部分（注册参数 + 区域 + 代理 + 号一号一 IP + 2FA + 邮箱配置）。
+ * 在「设置」页展示；号池管理页只保留启动/停止（见 RegisterPanel）。
  */
 export default function RegisterConfigCard() {
   const config = useSettingsStore((s) => s.registerConfig);
@@ -17,6 +17,9 @@ export default function RegisterConfigCard() {
   const setTotal = useSettingsStore((s) => s.setRegisterTotal);
   const setThreads = useSettingsStore((s) => s.setRegisterThreads);
   const setEnable2fa = useSettingsStore((s) => s.setRegisterEnable2fa);
+  const setRegions = useSettingsStore((s) => s.setRegisterRegions);
+  const setIpwebRotate = useSettingsStore((s) => s.setRegisterIpwebRotate);
+  const setIpDuration = useSettingsStore((s) => s.setRegisterIpDuration);
   const setMailField = useSettingsStore((s) => s.setRegisterMailField);
   const setProviderType = useSettingsStore((s) => s.setRegisterProviderType);
   const updateProvider = useSettingsStore((s) => s.updateRegisterProvider);
@@ -54,7 +57,7 @@ export default function RegisterConfigCard() {
           </Space>
         }
       >
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 16 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 16 }}>
           <div>
             <Text style={{ display: "block", marginBottom: 6 }}>目标注册数量</Text>
             <InputNumber min={1} value={config.total} onChange={(v) => setTotal(String(v ?? 1))} disabled={running} style={{ width: "100%" }} />
@@ -65,7 +68,45 @@ export default function RegisterConfigCard() {
           </div>
           <div>
             <Text style={{ display: "block", marginBottom: 6 }}>注册代理</Text>
-            <Input value={config.proxy} onChange={setProxy} placeholder="socks5://user:pass@host:port" disabled={running} />
+            <Input value={config.proxy} onChange={setProxy} placeholder="ipweb: gate2.ipweb.cc:7778:user:pass 或 socks5://user:pass@host:port" disabled={running} />
+          </div>
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 16, marginTop: 16 }}>
+          <div style={{ gridColumn: "span 2" }}>
+            <Text style={{ display: "block", marginBottom: 6 }}>注册区域（多选，按账号随机分配出口 IP 地区）</Text>
+            <Select
+              multiple
+              value={config.regions && config.regions.length ? config.regions : ["US"]}
+              onChange={(v) => setRegions((v as string[]) || [])}
+              disabled={running}
+              style={{ width: "100%" }}
+              optionList={[
+                { label: "美国 US", value: "US" },
+                { label: "日本 JP", value: "JP" },
+                { label: "印度 IN", value: "IN" },
+              ]}
+            />
+          </div>
+          <div>
+            <Text style={{ display: "block", marginBottom: 6 }}>号一号一 IP</Text>
+            <Space align="center" style={{ height: 32 }}>
+              <Switch checked={!!config.ipweb_rotate} onChange={setIpwebRotate} disabled={running} />
+              <Text type="tertiary" size="small">仅对 ipweb.cc 代理生效</Text>
+            </Space>
+          </div>
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 16, marginTop: 16 }}>
+          <div>
+            <Text style={{ display: "block", marginBottom: 6 }}>同 IP 保活时长（分钟）</Text>
+            <InputNumber
+              min={1}
+              max={2880}
+              value={config.ip_duration ?? 120}
+              onChange={(v) => setIpDuration(Math.min(2880, Math.max(1, Number(v) || 120)))}
+              disabled={running || !config.ipweb_rotate}
+              style={{ width: "100%" }}
+            />
+            <Text type="tertiary" size="small">窗口内同账号固定同一 IP；超时同地区换新 IP。覆盖注册全程，默认 120</Text>
           </div>
         </div>
         <div style={{ marginTop: 16 }}>
@@ -91,7 +132,7 @@ export default function RegisterConfigCard() {
           />
         </div>
         {providerType === "cloudmail_gen" ? (
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 12 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 12 }}>
             <div>
               <Text style={{ display: "block", marginBottom: 6 }}>CloudMail URL</Text>
               <Input value={String(provider.api_base || "")} onChange={(v) => updateProvider({ api_base: v })} disabled={running} />
@@ -130,7 +171,7 @@ export default function RegisterConfigCard() {
         ) : (
           <Text type="tertiary">邮箱来自「邮箱管理」导入的 API 邮箱池，无需额外配置。</Text>
         )}
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12, marginTop: 16 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 12, marginTop: 16 }}>
           {(["request_timeout", "wait_timeout", "wait_interval"] as const).map((k) => (
             <div key={k}>
               <Text style={{ display: "block", marginBottom: 6 }}>

@@ -17,6 +17,9 @@ class RegisterConfigRequest(BaseModel):
     total: int | None = None
     threads: int | None = None
     enable_2fa: bool | None = None
+    regions: list[str] | None = None
+    ipweb_rotate: bool | None = None
+    ip_duration: int | None = None
 
 
 def create_router() -> APIRouter:

@@ -3,6 +3,7 @@ import { Card, Button, Input, InputNumber, Switch, Toast, Typography, Space, Spi
 import { IconSave } from "@douyinfe/semi-icons";
 
 import { useSettingsStore } from "@/store/settings";
+import { useIsMobile } from "@/lib/use-is-mobile";
 import RegisterConfigCard from "@/components/RegisterConfigCard";
 
 const { Title, Text } = Typography;
@@ -17,6 +18,7 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
 }
 
 export default function SettingsPage() {
+  const isMobile = useIsMobile();
   const config = useSettingsStore((s) => s.config);
   const activation = useSettingsStore((s) => s.activationConfig);
   const loadConfig = useSettingsStore((s) => s.loadConfig);
@@ -92,7 +94,7 @@ export default function SettingsPage() {
                 min={0}
                 value={Number(config.refresh_account_interval_minute) || 0}
                 onChange={(v) => setRefreshInterval(String(v ?? 0))}
-                style={{ width: 200 }}
+                style={{ width: isMobile ? "100%" : 200 }}
               />
             </Row>
             <Space>
@@ -102,9 +104,6 @@ export default function SettingsPage() {
           </>
         )}
       </Card>
-
-      {/* 注册机配置（启动控制在「号池管理」，日志在右上角「日志」面板） */}
-      <RegisterConfigCard />
 
       {/* 激活配置 */}
       <Card
@@ -131,7 +130,7 @@ export default function SettingsPage() {
               <Input value={activation.base_url ?? ""} onChange={(v) => setActField("base_url", v)} />
             </Row>
             <Row label="激活并发数">
-              <InputNumber min={1} max={10} value={activation.concurrency} onChange={(v) => setActField("concurrency", String(v ?? 1))} style={{ width: 200 }} />
+              <InputNumber min={1} max={10} value={activation.concurrency} onChange={(v) => setActField("concurrency", String(v ?? 1))} style={{ width: isMobile ? "100%" : 200 }} />
             </Row>
             <Space>
               <Switch size="small" checked={!!activation.auto_activate_after_register} onChange={setActAuto} />
@@ -140,6 +139,11 @@ export default function SettingsPage() {
           </>
         )}
       </Card>
+
+      {/* 注册机配置（注册参数 + 区域 + 代理 + 号一号一 IP + 2FA + 邮箱） */}
+      <div style={{ marginTop: 16 }}>
+        <RegisterConfigCard />
+      </div>
     </div>
   );
 }

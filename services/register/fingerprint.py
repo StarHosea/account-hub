@@ -351,12 +351,14 @@ def normalize_proxy(raw: str, default_scheme: str = "socks5h") -> str:
 
 
 def rotate_ipweb_proxy(
-    raw: str, region_country: str, *, new_sid: str | None = None
+    raw: str, region_country: str, *, new_sid: str | None = None, duration: int | None = None
 ) -> tuple[str, str | None]:
-    """ipweb「号一号一 IP」改写：换国家段 + 全新 SID（清空 state/city，保留 duration）。
+    """ipweb「号一号一 IP」改写：换国家段 + 全新 SID（清空 state/city，可覆盖 duration）。
 
     仅当 host 以 ipweb.cc 结尾且 username 形如 B_<id>_<country>_<state>_<city>_<dur>_<SID>
     （>=7 段且首段为 "B"）时改写；否则原样返回 (归一化URL, None) 表示未改写。
+
+    duration: 传入则覆盖时长段（分钟），用于延长同 IP 粘性；None 时保留模板原值。
 
     Returns: (proxy_url, sid 或 None)
     """
@@ -372,6 +374,8 @@ def rotate_ipweb_proxy(
     segs[2] = (region_country or segs[2]).upper()
     segs[3] = ""   # state 清空（换国家后旧州码失效）
     segs[4] = ""   # city 清空
+    if duration is not None and int(duration) > 0:
+        segs[5] = str(int(duration))
     segs[-1] = sid
     rotated = ParsedProxy(parsed.scheme, parsed.host, parsed.port, "_".join(segs), parsed.password)
     return rotated.to_url(), sid

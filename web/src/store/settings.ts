@@ -64,6 +64,9 @@ type SettingsStore = {
   setRegisterTotal: (value: string) => void;
   setRegisterThreads: (value: string) => void;
   setRegisterEnable2fa: (value: boolean) => void;
+  setRegisterRegions: (values: string[]) => void;
+  setRegisterIpwebRotate: (value: boolean) => void;
+  setRegisterIpDuration: (value: number) => void;
   setRegisterMailField: (key: "request_timeout" | "wait_timeout" | "wait_interval", value: string) => void;
   setRegisterProviderType: (type: RegisterProviderType) => void;
   updateRegisterProvider: (updates: Partial<RegisterProvider>) => void;
@@ -88,6 +91,9 @@ function buildRegisterPayload(config: RegisterConfig): Partial<RegisterConfig> {
     total: Math.max(1, Number(config.total) || 1),
     threads: Math.max(1, Number(config.threads) || 1),
     enable_2fa: Boolean(config.enable_2fa),
+    regions: config.regions && config.regions.length ? config.regions : ["US"],
+    ipweb_rotate: Boolean(config.ipweb_rotate),
+    ip_duration: Math.min(2880, Math.max(1, Number(config.ip_duration) || 120)),
   };
 }
 
@@ -222,6 +228,24 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   setRegisterEnable2fa: (value) => {
     set((state) =>
       state.registerConfig ? { registerConfig: { ...state.registerConfig, enable_2fa: value } } : {},
+    );
+  },
+
+  setRegisterRegions: (values) => {
+    set((state) =>
+      state.registerConfig ? { registerConfig: { ...state.registerConfig, regions: values } } : {},
+    );
+  },
+
+  setRegisterIpwebRotate: (value) => {
+    set((state) =>
+      state.registerConfig ? { registerConfig: { ...state.registerConfig, ipweb_rotate: value } } : {},
+    );
+  },
+
+  setRegisterIpDuration: (value) => {
+    set((state) =>
+      state.registerConfig ? { registerConfig: { ...state.registerConfig, ip_duration: value } } : {},
     );
   },
 

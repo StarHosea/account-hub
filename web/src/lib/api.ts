@@ -45,6 +45,8 @@ export type Account = {
   image_inflight?: number;
   last_used_at?: string | null;
   proxy?: string | null;
+  country?: string | null;
+  exit_ip?: string | null;
   password?: string | null;
   created_at?: string | null;
   mail_link?: string | null;
@@ -235,6 +237,44 @@ type CdkListResponse = CdkListPayload & {
   page_size: number;
 };
 
+// ── Phones（手机号池管理）──────────────────────────────────────────
+
+/** 单个手机号最多出库次数（满则自动标记已使用），与后端 MAX_USES 对齐。 */
+export const PHONE_MAX_USES = 3;
+
+export type Phone = {
+  phone: string;
+  fetch_url: string;
+  used: boolean;
+  used_count: number;
+  invalid: boolean;
+  cooldown_until: string | null;
+  reserved_at?: string | null;
+  last_used_at: string | null;
+  imported_at: string | null;
+  note: string;
+};
+
+export type PhoneCounts = {
+  total: number;
+  available: number;
+  cooldown: number;
+  used: number;
+  invalid: number;
+  total_uses: number;
+};
+
+type PhoneListPayload = {
+  items: Phone[];
+  counts: PhoneCounts;
+};
+
+type PhoneListResponse = PhoneListPayload & {
+  total: number;
+  page: number;
+  page_size: number;
+};
+
 // ── Activation（Plus 激活）─────────────────────────────────────────
 
 export type ActivationStats = {
@@ -313,6 +353,9 @@ export type RegisterConfig = {
   total: number;
   threads: number;
   enable_2fa?: boolean;
+  regions?: string[];
+  ipweb_rotate?: boolean;
+  ip_duration?: number;
   stats: {
     job_id?: string;
     success: number;
@@ -543,6 +586,96 @@ export async function exportCdks(type?: CdkType) {
   link.click();
   document.body.removeChild(link);
   URL.revokeObjectURL(url);
+}
+
+// ── Phones ─────────────────────────────────────────────────────────
+
+export type PhoneListParams = PageParams & {
+  q?: string;
+  used?: "0" | "1";
+};
+
+export async function fetchPhones(params: PhoneListParams = {}) {
+  return httpRequest<PhoneListResponse>(`/api/phones${buildQuery(params)}`);
+}
+
+export async function importPhones(text: string) {
+  return httpRequest<PhoneListPayload & { result: { added: number; updated: number; total: number } }>("/api/phones", {
+    method: "POST",
+    body: { text },
+  });
+}
+
+export async function deletePhones(phones: string[]) {
+  return httpRequest<PhoneListPayload & { removed: number }>("/api/phones", {
+    method: "DELETE",
+    body: { phones },
+  });
+}
+
+export async function setPhonesUsed(phones: string[], used: boolean) {
+  return httpRequest<PhoneListPayload & { changed: number }>("/api/phones/used", {
+    method: "PATCH",
+    body: { phones, used },
+  });
+}
+
+/** 累计使用次数 +delta（默认 +1），后端自动标记为已使用。 */
+export async function addPhoneUsage(phones: string[], delta = 1) {
+  return httpRequest<PhoneListPayload & { changed: number }>("/api/phones/use", {
+    method: "POST",
+    body: { phones, delta },
+  });
+}
+
+/** 拉取导出文本（`手机号----接码地址`）。only_unused=true 仅导出未使用。 */
+export async function fetchPhonesExportText(onlyUnused = false): Promise<string> {
+  const params = new URLSearchParams();
+  if (onlyUnused) params.set("only_unused", "true");
+  const path = `/api/phones/export${params.toString() ? `?${params.toString()}` : ""}`;
+  const response = await request.get<string>(path, { responseType: "text" });
+  return String(response.data ?? "");
+}
+
+// ── Dispatch（发号管理）────────────────────────────────────────────
+
+export type DispatchKind = "phone" | "account";
+export type DispatchAction = "checkout" | "cooldown" | "invalid" | "release";
+
+export type DispatchField = { label: string; value: string };
+
+export type DispatchItem = {
+  kind: DispatchKind;
+  id: string;
+  title: string;
+  fields: DispatchField[];
+  used_count?: number;
+  max_uses?: number;
+};
+
+export type DispatchSummary = {
+  account_available: number;
+  phone_available: number;
+};
+
+export async function fetchDispatchSummary() {
+  return httpRequest<DispatchSummary>("/api/dispatch/summary");
+}
+
+/** 发号：预占并返回最老的一个可用号。releaseId 用于「下一个」先释放当前预占。 */
+export async function acquireDispatch(kind: DispatchKind, releaseId?: string) {
+  return httpRequest<{ item: DispatchItem | null; summary: DispatchSummary }>("/api/dispatch/acquire", {
+    method: "POST",
+    body: { kind, release_id: releaseId },
+  });
+}
+
+/** 对已预占的号执行动作：出库 / 冷却 / 无效 / 释放。 */
+export async function dispatchAction(kind: DispatchKind, id: string, action: DispatchAction) {
+  return httpRequest<{ ok: boolean; summary: DispatchSummary }>("/api/dispatch/action", {
+    method: "POST",
+    body: { kind, id, action },
+  });
 }
 
 // ── Activation ─────────────────────────────────────────────────────

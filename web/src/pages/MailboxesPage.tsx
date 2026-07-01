@@ -1,10 +1,28 @@
-import { useEffect, useState } from "react";
-import { Table, Card, Button, Tag, Toast, Modal, TextArea, Typography, Popconfirm, Space, Input, Select } from "@douyinfe/semi-ui-19";
-import { IconRefresh, IconUpload, IconDelete, IconCopy, IconSearch, IconLink } from "@douyinfe/semi-icons";
+import { useEffect, useMemo, useState } from "react";
+import {
+  Table,
+  Card,
+  Button,
+  Tag,
+  Toast,
+  Modal,
+  TextArea,
+  Typography,
+  Popconfirm,
+  Space,
+  Input,
+  Select,
+  Checkbox,
+  Pagination,
+} from "@douyinfe/semi-ui-19";
+import { IconRefresh, IconUpload, IconDelete, IconCopy, IconSearch, IconLink, IconTick, IconClose } from "@douyinfe/semi-icons";
 import type { ColumnProps } from "@douyinfe/semi-ui-19/lib/es/table";
 
 import { fetchMailboxes, importMailboxes, deleteMailboxes, markMailboxes, type Mailbox, type MailboxStats, type MailboxListParams } from "@/lib/api";
 import { useDebouncedValue } from "@/lib/use-debounced-value";
+import { useIsMobile } from "@/lib/use-is-mobile";
+import { StatCards } from "@/components/StatCards";
+import { MobileFilters } from "@/components/MobileFilters";
 
 const { Title, Text } = Typography;
 
@@ -16,7 +34,19 @@ function copy(text: string, label: string) {
   Toast.success(`${label}已复制`);
 }
 
+function statusTag(m: Mailbox) {
+  if (m.in_use) return <Tag color="blue" type="light">占用中</Tag>;
+  if (m.used) return <Tag color="grey" type="light">已用</Tag>;
+  return <Tag color="green" type="light">可用</Tag>;
+}
+
+function fmtTime(v: string | null) {
+  return v ? new Date(v).toLocaleString() : "—";
+}
+
 export default function MailboxesPage() {
+  const isMobile = useIsMobile();
+
   const [items, setItems] = useState<Mailbox[]>([]);
   const [stats, setStats] = useState<MailboxStats>(EMPTY_STATS);
   const [total, setTotal] = useState(0);
@@ -109,6 +139,11 @@ export default function MailboxesPage() {
     }
   };
 
+  const allOnPageSelected = items.length > 0 && items.every((m) => selected.includes(m.email));
+  const toggleSelectAll = () => setSelected(allOnPageSelected ? [] : items.map((m) => m.email));
+  const toggleOne = (email: string) =>
+    setSelected((prev) => (prev.includes(email) ? prev.filter((e) => e !== email) : [...prev, email]));
+
   const columns: ColumnProps<Mailbox>[] = [
     {
       title: "邮箱",
@@ -123,15 +158,7 @@ export default function MailboxesPage() {
         </Space>
       ),
     },
-    {
-      title: "状态",
-      width: 110,
-      render: (_: unknown, m: Mailbox) => {
-        if (m.in_use) return <Tag color="blue" type="light">占用中</Tag>;
-        if (m.used) return <Tag color="grey" type="light">已用</Tag>;
-        return <Tag color="green" type="light">可用</Tag>;
-      },
-    },
+    { title: "状态", width: 110, render: (_: unknown, m: Mailbox) => statusTag(m) },
     {
       title: "接码地址",
       dataIndex: "fetch_url",
@@ -161,7 +188,7 @@ export default function MailboxesPage() {
       width: 150,
       render: (v: string | null) => (
         <Text type="tertiary" size="small">
-          {v ? new Date(v).toLocaleString() : "—"}
+          {fmtTime(v)}
         </Text>
       ),
     },
@@ -184,13 +211,53 @@ export default function MailboxesPage() {
     { label: "占用中", value: stats.in_use, color: "var(--semi-color-primary)" },
   ];
 
+  const filterControls = (
+    <>
+      <Input
+        prefix={<IconSearch />}
+        value={query}
+        onChange={(v) => {
+          setQuery(v);
+          setPage(1);
+        }}
+        showClear
+        placeholder="搜索邮箱 / 接码地址"
+        style={{ width: isMobile ? "100%" : 240 }}
+      />
+      <Select
+        value={statusFilter}
+        onChange={(v) => {
+          setStatusFilter((v as "" | "unused" | "used" | "in_use") ?? "");
+          setPage(1);
+        }}
+        style={{ width: isMobile ? "100%" : 130 }}
+        optionList={[
+          { label: "全部状态", value: "" },
+          { label: "可用", value: "unused" },
+          { label: "已用", value: "used" },
+          { label: "占用中", value: "in_use" },
+        ]}
+      />
+    </>
+  );
+  const activeFilterCount = (query.trim() ? 1 : 0) + (statusFilter ? 1 : 0);
+
   return (
     <div>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
-        <Title heading={3} style={{ margin: 0 }}>
+      <div
+        style={{
+          display: "flex",
+          flexDirection: isMobile ? "column" : "row",
+          alignItems: isMobile ? "stretch" : "center",
+          justifyContent: "space-between",
+          gap: 12,
+          marginBottom: 16,
+        }}
+      >
+        <Title heading={isMobile ? 4 : 3} style={{ margin: 0 }}>
           邮箱管理
         </Title>
-        <Space>
+        <Space spacing={8} style={{ flexWrap: "wrap" }}>
           <Button icon={<IconRefresh />} onClick={() => void load()} loading={loading}>
             刷新
           </Button>
@@ -200,53 +267,22 @@ export default function MailboxesPage() {
         </Space>
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12, marginBottom: 16 }}>
-        {cards.map((c) => (
-          <Card key={c.label} bodyStyle={{ padding: 16 }}>
-            <Text type="tertiary" size="small">
-              {c.label}
-            </Text>
-            <div style={{ fontSize: 22, fontWeight: 600, color: c.color, marginTop: 4 }}>{c.value}</div>
-          </Card>
-        ))}
-      </div>
+      <StatCards mobile={isMobile} items={cards} />
 
-      <div style={{ display: "flex", flexWrap: "wrap", gap: 12, marginBottom: 16 }}>
-        <Input
-          prefix={<IconSearch />}
-          value={query}
-          onChange={(v) => {
-            setQuery(v);
-            setPage(1);
-          }}
-          showClear
-          placeholder="搜索邮箱 / 接码地址"
-          style={{ width: 240 }}
-        />
-        <Select
-          value={statusFilter}
-          onChange={(v) => {
-            setStatusFilter((v as "" | "unused" | "used" | "in_use") ?? "");
-            setPage(1);
-          }}
-          style={{ width: 130 }}
-          optionList={[
-            { label: "全部状态", value: "" },
-            { label: "可用", value: "unused" },
-            { label: "已用", value: "used" },
-            { label: "占用中", value: "in_use" },
-          ]}
-        />
-      </div>
+      {isMobile ? (
+        <MobileFilters activeCount={activeFilterCount}>{filterControls}</MobileFilters>
+      ) : (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 12, marginBottom: 16 }}>{filterControls}</div>
+      )}
 
       {selected.length > 0 ? (
         <div style={{ marginBottom: 12 }}>
-          <Space>
+          <Space style={{ flexWrap: "wrap" }}>
             <Text type="tertiary">已选 {selected.length} 项</Text>
-            <Button size="small" onClick={() => void handleMark(selected, true)} loading={busy}>
+            <Button size="small" icon={<IconTick />} onClick={() => void handleMark(selected, true)} loading={busy}>
               标记已用
             </Button>
-            <Button size="small" onClick={() => void handleMark(selected, false)} loading={busy}>
+            <Button size="small" icon={<IconClose />} onClick={() => void handleMark(selected, false)} loading={busy}>
               标记未用
             </Button>
             <Popconfirm title={`删除选中的 ${selected.length} 个？`} onConfirm={() => void handleDelete(selected)}>
@@ -258,27 +294,167 @@ export default function MailboxesPage() {
         </div>
       ) : null}
 
-      <Table
-        columns={columns}
-        dataSource={items}
-        loading={loading}
-        rowKey="email"
-        tableLayout="fixed"
-        scroll={{ x: 1020 }}
-        pagination={{
-          currentPage: page,
-          pageSize: PAGE_SIZE,
-          total,
-          onPageChange: setPage,
-        }}
-        rowSelection={{ selectedRowKeys: selected, onChange: (keys) => setSelected((keys ?? []) as string[]) }}
-        empty="暂无邮箱，先导入。"
-      />
+      {isMobile ? (
+        <MobileList
+          items={items}
+          loading={loading}
+          selected={selected}
+          allSelected={allOnPageSelected}
+          onToggleAll={toggleSelectAll}
+          onToggle={toggleOne}
+          onMark={(email, used) => void handleMark([email], used)}
+          onDelete={(email) => void handleDelete([email])}
+          page={page}
+          pageSize={PAGE_SIZE}
+          total={total}
+          onPageChange={setPage}
+        />
+      ) : (
+        <Table
+          columns={columns}
+          dataSource={items}
+          loading={loading}
+          rowKey="email"
+          tableLayout="fixed"
+          scroll={{ x: 1020 }}
+          pagination={{ currentPage: page, pageSize: PAGE_SIZE, total, onPageChange: setPage }}
+          rowSelection={{ selectedRowKeys: selected, onChange: (keys) => setSelected((keys ?? []) as string[]) }}
+          empty="暂无邮箱，先导入。"
+        />
+      )}
 
-      <Modal title="导入邮箱" visible={importOpen} onCancel={() => setImportOpen(false)} onOk={() => void handleImport()} okText="导入" confirmLoading={busy}>
-        <Text type="tertiary">按邮箱池约定格式粘贴，一行一个。</Text>
-        <TextArea value={importText} onChange={setImportText} rows={10} style={{ marginTop: 8, fontFamily: "monospace" }} placeholder={"一行一个邮箱..."} />
+      <Modal
+        title="导入邮箱"
+        visible={importOpen}
+        onCancel={() => setImportOpen(false)}
+        onOk={() => void handleImport()}
+        okText="导入"
+        confirmLoading={busy}
+        fullScreen={isMobile}
+      >
+        <Text type="tertiary">按邮箱池约定格式粘贴，一行一个 <Text code>邮箱----接码地址</Text>。</Text>
+        <TextArea value={importText} onChange={setImportText} rows={isMobile ? 12 : 10} style={{ marginTop: 8, fontFamily: "monospace" }} placeholder={"一行一个邮箱..."} />
       </Modal>
+    </div>
+  );
+}
+
+// ───────────────────────── 手机端卡片流 ─────────────────────────
+
+type MobileListProps = {
+  items: Mailbox[];
+  loading: boolean;
+  selected: string[];
+  allSelected: boolean;
+  onToggleAll: () => void;
+  onToggle: (email: string) => void;
+  onMark: (email: string, used: boolean) => void;
+  onDelete: (email: string) => void;
+  page: number;
+  pageSize: number;
+  total: number;
+  onPageChange: (page: number) => void;
+};
+
+function MobileList({
+  items,
+  loading,
+  selected,
+  allSelected,
+  onToggleAll,
+  onToggle,
+  onMark,
+  onDelete,
+  page,
+  pageSize,
+  total,
+  onPageChange,
+}: MobileListProps) {
+  if (!loading && items.length === 0) {
+    return (
+      <Card bodyStyle={{ padding: 32, textAlign: "center" }}>
+        <Text type="tertiary">暂无邮箱，先导入。</Text>
+      </Card>
+    );
+  }
+
+  return (
+    <div>
+      <div style={{ marginBottom: 8, paddingLeft: 4 }}>
+        <Checkbox checked={allSelected} onChange={onToggleAll}>
+          <Text type="tertiary" size="small">
+            全选本页
+          </Text>
+        </Checkbox>
+      </div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        {items.map((m) => {
+          const checked = selected.includes(m.email);
+          return (
+            <Card
+              key={m.email}
+              bodyStyle={{ padding: 14 }}
+              style={{ borderColor: checked ? "var(--semi-color-primary)" : undefined }}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
+                <Checkbox checked={checked} onChange={() => onToggle(m.email)} />
+                <Text
+                  strong
+                  ellipsis={{ showTooltip: true }}
+                  style={{ flex: 1, fontSize: 15 }}
+                  onClick={() => copy(m.email, "邮箱")}
+                >
+                  {m.email}
+                </Text>
+                {statusTag(m)}
+              </div>
+
+              <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 10, minWidth: 0 }}>
+                <Text type="tertiary" size="small" style={{ flexShrink: 0 }}>
+                  接码
+                </Text>
+                {m.fetch_url ? (
+                  <>
+                    <Text ellipsis={{ showTooltip: true }} style={{ flex: 1, fontSize: 12 }}>
+                      {m.fetch_url}
+                    </Text>
+                    <Button size="small" theme="borderless" icon={<IconCopy />} onClick={() => copy(m.fetch_url, "接码地址")} />
+                    <Button
+                      size="small"
+                      theme="borderless"
+                      icon={<IconLink />}
+                      onClick={() => window.open(m.fetch_url, "_blank", "noopener")}
+                    />
+                  </>
+                ) : (
+                  <Text type="tertiary">—</Text>
+                )}
+              </div>
+
+              <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+                <Button
+                  size="small"
+                  icon={m.used ? <IconClose /> : <IconTick />}
+                  style={{ flex: 1 }}
+                  onClick={() => onMark(m.email, !m.used)}
+                >
+                  {m.used ? "标记未用" : "标记已用"}
+                </Button>
+                <Popconfirm title="删除该邮箱？" onConfirm={() => onDelete(m.email)}>
+                  <Button size="small" type="danger" theme="borderless" icon={<IconDelete />} />
+                </Popconfirm>
+              </div>
+            </Card>
+          );
+        })}
+      </div>
+
+      {total > pageSize ? (
+        <div style={{ display: "flex", justifyContent: "center", marginTop: 16 }}>
+          <Pagination total={total} currentPage={page} pageSize={pageSize} onPageChange={onPageChange} />
+        </div>
+      ) : null}
     </div>
   );
 }

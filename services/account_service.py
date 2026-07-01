@@ -26,6 +26,13 @@ def _is_tls_connection_error(message: str) -> bool:
     text = str(message or "").lower()
     return (
         "curl: (35)" in text
+        or "curl: (97)" in text        # SOCKS5 代理瞬时拒绝（住宅代理换 IP 窗口）
+        or "curl: (28)" in text        # 超时
+        or "curl: (7)" in text         # 连接失败
+        or "curl: (56)" in text        # 接收数据失败
+        or "rejected by the socks5" in text
+        or "connection closed abruptly" in text
+        or "connection timed out" in text
         or "tls connect error" in text
         or "openssl_internal" in text
         or "ssl: wrong_version_number" in text
@@ -256,6 +263,8 @@ class AccountService:
         normalized["email"] = normalized.get("email") or None
         normalized["user_id"] = normalized.get("user_id") or None
         normalized["proxy"] = str(normalized.get("proxy") or "").strip()
+        normalized["country"] = str(normalized.get("country") or "").strip() or None
+        normalized["exit_ip"] = str(normalized.get("exit_ip") or "").strip() or None
         source_type = normalized.get("source_type")
         if not source_type and str(normalized.get("export_type") or "").strip().lower() == "codex":
             source_type = "codex"
@@ -525,7 +534,24 @@ class AccountService:
     def _password_re_login_thread(self, access_token: str, email: str, password: str, event: str, progress_id: str | None = None) -> None:
         """密码重新登录线程入口"""
         try:
-            result = self._login_with_password(email, password)
+            account = self.get_account(access_token)
+            # 账号已开 2FA 时，登录会触发 mfa_challenge，需带上存储的 totp_secret 自动过；
+            # 同时复用账号绑定邮箱的 OTP 取码（登录也可能触发邮箱步进）。
+            totp_secret = str((account or {}).get("totp_secret") or "").strip() or None
+            otp_fetch = self._mailbox_otp_fetcher(email)
+            # 住宅代理偶发瞬时拒绝/断连（curl 97/28），登录请求是裸调用不自带重试，
+            # 故在此对整个登录做幂等重试（每次重新生成 PKCE/device_id）。
+            result = {}
+            for attempt in range(3):
+                result = self._login_with_password(
+                    email, password,
+                    account=account,
+                    totp_secret=totp_secret,
+                    otp_fetch=otp_fetch,
+                )
+                if result.get("ok") or not _is_tls_connection_error(str(result.get("error") or "")):
+                    break
+                time.sleep(1.5 * (attempt + 1))
             if result.get("ok"):
                 # 登录成功，更新账号
                 new_access_token = result.get("access_token", "")
@@ -646,6 +672,7 @@ class AccountService:
         otp_fetch=None,
         totp_secret: str | None = None,
         on_progress=None,
+        account: dict | None = None,
     ) -> dict:
         """通过邮箱+密码登录，返回 {access_token, refresh_token, id_token, ...}
 
@@ -674,11 +701,11 @@ class AccountService:
         user_agent = self._OAUTH_USER_AGENT
         keep_alive = False  # 仅在成功且 keep_session 时置 True，避免 finally 误关存活 session
 
-        # 创建 session
-        session_kwargs = {"impersonate": "chrome110", "verify": False}
-        proxy = config.get_proxy_settings()
-        if proxy:
-            session_kwargs["proxy"] = proxy
+        # 创建 session：走该账号专属代理（号一号一 IP），缺省回退全局代理
+        from services.proxy_service import proxy_settings
+        session_kwargs = proxy_settings.build_session_kwargs(
+            account=account, impersonate="chrome110", verify=False
+        )
         session = requests.Session(**session_kwargs)
         
         try:
@@ -1038,7 +1065,7 @@ class AccountService:
 
         return _fetch
 
-    def _establish_chatgpt_session(self, email: str, password: str, totp_secret: str | None = None, on_progress=None) -> dict:
+    def _establish_chatgpt_session(self, email: str, password: str, totp_secret: str | None = None, on_progress=None, account: dict | None = None) -> dict:
         """密码登录拿到可调 mfa 接口的新鲜会话 + token（开/关 2FA 用）。
 
         实测：密码登录（platform client + 必要时邮箱 OTP / TOTP 步进）拿到的 token，pwd_auth_time
@@ -1046,6 +1073,7 @@ class AccountService:
         client 的 token（后者是机密客户端，公开 PKCE 的 oauth/token 换不了）。
 
         totp_secret：账号已开 2FA 时登录会要求验证器码（关闭流程用），传入以自动过 challenge。
+        account：传入则该会话走账号专属代理（号一号一 IP），开/关 2FA 与登录共用同一出口。
         """
         login = self._login_with_password(
             email, password,
@@ -1053,6 +1081,7 @@ class AccountService:
             otp_fetch=self._mailbox_otp_fetcher(email),
             totp_secret=totp_secret,
             on_progress=on_progress,
+            account=account,
         )
         if not login.get("ok"):
             return login
@@ -1060,6 +1089,8 @@ class AccountService:
             "ok": True,
             "session": login.get("session"),
             "access_token": str(login.get("access_token") or ""),
+            "refresh_token": str(login.get("refresh_token") or ""),
+            "id_token": str(login.get("id_token") or ""),
             "device_id": str(login.get("device_id") or ""),
         }
 
@@ -1130,7 +1161,7 @@ class AccountService:
 
         prog(10, "正在登录账号")
         try:
-            login = self._establish_chatgpt_session(email, password, on_progress=on_progress)
+            login = self._establish_chatgpt_session(email, password, on_progress=on_progress, account=account)
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": "login_exception", "detail": str(exc), "items": self.list_accounts()}
         if not login.get("ok"):
@@ -1138,6 +1169,8 @@ class AccountService:
         session = login.get("session")
         token = str(login.get("access_token") or "")
         device_id = str(login.get("device_id") or "")
+        # 密码登录拿到的是该账号最新 token，写回账号库（token 可能轮换，后续以新 token 为准）
+        access_token = self._apply_refreshed_tokens(access_token, login, "enable_2fa") or access_token
         try:
             headers = self._mfa_headers(token, device_id)
             prog(60, "申请 2FA 密钥")
@@ -1188,7 +1221,7 @@ class AccountService:
 
         prog(10, "正在登录账号")
         try:
-            login = self._establish_chatgpt_session(email, password, totp_secret=secret, on_progress=on_progress)
+            login = self._establish_chatgpt_session(email, password, totp_secret=secret, on_progress=on_progress, account=account)
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": "login_exception", "detail": str(exc), "items": self.list_accounts()}
         if not login.get("ok"):
@@ -1196,6 +1229,8 @@ class AccountService:
         session = login.get("session")
         token = str(login.get("access_token") or "")
         device_id = str(login.get("device_id") or "")
+        # 密码登录拿到的是该账号最新 token，写回账号库（token 可能轮换，后续以新 token 为准）
+        access_token = self._apply_refreshed_tokens(access_token, login, "disable_2fa") or access_token
         try:
             headers = self._mfa_headers(token, device_id)
             prog(60, "读取 2FA 信息")

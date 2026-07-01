@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 
-from api import accounts, activation, cdks, mailboxes, register, run, system
+from api import accounts, activation, cdks, dispatch, mailboxes, phones, register, run, system
 from api.errors import install_exception_handlers
 from api.support import resolve_web_asset, start_limited_account_watcher
 from services.config import config
@@ -39,6 +39,8 @@ def create_app() -> FastAPI:
     app.include_router(register.create_router())
     app.include_router(mailboxes.create_router())
     app.include_router(cdks.create_router())
+    app.include_router(phones.create_router())
+    app.include_router(dispatch.create_router())
     app.include_router(activation.create_router())
     app.include_router(run.create_router())
     app.include_router(system.create_router(app_version))

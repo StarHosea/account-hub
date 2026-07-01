@@ -51,10 +51,15 @@ request.interceptors.response.use(
         const status = error.response?.status;
         const shouldRedirect = (error.config as RequestConfig | undefined)?.redirectOnUnauthorized !== false;
         if (status === 401 && shouldRedirect && typeof window !== "undefined") {
-            // Avoid redirect loop — only redirect if not already on /login
-            if (!window.location.pathname.startsWith("/login")) {
+            // 私密管理路径：后端注入 window.__ADMIN_BASE__，跳转需带上该前缀，
+            // 否则会跳到绝对 /login（后端未托管该路径 → 404）。与 main.tsx 的 basename 保持一致。
+            const injected = (window as unknown as { __ADMIN_BASE__?: string }).__ADMIN_BASE__ || "";
+            const base = injected && !injected.includes("%%") ? injected.replace(/\/$/, "") : "";
+            const loginPath = `${base}/login`;
+            // Avoid redirect loop — only redirect if not already on the login page
+            if (window.location.pathname !== loginPath) {
                 await clearStoredAuthSession();
-                window.location.replace("/login");
+                window.location.replace(loginPath);
                 // Return a never-resolving promise to prevent further error handling
                 // while the browser navigates away
                 return new Promise(() => {});

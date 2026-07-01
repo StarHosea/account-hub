@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 import threading
 import time
 import uuid
@@ -16,46 +17,96 @@ from services.register import mail_provider, openai_register
 REGISTER_FILE = DATA_DIR / "register.json"
 
 
-def _serialize_outlook_pool(credentials: list[dict]) -> str:
-    return "\n".join(
-        f'{c["email"]}----{c.get("password", "")}----{c["client_id"]}----{c["refresh_token"]}' for c in credentials
-    )
-
-
-def _merge_outlook_pool(old_text: str, new_text: str) -> str:
-    """合并已存邮箱池与新导入文本，按邮箱去重，新导入的同名邮箱覆盖旧凭据。"""
-    merged: dict[str, dict] = {}
-    for credential in mail_provider.parse_outlook_credentials(old_text or ""):
-        merged[credential["email"].strip().lower()] = credential
-    for credential in mail_provider.parse_outlook_credentials(new_text or ""):
-        merged[credential["email"].strip().lower()] = credential
-    return _serialize_outlook_pool(list(merged.values()))
-
-
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _default_mail() -> dict:
+    return {
+        "request_timeout": 30,
+        "wait_timeout": 60,
+        "wait_interval": 3,
+        "providers": [{"type": mail_provider.API_MAILBOX_TYPE, "enable": True, "label": "API邮箱"}],
+    }
+
+
 def _default_config() -> dict:
-    return {**openai_register.config, "mode": "total", "target_quota": 100, "target_available": 10, "check_interval": 5, "enabled": False, "stats": {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": openai_register.config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, "current_quota": 0, "current_available": 0}}
+    return {
+        "mail": _default_mail(),
+        "proxy": "",
+        "total": 10,
+        "threads": 3,
+        "enabled": False,
+        "enable_2fa": True,
+        "regions": ["US"],
+        "ipweb_rotate": False,
+        "ip_duration": 120,
+        "stats": {
+            "success": 0,
+            "fail": 0,
+            "done": 0,
+            "running": 0,
+            "threads": 3,
+            "elapsed_seconds": 0,
+            "avg_seconds": 0,
+            "success_rate": 0,
+            "current_available": 0,
+        },
+    }
+
+
+def _normalize_providers(mail: dict) -> list[dict]:
+    """保留用户配置的邮箱 provider（api_mailbox / cloudmail_gen）；缺省回退 API 邮箱池。"""
+    providers = mail.get("providers") if isinstance(mail.get("providers"), list) else []
+    cleaned: list[dict] = []
+    for item in providers:
+        if not isinstance(item, dict):
+            continue
+        t = str(item.get("type") or mail_provider.API_MAILBOX_TYPE)
+        if t not in (mail_provider.API_MAILBOX_TYPE, mail_provider.CLOUDMAIL_TYPE):
+            continue
+        entry = {"type": t, "enable": bool(item.get("enable", True))}
+        if t == mail_provider.CLOUDMAIL_TYPE:
+            entry.update({
+                "api_base": str(item.get("api_base") or "").strip(),
+                "admin_email": str(item.get("admin_email") or "").strip(),
+                "admin_password": str(item.get("admin_password") or "").strip(),
+                "domain": item.get("domain") or [],
+                "subdomain": item.get("subdomain") or [],
+                "email_prefix": str(item.get("email_prefix") or "").strip(),
+                "label": "CloudMail",
+            })
+        else:
+            entry["label"] = "API邮箱"
+        cleaned.append(entry)
+    if not cleaned:
+        cleaned = [{"type": mail_provider.API_MAILBOX_TYPE, "enable": True, "label": "API邮箱"}]
+    return cleaned
 
 
 def _normalize(raw: dict) -> dict:
     cfg = _default_config()
-    cfg.update({k: v for k, v in raw.items() if k not in {"stats", "logs"}})
-    cfg["total"] = max(1, int(cfg.get("total") or 1))
-    cfg["threads"] = max(1, int(cfg.get("threads") or 1))
-    cfg["mode"] = str(cfg.get("mode") or "total").strip() if str(cfg.get("mode") or "total").strip() in {"total", "quota", "available"} else "total"
-    cfg["target_quota"] = max(1, int(cfg.get("target_quota") or 1))
-    cfg["target_available"] = max(1, int(cfg.get("target_available") or 1))
-    cfg["check_interval"] = max(1, int(cfg.get("check_interval") or 5))
-    cfg["proxy"] = str(cfg.get("proxy") or "").strip()
-    if isinstance(cfg.get("mail"), dict):
-        cfg["mail"].pop("proxy", None)
-    cfg["enabled"] = bool(cfg.get("enabled"))
-    stats = {**_default_config()["stats"], **(raw.get("stats") if isinstance(raw.get("stats"), dict) else {}),
-             "threads": cfg["threads"]}
-    cfg["stats"] = stats
+    cfg["total"] = max(1, int(raw.get("total") or cfg["total"]))
+    cfg["threads"] = max(1, int(raw.get("threads") or cfg["threads"]))
+    cfg["proxy"] = str(raw.get("proxy") or "").strip()
+    mail = raw.get("mail") if isinstance(raw.get("mail"), dict) else {}
+    cfg["mail"] = {
+        "request_timeout": float(mail.get("request_timeout") or 30),
+        "wait_timeout": float(mail.get("wait_timeout") or 60),
+        "wait_interval": float(mail.get("wait_interval") or 3),
+        "providers": _normalize_providers(mail),
+    }
+    cfg["enabled"] = bool(raw.get("enabled"))
+    # 缺失时回退到默认（现默认开），避免旧配置文件没有该键就被强制关掉。
+    cfg["enable_2fa"] = bool(raw.get("enable_2fa", cfg["enable_2fa"]))
+    valid_regions = set(openai_register.fingerprint.REGIONS.keys())
+    raw_regions = raw.get("regions") if isinstance(raw.get("regions"), list) else []
+    cfg["regions"] = [r for r in raw_regions if r in valid_regions] or ["US"]
+    cfg["ipweb_rotate"] = bool(raw.get("ipweb_rotate"))
+    cfg["ip_duration"] = min(2880, max(1, int(raw.get("ip_duration") or 120)))
+    base_stats = _default_config()["stats"]
+    raw_stats = raw.get("stats") if isinstance(raw.get("stats"), dict) else {}
+    cfg["stats"] = {**base_stats, **{k: raw_stats[k] for k in base_stats if k in raw_stats}, "threads": cfg["threads"]}
     return cfg
 
 
@@ -82,89 +133,15 @@ class RegisterService:
 
     def get(self) -> dict:
         with self._lock:
-            snapshot = json.loads(json.dumps({**self._config, "logs": self._logs[-300:]}, ensure_ascii=False))
-        self._redact_outlook_pools(snapshot)
-        return snapshot
+            return json.loads(json.dumps({**self._config, "logs": self._logs[-300:]}, ensure_ascii=False))
 
-    @staticmethod
-    def _mask_email(email: str) -> str:
-        local, sep, domain = str(email or "").partition("@")
-        if not sep:
-            return "***"
-        masked = (local[:2] + "***" + local[-1:]) if len(local) > 2 else (local[:1] + "***")
-        return f"{masked}@{domain}"
-
-    def _redact_outlook_pools(self, snapshot: dict) -> None:
-        """把 outlook_token 邮箱池里的密码/refresh_token 从对外输出中抹掉，仅保留脱敏预览与统计。
-
-        mailboxes 改为只写导入框（输出为空），避免把密码与 refresh_token 通过 GET/SSE 反复广播。
-        """
-        mail = snapshot.get("mail")
-        if not isinstance(mail, dict):
-            return
-        providers = mail.get("providers")
-        if not isinstance(providers, list):
-            return
-        for provider in providers:
-            if not isinstance(provider, dict) or provider.get("type") != "outlook_token":
-                continue
-            credentials = mail_provider.parse_outlook_credentials(str(provider.get("mailboxes") or ""))
-            provider["mailboxes"] = ""
-            provider["mailboxes_count"] = len(credentials)
-            provider["mailboxes_preview"] = [self._mask_email(c["email"]) for c in credentials]
-            provider["mailboxes_stats"] = mail_provider.outlook_token_pool_stats(credentials)
-
-    def _drop_mail_proxy(self) -> None:
-        if isinstance(self._config.get("mail"), dict):
-            self._config["mail"].pop("proxy", None)
-
-    def _merge_outlook_pools(self, updates: dict) -> None:
-        """对 outlook_token provider：把前端新导入的 mailboxes 与已存池按邮箱合并去重。
-
-        前端 mailboxes 是只写导入框，留空表示不改动；填入的新行追加/覆盖已存凭据。
-        按数组下标与已存的同类型 provider 对齐。
-        """
-        mail = updates.get("mail")
-        if not isinstance(mail, dict) or not isinstance(mail.get("providers"), list):
-            return
-        old_mail = self._config.get("mail") if isinstance(self._config.get("mail"), dict) else {}
-        old_providers = old_mail.get("providers") if isinstance(old_mail.get("providers"), list) else []
-        for index, provider in enumerate(mail["providers"]):
-            if not isinstance(provider, dict) or provider.get("type") != "outlook_token":
-                continue
-            old = old_providers[index] if index < len(old_providers) and isinstance(old_providers[index], dict) else {}
-            old_text = str(old.get("mailboxes") or "") if old.get("type") == "outlook_token" else ""
-            new_text = str(provider.get("mailboxes") or "")
-            provider["mailboxes"] = _merge_outlook_pool(old_text, new_text) if (old_text or new_text) else ""
-            for key in ("mailboxes_count", "mailboxes_preview", "mailboxes_stats"):
-                provider.pop(key, None)
-
-    def _prune_unused_outlook_pools(self) -> int:
-        mail = self._config.get("mail")
-        if not isinstance(mail, dict):
-            return 0
-        providers = mail.get("providers")
-        if not isinstance(providers, list):
-            return 0
-        total_removed = 0
-        for provider in providers:
-            if not isinstance(provider, dict) or provider.get("type") != "outlook_token":
-                continue
-            credentials = mail_provider.parse_outlook_credentials(str(provider.get("mailboxes") or ""))
-            kept, removed = mail_provider.prune_outlook_unused_credentials(credentials)
-            if removed:
-                provider["mailboxes"] = _serialize_outlook_pool(kept)
-                total_removed += removed
-            for key in ("mailboxes_count", "mailboxes_preview", "mailboxes_stats"):
-                provider.pop(key, None)
-        return total_removed
+    def _push_to_worker(self) -> None:
+        openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads", "enable_2fa", "regions", "ipweb_rotate", "ip_duration")})
 
     def update(self, updates: dict) -> dict:
         with self._lock:
-            self._merge_outlook_pools(updates)
             self._config = _normalize({**self._config, **updates})
-            self._drop_mail_proxy()
-            openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
+            self._push_to_worker()
             self._save()
             return self.get()
 
@@ -175,17 +152,16 @@ class RegisterService:
                 self._save()
                 return self.get()
             self._config["enabled"] = True
-            self._drop_mail_proxy()
             self._logs = []
             metrics = self._pool_metrics()
             self._config["stats"] = {"job_id": uuid.uuid4().hex, "success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], **metrics, "started_at": _now(), "updated_at": _now()}
-            openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
+            self._push_to_worker()
             with openai_register.stats_lock:
                 openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": time.time()})
             self._save()
             self._runner = threading.Thread(target=self._run, daemon=True, name="openai-register")
             self._runner.start()
-            self._append_log(f"注册任务启动，模式={self._config['mode']}，线程数={self._config['threads']}", "yellow")
+            self._append_log(f"注册任务启动，目标数量={self._config['total']}，线程数={self._config['threads']}", "yellow")
             return self.get()
 
     def stop(self) -> dict:
@@ -205,50 +181,42 @@ class RegisterService:
             self._save()
             return self.get()
 
-    def reset_outlook_pool(self, scope: str = "all") -> dict:
-        scope = str(scope or "all").strip().lower()
-        if scope == "unused":
-            with self._lock:
-                removed = self._prune_unused_outlook_pools()
-                openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
-                self._save()
-                self._append_log(f"已清空 Outlook 邮箱池未使用邮箱，移除 {removed} 个", "yellow")
-            return self.get()
-        scope = "failed" if str(scope) == "failed" else "all"
-        cleared = mail_provider.reset_outlook_token_pool_state(scope)
-        with self._lock:
-            self._append_log(
-                f"已重置 Outlook 邮箱池状态（范围={'仅失败/占用' if scope == 'failed' else '全部'}），清除 {cleared} 条记录",
-                "yellow",
-            )
-        return self.get()
-
     def _append_log(self, text: str, color: str = "") -> None:
         with self._lock:
             self._logs.append({"time": _now(), "text": str(text), "level": str(color or "info")})
             self._logs = self._logs[-300:]
 
+    # 自动激活错峰参数：避免「注册成功秒充 Plus」这种非自然行为聚类
+    _ACT_MIN_DELAY = 30.0
+    _ACT_MAX_DELAY = 180.0
+    _ACT_GAP_MIN = 20.0
+    _ACT_GAP_MAX = 60.0
+
+    def _maybe_auto_activate(self, result: dict) -> None:
+        """注册成功后，若开启「注册后自动激活」，延迟 + 跨账号错峰派发 Plus 激活。"""
+        token = str((result.get("result") or {}).get("access_token") or "").strip()
+        if not token:
+            return
+        delay = random.uniform(self._ACT_MIN_DELAY, self._ACT_MAX_DELAY)
+        with self._lock:
+            base = max(time.time(), float(getattr(self, "_act_next_floor", 0.0)))
+            fire_at = base + delay
+            self._act_next_floor = fire_at + random.uniform(self._ACT_GAP_MIN, self._ACT_GAP_MAX)
+        timer = threading.Timer(max(0.0, fire_at - time.time()), self._dispatch_activation, args=(token,))
+        timer.daemon = True
+        timer.start()
+
+    def _dispatch_activation(self, token: str) -> None:
+        try:
+            from services.activation_service import activation_service
+            activation_service.activate_token_async(token)
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"自动激活派发失败：{exc}", "red")
+
     def _pool_metrics(self) -> dict:
         items = account_service.list_accounts()
         normal = [item for item in items if item.get("status") == "正常"]
-        return {
-            "current_quota": sum(int(item.get("quota") or 0) for item in normal if not item.get("image_quota_unknown")),
-            "current_available": len(normal),
-        }
-
-    def _target_reached(self, cfg: dict, submitted: int) -> bool:
-        mode = str(cfg.get("mode") or "total")
-        metrics = self._pool_metrics()
-        self._bump(**metrics)
-        if mode == "quota":
-            reached = metrics["current_quota"] >= int(cfg.get("target_quota") or 1)
-            self._append_log(f"检查号池：当前正常账号={metrics['current_available']}，当前剩余额度={metrics['current_quota']}，目标额度={cfg.get('target_quota')}，{'跳过注册' if reached else '继续注册'}", "yellow")
-            return reached
-        if mode == "available":
-            reached = metrics["current_available"] >= int(cfg.get("target_available") or 1)
-            self._append_log(f"检查号池：当前正常账号={metrics['current_available']}，目标账号={cfg.get('target_available')}，当前剩余额度={metrics['current_quota']}，{'跳过注册' if reached else '继续注册'}", "yellow")
-            return reached
-        return submitted >= int(cfg.get("total") or 1)
+        return {"current_available": len(normal)}
 
     def _bump(self, **updates) -> None:
         with self._lock:
@@ -260,7 +228,6 @@ class RegisterService:
                     elapsed = max(0.0, (datetime.now(timezone.utc) - datetime.fromisoformat(started_at)).total_seconds())
                 except Exception:
                     elapsed = 0.0
-                done = int(stats.get("done") or 0)
                 success = int(stats.get("success") or 0)
                 fail = int(stats.get("fail") or 0)
                 stats["elapsed_seconds"] = round(elapsed, 1)
@@ -271,30 +238,30 @@ class RegisterService:
 
     def _run(self) -> None:
         threads = int(self.get()["threads"])
+        total = int(self.get()["total"])
         submitted, done, success, fail = 0, 0, 0, 0
         with ThreadPoolExecutor(max_workers=threads) as executor:
             futures = set()
             while True:
-                cfg = self.get()
-                while self.get()["enabled"] and not self._target_reached(cfg, submitted) and len(futures) < threads:
+                while self.get()["enabled"] and submitted < total and len(futures) < threads:
                     submitted += 1
                     futures.add(executor.submit(openai_register.worker, submitted))
-                self._bump(running=len(futures), done=done, success=success, fail=fail)
-                if not futures and (not self.get()["enabled"] or str(cfg.get("mode") or "total") == "total"):
-                    break
+                self._bump(running=len(futures), done=done, success=success, fail=fail, **self._pool_metrics())
                 if not futures:
-                    time.sleep(max(1, int(cfg.get("check_interval") or 5)))
-                    continue
+                    break
                 finished, futures = wait(futures, return_when=FIRST_COMPLETED)
                 for future in finished:
                     done += 1
                     try:
                         result = future.result()
-                        success += 1 if result.get("ok") else 0
-                        fail += 0 if result.get("ok") else 1
+                        if result.get("ok"):
+                            success += 1
+                            self._maybe_auto_activate(result)
+                        else:
+                            fail += 1
                     except Exception:
                         fail += 1
-        self._bump(running=0, done=done, success=success, fail=fail, finished_at=_now())
+        self._bump(running=0, done=done, success=success, fail=fail, finished_at=_now(), **self._pool_metrics())
         with self._lock:
             self._config["enabled"] = False
             self._save()

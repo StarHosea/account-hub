@@ -1,5 +1,3 @@
-"use client";
-
 import localforage from "localforage";
 
 export type AuthRole = "admin" | "user";
@@ -11,11 +9,11 @@ export type StoredAuthSession = {
   name: string;
 };
 
-export const AUTH_KEY_STORAGE_KEY = "chatgpt2api_auth_key";
-export const AUTH_SESSION_STORAGE_KEY = "chatgpt2api_auth_session";
+export const AUTH_KEY_STORAGE_KEY = "account_hub_auth_key";
+export const AUTH_SESSION_STORAGE_KEY = "account_hub_auth_session";
 
 const authStorage = localforage.createInstance({
-  name: "chatgpt2api",
+  name: "account-hub",
   storeName: "auth",
 });
 
@@ -39,8 +37,8 @@ function normalizeSession(value: unknown, fallbackKey = ""): StoredAuthSession |
   };
 }
 
-export function getDefaultRouteForRole(role: AuthRole) {
-  return role === "admin" ? "/accounts" : "/image";
+export function getDefaultRouteForRole(_role: AuthRole) {
+  return "/accounts";
 }
 
 export async function getStoredAuthKey() {

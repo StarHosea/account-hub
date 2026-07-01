@@ -33,3 +33,6 @@ git_cache/
 loginwithpassword_*/
 logwithemailverifycode_*/
 test_batch_output/
+# 工具索引/编辑器目录
+.codegraph/
+.cursor/

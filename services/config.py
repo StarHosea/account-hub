@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass
 import json
 import os
@@ -34,7 +33,7 @@ DEFAULT_IMAGE_STORAGE = {
     "webdav_url": "",
     "webdav_username": "",
     "webdav_password": "",
-    "webdav_root_path": "chatgpt2api/images",
+    "webdav_root_path": "account-hub/images",
     "public_base_url": "",
 }
 
@@ -49,40 +48,6 @@ DEFAULT_CHAT_COMPLETION_CACHE = {
     "drop_assistant_history": False,
 }
 
-DEFAULT_PROXY_RUNTIME_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/145.0.0.0 Safari/537.36"
-)
-
-DEFAULT_PROXY_RUNTIME = {
-    "enabled": False,
-    "egress_mode": "direct",
-    "proxy_url": "",
-    "resource_proxy_url": "",
-    "skip_ssl_verify": False,
-    "reset_session_status_codes": [403],
-    "clearance": {
-        "enabled": False,
-        "mode": "none",
-        "cf_cookies": "",
-        "cf_clearance": "",
-        "user_agent": DEFAULT_PROXY_RUNTIME_USER_AGENT,
-        "browser": "chrome",
-        "flaresolverr_url": "",
-        "timeout_sec": 60,
-        "refresh_interval": 3600,
-        "warm_up_on_start": False,
-    },
-}
-
-DEFAULT_THIRD_PARTY_APPS = {
-    "infinite_canvas": {
-        "enabled": False,
-        "url": "https://canvas.best",
-    },
-}
-
 
 def _normalize_bool(value: object, default: bool = False) -> bool:
     if isinstance(value, str):
@@ -91,7 +56,6 @@ def _normalize_bool(value: object, default: bool = False) -> bool:
             return True
         if lowered in {"0", "false", "no", "off"}:
             return False
-        return default
     if value is None:
         return default
     return bool(value)
@@ -100,7 +64,7 @@ def _normalize_bool(value: object, default: bool = False) -> bool:
 def _normalize_positive_int(value: object, default: int, minimum: int = 0) -> int:
     try:
         normalized = int(value)
-    except (OverflowError, TypeError, ValueError):
+    except (TypeError, ValueError):
         normalized = default
     return max(minimum, normalized)
 
@@ -199,95 +163,6 @@ def _normalize_chat_completion_cache_settings(value: object) -> dict[str, object
     }
 
 
-def _normalize_status_codes(value: object) -> list[int]:
-    items = value if isinstance(value, list) else DEFAULT_PROXY_RUNTIME["reset_session_status_codes"]
-    normalized: list[int] = []
-    for item in items:
-        if isinstance(item, bool):
-            continue
-        try:
-            status = int(item)
-        except (OverflowError, TypeError, ValueError):
-            continue
-        if 100 <= status <= 599 and status not in normalized:
-            normalized.append(status)
-    if not normalized:
-        return list(DEFAULT_PROXY_RUNTIME["reset_session_status_codes"])
-    return normalized
-
-
-def _normalize_proxy_runtime_settings(value: object) -> dict[str, object]:
-    source = value if isinstance(value, dict) else {}
-    default_clearance = DEFAULT_PROXY_RUNTIME["clearance"]
-    clearance_source = source.get("clearance") if isinstance(source.get("clearance"), dict) else {}
-
-    egress_mode = str(source.get("egress_mode") or DEFAULT_PROXY_RUNTIME["egress_mode"]).strip().lower()
-    if egress_mode not in {"direct", "single_proxy"}:
-        egress_mode = str(DEFAULT_PROXY_RUNTIME["egress_mode"])
-
-    clearance_mode = str(clearance_source.get("mode") or default_clearance["mode"]).strip().lower()
-    if clearance_mode not in {"none", "manual", "flaresolverr"}:
-        clearance_mode = str(default_clearance["mode"])
-
-    user_agent = str(clearance_source.get("user_agent") or default_clearance["user_agent"]).strip()
-    browser = str(clearance_source.get("browser") or default_clearance["browser"]).strip()
-
-    existing_clearance_cookies = str(source.get("_existing_cf_cookies") or "").strip()
-    existing_cf_clearance = str(source.get("_existing_cf_clearance") or "").strip()
-    cf_cookies = str(clearance_source.get("cf_cookies") or "").strip()
-    cf_clearance = str(clearance_source.get("cf_clearance") or "").strip()
-    if not cf_cookies and _normalize_bool(clearance_source.get("has_cf_cookies"), False):
-        cf_cookies = existing_clearance_cookies
-    if not cf_clearance and _normalize_bool(clearance_source.get("has_cf_clearance"), False):
-        cf_clearance = existing_cf_clearance
-
-    return {
-        "enabled": _normalize_bool(source.get("enabled"), bool(DEFAULT_PROXY_RUNTIME["enabled"])),
-        "egress_mode": egress_mode,
-        "proxy_url": str(source.get("proxy_url") or "").strip(),
-        "resource_proxy_url": str(source.get("resource_proxy_url") or "").strip(),
-        "skip_ssl_verify": _normalize_bool(
-            source.get("skip_ssl_verify"),
-            bool(DEFAULT_PROXY_RUNTIME["skip_ssl_verify"]),
-        ),
-        "reset_session_status_codes": _normalize_status_codes(source.get("reset_session_status_codes")),
-        "clearance": {
-            "enabled": _normalize_bool(clearance_source.get("enabled"), bool(default_clearance["enabled"])),
-            "mode": clearance_mode,
-            "cf_cookies": cf_cookies,
-            "cf_clearance": cf_clearance,
-            "user_agent": user_agent or str(default_clearance["user_agent"]),
-            "browser": browser or str(default_clearance["browser"]),
-            "flaresolverr_url": str(clearance_source.get("flaresolverr_url") or "").strip(),
-            "timeout_sec": _normalize_positive_int(
-                clearance_source.get("timeout_sec"),
-                int(default_clearance["timeout_sec"]),
-                1,
-            ),
-            "refresh_interval": _normalize_positive_int(
-                clearance_source.get("refresh_interval"),
-                int(default_clearance["refresh_interval"]),
-                60,
-            ),
-            "warm_up_on_start": _normalize_bool(
-                clearance_source.get("warm_up_on_start"),
-                bool(default_clearance["warm_up_on_start"]),
-            ),
-        },
-    }
-
-
-def _normalize_third_party_apps_settings(value: object) -> dict[str, object]:
-    source = value if isinstance(value, dict) else {}
-    canvas_source = source.get("infinite_canvas") if isinstance(source.get("infinite_canvas"), dict) else {}
-    return {
-        "infinite_canvas": {
-            "enabled": _normalize_bool(canvas_source.get("enabled"), False),
-            "url": str(canvas_source.get("url") or DEFAULT_THIRD_PARTY_APPS["infinite_canvas"]["url"]).strip(),
-        },
-    }
-
-
 def _validate_image_storage_settings(settings: dict[str, object]) -> None:
     if not _normalize_bool(settings.get("enabled"), False):
         return
@@ -330,11 +205,11 @@ def _read_json_object(path: Path, *, name: str) -> dict[str, object]:
 def _load_settings() -> LoadedSettings:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     raw_config = _read_json_object(CONFIG_FILE, name="config.json")
-    auth_key = _normalize_auth_key(os.getenv("CHATGPT2API_AUTH_KEY") or raw_config.get("auth-key"))
+    auth_key = _normalize_auth_key(os.getenv("ACCOUNT_HUB_AUTH_KEY") or raw_config.get("auth-key"))
     if _is_invalid_auth_key(auth_key):
         raise ValueError(
             "❌ auth-key 未设置！\n"
-            "请在环境变量 CHATGPT2API_AUTH_KEY 中设置，或者在 config.json 中填写 auth-key。"
+            "请在环境变量 ACCOUNT_HUB_AUTH_KEY 中设置，或者在 config.json 中填写 auth-key。"
         )
 
     try:
@@ -359,7 +234,7 @@ class ConfigStore:
                 "❌ auth-key 未设置！\n"
                 "请按以下任意一种方式解决：\n"
                 "1. 在 Render 的 Environment 变量中添加：\n"
-                "   CHATGPT2API_AUTH_KEY = your_real_auth_key\n"
+                "   ACCOUNT_HUB_AUTH_KEY = your_real_auth_key\n"
                 "2. 或者在 config.json 中填写：\n"
                 '   "auth-key": "your_real_auth_key"'
             )
@@ -372,7 +247,43 @@ class ConfigStore:
 
     @property
     def auth_key(self) -> str:
-        return _normalize_auth_key(os.getenv("CHATGPT2API_AUTH_KEY") or self.data.get("auth-key"))
+        return _normalize_auth_key(os.getenv("ACCOUNT_HUB_AUTH_KEY") or self.data.get("auth-key"))
+
+    @property
+    def admin_path(self) -> str:
+        """管理后台的隐藏访问路径（部署时用环境变量 ADMIN_PATH 配置一个私密路径）。
+        归一化为以 / 开头、无尾部斜杠。默认 /mhx-plus-admin（生产务必改成私密值）。"""
+        raw = str(os.getenv("ADMIN_PATH") or self.data.get("admin_path") or "/mhx-plus-admin").strip()
+        raw = "/" + raw.strip("/")
+        return raw if raw != "/" else "/mhx-plus-admin"
+
+    @property
+    def cdk_activation(self) -> dict:
+        """Plus CDK 兑换/激活配置。API Key 仅存后端，优先取环境变量。"""
+        raw = self.data.get("cdk_activation")
+        raw = raw if isinstance(raw, dict) else {}
+        return {
+            "base_url": str(os.getenv("CDK_API_BASE_URL") or raw.get("base_url") or "https://chong.nerver.cc").strip().rstrip("/"),
+            "api_key": str(os.getenv("CDK_API_KEY") or raw.get("api_key") or "").strip(),
+            "concurrency": max(1, min(10, int(raw.get("concurrency") or 3))),
+            "poll_interval": max(1.0, float(raw.get("poll_interval") or 5.0)),
+            "poll_timeout": max(30.0, float(raw.get("poll_timeout") or 1800.0)),
+            "max_attempts_per_type": max(1, int(raw.get("max_attempts_per_type") or 3)),
+            "auto_activate_after_register": bool(raw.get("auto_activate_after_register")),
+            # 一键运行编排：目标激活数（消耗 CDK 数）、账号不足是否自动补注册
+            "target": max(0, int(raw.get("target") or 0)),
+            "auto_replenish": bool(raw.get("auto_replenish", True)),
+        }
+
+    def update_cdk_activation(self, updates: dict) -> dict:
+        current = self.data.get("cdk_activation")
+        current = dict(current) if isinstance(current, dict) else {}
+        for key in ("base_url", "api_key", "concurrency", "poll_interval", "poll_timeout", "max_attempts_per_type", "auto_activate_after_register", "target", "auto_replenish"):
+            if key in updates and updates[key] is not None:
+                current[key] = updates[key]
+        self.data["cdk_activation"] = current
+        self._save()
+        return self.cdk_activation
 
     @property
     def accounts_file(self) -> Path:
@@ -456,17 +367,13 @@ class ConfigStore:
 
     @property
     def auto_remove_invalid_accounts(self) -> bool:
-        value = self.data.get("auto_remove_invalid_accounts", False)
-        if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "yes", "on"}
-        return bool(value)
+        # 已下线：失效账号不再自动移除（保留库存，由人工/导出流程处理）。
+        return False
 
     @property
     def auto_remove_rate_limited_accounts(self) -> bool:
-        value = self.data.get("auto_remove_rate_limited_accounts", False)
-        if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "yes", "on"}
-        return bool(value)
+        # 已下线：限流账号不再自动移除（限流仅是额度问题，账号仍存活）。
+        return False
 
     @property
     def auto_relogin_after_refresh(self) -> bool:
@@ -526,7 +433,7 @@ class ConfigStore:
     @property
     def base_url(self) -> str:
         return str(
-            os.getenv("CHATGPT2API_BASE_URL")
+            os.getenv("ACCOUNT_HUB_BASE_URL")
             or self.data.get("base_url")
             or ""
         ).strip().rstrip("/")
@@ -558,31 +465,11 @@ class ConfigStore:
         data["backup"] = self.get_backup_settings()
         data["image_storage"] = self.get_image_storage_settings()
         data["chat_completion_cache"] = self.get_chat_completion_cache_settings()
-        data["proxy_runtime"] = self.get_public_proxy_runtime_settings()
-        data["third_party_apps"] = self.get_third_party_apps_settings()
         data.pop("auth-key", None)
         return data
 
     def get_proxy_settings(self) -> str:
         return str(self.data.get("proxy") or "").strip()
-
-    def get_proxy_runtime_settings(self) -> dict[str, object]:
-        return _normalize_proxy_runtime_settings(self.data.get("proxy_runtime"))
-
-    def get_public_proxy_runtime_settings(self) -> dict[str, object]:
-        runtime = copy.deepcopy(self.get_proxy_runtime_settings())
-        clearance = runtime.get("clearance") if isinstance(runtime.get("clearance"), dict) else {}
-        if isinstance(clearance, dict):
-            cf_cookies = str(clearance.get("cf_cookies") or "").strip()
-            cf_clearance = str(clearance.get("cf_clearance") or "").strip()
-            clearance["cf_cookies"] = ""
-            clearance["cf_clearance"] = ""
-            clearance["has_cf_cookies"] = bool(cf_cookies)
-            clearance["has_cf_clearance"] = bool(cf_clearance)
-        return runtime
-
-    def get_third_party_apps_settings(self) -> dict[str, object]:
-        return _normalize_third_party_apps_settings(self.data.get("third_party_apps"))
 
     def update(self, data: dict[str, object]) -> dict[str, object]:
         next_data = dict(self.data)
@@ -596,17 +483,6 @@ class ConfigStore:
             next_data["chat_completion_cache"] = _normalize_chat_completion_cache_settings(
                 next_data.get("chat_completion_cache")
             )
-        if "third_party_apps" in next_data:
-            next_data["third_party_apps"] = _normalize_third_party_apps_settings(next_data.get("third_party_apps"))
-        if "proxy_runtime" in next_data:
-            incoming_runtime = next_data.get("proxy_runtime")
-            if isinstance(incoming_runtime, dict):
-                previous_clearance = self.get_proxy_runtime_settings().get("clearance")
-                if isinstance(previous_clearance, dict):
-                    incoming_runtime = dict(incoming_runtime)
-                    incoming_runtime["_existing_cf_cookies"] = previous_clearance.get("cf_cookies")
-                    incoming_runtime["_existing_cf_clearance"] = previous_clearance.get("cf_clearance")
-            next_data["proxy_runtime"] = _normalize_proxy_runtime_settings(incoming_runtime)
         next_data.pop("backup_state", None)
         self.data = next_data
         self._save()

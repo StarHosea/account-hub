@@ -144,7 +144,7 @@ wheels = [
 ]
 
 [[package]]
-name = "chatgpt2api"
+name = "account-hub"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>小海豚</title>
+  </head>
+  <body>
+    <script>
+      // flash-free 深色模式：首屏前根据存储/系统偏好设好 Semi theme-mode
+      (function () {
+        try {
+          var k = localStorage.getItem("account-hub-theme");
+          var dark = k ? k === "dark" : window.matchMedia("(prefers-color-scheme: dark)").matches;
+          if (dark) document.body.setAttribute("theme-mode", "dark");
+        } catch (e) {}
+      })();
+    </script>
+    <div id="root"></div>
+    <script>
+      // 后端托管时会把下方占位替换为私密管理路径；dev 下保持占位（按根路径处理）。
+      window.__ADMIN_BASE__ = "%%ADMIN_BASE%%";
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

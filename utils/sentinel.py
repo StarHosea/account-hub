@@ -20,10 +20,37 @@ class SentinelTokenGenerator:
     MAX_ATTEMPTS = 500_000
     ERROR_PREFIX = "wQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D"
 
-    def __init__(self, device_id: str, ua: str):
+    def __init__(
+        self,
+        device_id: str,
+        ua: str,
+        *,
+        screen: str = "1920x1080",
+        hardware_concurrency: int = 8,
+        language: str = "en-US",
+        gmt_offset: str = "GMT+0000",
+        tz_label: str = "Coordinated Universal Time",
+    ):
         self.device_id = device_id
         self.user_agent = ua
+        self.screen = screen
+        self.hardware_concurrency = hardware_concurrency
+        self.language = language
+        self.gmt_offset = gmt_offset
+        self.tz_label = tz_label
         self.sid = str(uuid.uuid4())
+
+    @staticmethod
+    def _offset_seconds(gmt_offset: str) -> int:
+        """把 "GMT+0900" / "GMT-0500" 解析成秒偏移，解析失败按 0。"""
+        try:
+            sign = 1 if "+" in gmt_offset else -1
+            digits = gmt_offset.split("+")[-1].split("-")[-1].strip()
+            hours = int(digits[:2])
+            minutes = int(digits[2:4]) if len(digits) >= 4 else 0
+            return sign * (hours * 3600 + minutes * 60)
+        except Exception:
+            return 0
 
     @staticmethod
     def _fnv1a_32(text: str) -> str:
@@ -40,16 +67,20 @@ class SentinelTokenGenerator:
 
     def _get_config(self) -> list:
         perf_now = random.uniform(1000, 50000)
+        local_clock = time.gmtime(time.time() + self._offset_seconds(self.gmt_offset))
+        date_str = time.strftime(
+            f"%a %b %d %Y %H:%M:%S {self.gmt_offset} ({self.tz_label})", local_clock
+        )
         return [
-            "1920x1080",
-            time.strftime("%a %b %d %Y %H:%M:%S GMT+0000 (Coordinated Universal Time)", time.gmtime()),
+            self.screen,
+            date_str,
             4294705152,
             random.random(),
             self.user_agent,
             "https://sentinel.openai.com/sentinel/20260124ceb8/sdk.js",
             None,
             None,
-            "en-US",
+            self.language,
             random.random(),
             random.choice(["vendorSub-undefined", "plugins-undefined", "mimeTypes-undefined", "hardwareConcurrency-undefined"]),
             random.choice(["location", "implementation", "URL", "documentURI", "compatMode"]),
@@ -57,7 +88,7 @@ class SentinelTokenGenerator:
             perf_now,
             self.sid,
             "",
-            random.choice([4, 8, 12, 16]),
+            self.hardware_concurrency,
             time.time() * 1000 - perf_now,
         ]
 
@@ -100,6 +131,12 @@ def build_sentinel_token(
     *,
     user_agent: str = "",
     sec_ch_ua: str = "",
+    screen: str = "1920x1080",
+    hardware_concurrency: int = 8,
+    language: str = "en-US",
+    gmt_offset: str = "GMT+0000",
+    tz_label: str = "Coordinated Universal Time",
+    sec_ch_ua_platform: str = '"Windows"',
 ) -> tuple[str, str]:
     """请求 sentinel token 并返回 (sentinel_header_value, oai_sc_cookie_value)。
 
@@ -109,6 +146,9 @@ def build_sentinel_token(
         flow: 流程标识（如 "password_verify", "username_password_create" 等）
         user_agent: 可选的 User-Agent 覆盖
         sec_ch_ua: 可选的 sec-ch-ua 覆盖
+        screen / hardware_concurrency / language / gmt_offset / tz_label: 设备指纹参数，
+            需与请求头、地区保持一致；默认值复刻旧行为。
+        sec_ch_ua_platform: sentinel 请求头的 sec-ch-ua-platform（macOS 档案应传 '"macOS"'）
 
     Returns:
         (openai-sentinel-token header value, oai-sc cookie value) 元组
@@ -118,7 +158,14 @@ def build_sentinel_token(
     """
     ua = user_agent or DEFAULT_SENTINEL_USER_AGENT
     ch_ua = sec_ch_ua or DEFAULT_SENTINEL_SEC_CH_UA
-    generator = SentinelTokenGenerator(device_id, ua)
+    generator = SentinelTokenGenerator(
+        device_id, ua,
+        screen=screen,
+        hardware_concurrency=hardware_concurrency,
+        language=language,
+        gmt_offset=gmt_offset,
+        tz_label=tz_label,
+    )
     resp = session.post(
         "https://sentinel.openai.com/backend-api/sentinel/req",
         data=json.dumps({"p": generator.generate_requirements_token(), "id": device_id, "flow": flow}),
@@ -129,7 +176,7 @@ def build_sentinel_token(
             "User-Agent": ua,
             "sec-ch-ua": ch_ua,
             "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
+            "sec-ch-ua-platform": sec_ch_ua_platform,
         },
         timeout=20,
         verify=False,

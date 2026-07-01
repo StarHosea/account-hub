@@ -1,20 +1,27 @@
 import { httpRequest, request } from "@/lib/request";
 
+/** 把参数对象拼成 query string，跳过 undefined/null/空串。 */
+function buildQuery(params: Record<string, string | number | boolean | undefined | null>): string {
+  const usp = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value === undefined || value === null || value === "") continue;
+    usp.set(key, String(value));
+  }
+  const qs = usp.toString();
+  return qs ? `?${qs}` : "";
+}
+
+export type PageParams = {
+  page?: number;
+  page_size?: number;
+};
+
+
 export type AccountType = string;
 export type AccountStatus = "正常" | "限流" | "异常" | "禁用";
-export type ImageModel = string;
 export type AuthRole = "admin" | "user";
-export type ImageStorageMode = "local" | "webdav" | "both";
 
-export type ImageStorageSettings = {
-  enabled: boolean;
-  mode: ImageStorageMode;
-  webdav_url: string;
-  webdav_username: string;
-  webdav_password: string;
-  webdav_root_path: string;
-  public_base_url: string;
-};
+export type PlusStatus = "未激活" | "排队中" | "激活中" | "已激活" | "激活失败";
 
 export type Account = {
   access_token: string;
@@ -32,12 +39,29 @@ export type Account = {
   }>;
   default_model_slug?: string | null;
   restore_at?: string | null;
+  last_refresh_error?: string | null;
   success: number;
   fail: number;
-  /** 当前图片在途数(正在生成、尚未结束的图片数)。号池空闲时持续 > 0 表示并发槽位泄漏。 */
   image_inflight?: number;
   last_used_at?: string | null;
   proxy?: string | null;
+  country?: string | null;
+  exit_ip?: string | null;
+  password?: string | null;
+  created_at?: string | null;
+  mail_link?: string | null;
+  // 2FA (TOTP) 相关字段
+  totp_secret?: string | null;
+  otpauth_url?: string | null;
+  // 导出消费标记
+  used?: boolean;
+  // Plus 激活相关字段
+  plus_status?: PlusStatus;
+  plus_attempts?: { UPI: number; IDEL: number };
+  plus_cdk?: string | null;
+  plus_task_id?: string | null;
+  plus_last_message?: string | null;
+  plus_updated_at?: string | null;
 };
 
 export type AccountImportPayload = {
@@ -49,23 +73,20 @@ export type AccountImportPayload = {
   [key: string]: unknown;
 };
 
-export type Model = {
-  id: string;
-  object: string;
-  created: number;
-  owned_by: string;
-  permission: unknown[];
-  root: string;
-  parent: string | null;
+export type AccountSummary = {
+  total: number;
+  alive: number;
+  dead: number;
+  activated: number;
+  unused: number;
 };
 
 type AccountListResponse = {
   items: Account[];
-};
-
-type ModelListResponse = {
-  object: string;
-  data: Model[];
+  summary: AccountSummary;
+  total: number;
+  page: number;
+  page_size: number;
 };
 
 type AccountMutationResponse = {
@@ -101,203 +122,17 @@ type AccountUpdateResponse = {
   items: Account[];
 };
 
-export type ProxyRuntimeEgressMode = "direct" | "single_proxy";
-export type ProxyRuntimeClearanceMode = "none" | "manual" | "flaresolverr";
-
-export type ProxyRuntimeClearanceSettings = {
-  enabled: boolean;
-  mode: ProxyRuntimeClearanceMode;
-  cf_cookies: string;
-  cf_clearance: string;
-  user_agent: string;
-  browser: string;
-  flaresolverr_url: string;
-  timeout_sec: number | string;
-  refresh_interval: number | string;
-  warm_up_on_start: boolean;
-  has_cf_cookies?: boolean;
-  has_cf_clearance?: boolean;
-};
-
-export type ProxyRuntimeSettings = {
-  enabled: boolean;
-  egress_mode: ProxyRuntimeEgressMode;
-  proxy_url: string;
-  resource_proxy_url: string;
-  skip_ssl_verify: boolean;
-  reset_session_status_codes: number[];
-  clearance: ProxyRuntimeClearanceSettings;
-};
-
-export type ProxyRuntimeStatus = {
-  enabled: boolean;
-  egress_mode: ProxyRuntimeEgressMode | string;
-  proxy_source: string;
-  has_proxy: boolean;
-  clearance_enabled: boolean;
-  clearance_mode: ProxyRuntimeClearanceMode | string;
-  has_clearance_bundle: boolean;
-  cached_clearance_hosts: string[];
-};
-
-export type ProxyRuntimeResponse = {
-  runtime: ProxyRuntimeSettings;
-  status: ProxyRuntimeStatus;
-};
-
-export type ThirdPartyAppsSettings = {
-  infinite_canvas: {
-    enabled: boolean;
-    url: string;
-  };
-};
-
 export type SettingsConfig = {
   proxy: string;
   base_url?: string;
   global_system_prompt?: string;
   sensitive_words?: string[];
-  ai_review?: {
-    enabled?: boolean;
-    base_url?: string;
-    api_key?: string;
-    model?: string;
-    prompt?: string;
-  };
   refresh_account_interval_minute?: number | string;
-  image_retention_days?: number | string;
-  image_poll_timeout_secs?: number | string;
-  image_account_concurrency?: number | string;
-  image_parallel_generation?: boolean;
-  image_settle_enabled?: boolean;
-  image_check_before_hit_enabled?: boolean;
-  image_settle_secs?: number | string;
-  image_timeout_retry_secs?: number | string;
   auto_remove_invalid_accounts?: boolean;
   auto_remove_rate_limited_accounts?: boolean;
   auto_relogin_after_refresh?: boolean;
   log_levels?: string[];
-  image_storage?: ImageStorageSettings;
-  proxy_runtime?: ProxyRuntimeSettings;
-  third_party_apps?: ThirdPartyAppsSettings;
-  backup?: BackupSettings;
-  backup_state?: BackupState;
   [key: string]: unknown;
-};
-
-export type BackupInclude = {
-  config: boolean;
-  register: boolean;
-  cpa: boolean;
-  sub2api: boolean;
-  logs: boolean;
-  image_tasks: boolean;
-  accounts_snapshot: boolean;
-  auth_keys_snapshot: boolean;
-  images: boolean;
-};
-
-export type BackupSettings = {
-  enabled: boolean;
-  provider: "cloudflare_r2" | string;
-  account_id: string;
-  access_key_id: string;
-  secret_access_key: string;
-  bucket: string;
-  prefix: string;
-  interval_minutes: number | string;
-  rotation_keep: number | string;
-  encrypt: boolean;
-  passphrase: string;
-  include: BackupInclude;
-};
-
-export type BackupState = {
-  running: boolean;
-  last_started_at?: string | null;
-  last_finished_at?: string | null;
-  last_status?: string;
-  last_error?: string | null;
-  last_object_key?: string | null;
-};
-
-export type BackupItem = {
-  key: string;
-  name: string;
-  size: number;
-  updated_at?: string | null;
-  encrypted: boolean;
-};
-
-export type BackupDetail = {
-  key: string;
-  name: string;
-  encrypted: boolean;
-  created_at?: string | null;
-  trigger?: string | null;
-  app_version?: string | null;
-  storage_backend?: Record<string, unknown> | null;
-  files: Array<{
-    name: string;
-    exists: boolean;
-    content_type?: string;
-    size: number;
-    sha256?: string;
-  }>;
-  snapshots: Array<{
-    name: string;
-    count: number;
-  }>;
-};
-
-export type ManagedImage = {
-  rel: string;
-  path?: string;
-  name: string;
-  date: string;
-  size: number;
-  url: string;
-  thumbnail_url?: string;
-  created_at: string;
-  width?: number;
-  height?: number;
-  tags?: string[];
-};
-
-export type SystemLog = {
-  id: string;
-  time: string;
-  type: "call" | "account" | string;
-  summary?: string;
-  detail?: Record<string, unknown>;
-  [key: string]: unknown;
-};
-
-export type ImageResponse = {
-  created: number;
-  data: Array<{ b64_json?: string; url?: string; revised_prompt?: string }>;
-};
-
-export type ImageTask = {
-  id: string;
-  status: "queued" | "running" | "success" | "error";
-  mode: "generate" | "edit";
-  model?: ImageModel;
-  size?: string;
-  quality?: string;
-  created_at: string;
-  updated_at: string;
-  conversation_id?: string;
-  data?: Array<{ b64_json?: string; url?: string; revised_prompt?: string }>;
-  error?: string;
-  progress?: string;
-  elapsed_secs?: number;
-  duration_ms?: number;
-};
-
-type ImageTaskListResponse = {
-  items: ImageTask[];
-  missing_ids: string[];
 };
 
 export type LoginResponse = {
@@ -317,12 +152,193 @@ export type UserKey = {
   last_used_at: string | null;
 };
 
-export type OutlookPoolStats = {
+// ── Mailboxes（邮箱管理）─────────────────────────────────────────────
+
+export type Mailbox = {
+  email: string;
+  fetch_url: string;
+  used: boolean;
+  in_use: boolean;
+  account_token: string | null;
+  registered_at: string | null;
+  imported_at: string | null;
+  note: string;
+};
+
+export type MailboxStats = {
+  total: number;
+  used: number;
   unused: number;
   in_use: number;
+};
+
+type MailboxListPayload = {
+  items: Mailbox[];
+  stats: MailboxStats;
+};
+
+type MailboxListResponse = MailboxListPayload & {
+  total: number;
+  page: number;
+  page_size: number;
+};
+
+// ── CDKs（Plus CDK 管理）───────────────────────────────────────────
+
+export type CdkType = "UPI" | "IDEL";
+export type CdkStatus = "available" | "used" | "invalid";
+
+export type CdkBoundAccount = {
+  email?: string | null;
+  password?: string | null;
+  totp_secret?: string | null;
+  otpauth_url?: string | null;
+  fetch_url?: string | null;
+  status?: string | null;
+  plus_status?: string | null;
+  source_type?: string | null;
+  created_at?: string | null;
+};
+
+export type Cdk = {
+  cdk: string;
+  type: CdkType;
+  status: CdkStatus;
+  bound_token: string | null;
+  bound_account?: CdkBoundAccount | null;
+  used_at: string | null;
+  imported_at: string | null;
+  note: string;
+};
+
+export type CdkTypeCounts = {
+  available: number;
   used: number;
-  token_invalid: number;
-  failed: number;
+  invalid: number;
+};
+
+export type CdkCounts = {
+  by_type: {
+    UPI: CdkTypeCounts;
+    IDEL: CdkTypeCounts;
+  };
+  available: number;
+  total: number;
+};
+
+type CdkListPayload = {
+  items: Cdk[];
+  counts: CdkCounts;
+};
+
+type CdkListResponse = CdkListPayload & {
+  total: number;
+  page: number;
+  page_size: number;
+};
+
+// ── Phones（手机号池管理）──────────────────────────────────────────
+
+/** 单个手机号最多出库次数（满则自动标记已使用），与后端 MAX_USES 对齐。 */
+export const PHONE_MAX_USES = 3;
+
+export type Phone = {
+  phone: string;
+  fetch_url: string;
+  used: boolean;
+  used_count: number;
+  invalid: boolean;
+  cooldown_until: string | null;
+  reserved_at?: string | null;
+  last_used_at: string | null;
+  imported_at: string | null;
+  note: string;
+};
+
+export type PhoneCounts = {
+  total: number;
+  available: number;
+  cooldown: number;
+  used: number;
+  invalid: number;
+  total_uses: number;
+};
+
+type PhoneListPayload = {
+  items: Phone[];
+  counts: PhoneCounts;
+};
+
+type PhoneListResponse = PhoneListPayload & {
+  total: number;
+  page: number;
+  page_size: number;
+};
+
+// ── Activation（Plus 激活）─────────────────────────────────────────
+
+export type ActivationStats = {
+  total: number;
+  done: number;
+  success: number;
+  fail: number;
+  running: number;
+  started_at?: string | null;
+  finished_at?: string | null;
+  updated_at?: string | null;
+  job_id?: string;
+};
+
+export type ActivationSummary = {
+  free: number;
+  activated: number;
+  activating: number;
+  total: number;
+};
+
+export type ActivationLog = {
+  time: string;
+  text: string;
+  level: string;
+};
+
+export type ActivationConfig = {
+  base_url: string;
+  concurrency: number;
+  poll_interval: number;
+  poll_timeout: number;
+  max_attempts_per_type: number;
+  api_key: string;
+  has_api_key: boolean;
+  auto_activate_after_register: boolean;
+};
+
+export type ActivationState = {
+  activation: {
+    running: boolean;
+    stats: ActivationStats;
+    summary: ActivationSummary;
+    logs: ActivationLog[];
+  };
+  config: ActivationConfig;
+};
+
+// ── Register（注册机）──────────────────────────────────────────────
+
+export type RegisterProviderType = "api_mailbox" | "cloudmail_gen";
+
+export type RegisterProvider = {
+  type: RegisterProviderType;
+  enable: boolean;
+  label?: string;
+  // cloudmail_gen only
+  api_base?: string;
+  admin_email?: string;
+  admin_password?: string;
+  domain?: string[];
+  subdomain?: string[];
+  email_prefix?: string;
+  [key: string]: unknown;
 };
 
 export type RegisterConfig = {
@@ -331,15 +347,15 @@ export type RegisterConfig = {
     request_timeout: number;
     wait_timeout: number;
     wait_interval: number;
-    providers: Array<Record<string, unknown>>;
+    providers: RegisterProvider[];
   };
   proxy: string;
   total: number;
   threads: number;
-  mode: "total" | "quota" | "available";
-  target_quota: number;
-  target_available: number;
-  check_interval: number;
+  enable_2fa?: boolean;
+  regions?: string[];
+  ipweb_rotate?: boolean;
+  ip_duration?: number;
   stats: {
     job_id?: string;
     success: number;
@@ -350,7 +366,6 @@ export type RegisterConfig = {
     elapsed_seconds?: number;
     avg_seconds?: number;
     success_rate?: number;
-    current_quota?: number;
     current_available?: number;
     started_at?: string;
     updated_at?: string;
@@ -362,6 +377,8 @@ export type RegisterConfig = {
     level: string;
   }>;
 };
+
+// ── Auth ───────────────────────────────────────────────────────────
 
 export async function login(authKey: string) {
   const normalizedAuthKey = String(authKey || "").trim();
@@ -375,39 +392,23 @@ export async function login(authKey: string) {
   });
 }
 
-export async function fetchAccounts() {
-  return httpRequest<AccountListResponse>("/api/accounts");
-}
+// ── Accounts ───────────────────────────────────────────────────────
 
-export async function fetchModels() {
-  return httpRequest<ModelListResponse>("/v1/models");
+export type AccountListParams = PageParams & {
+  q?: string;
+  status?: "alive" | "dead";
+  plus?: "activated" | "inactive";
+  used?: boolean;
+};
+
+export async function fetchAccounts(params: AccountListParams = {}) {
+  return httpRequest<AccountListResponse>(`/api/accounts${buildQuery(params)}`);
 }
 
 export async function createAccounts(tokens: string[], accounts: AccountImportPayload[] = []) {
   return httpRequest<AccountMutationResponse>("/api/accounts", {
     method: "POST",
     body: { tokens, accounts },
-  });
-}
-
-export type OAuthLoginStartResponse = {
-  session_id: string;
-  authorize_url: string;
-  expires_in: string;
-  redirect_uri_prefix: string;
-};
-
-export async function startOAuthLogin(emailHint?: string) {
-  return httpRequest<OAuthLoginStartResponse>("/api/accounts/oauth/start", {
-    method: "POST",
-    body: { email_hint: emailHint ?? "" },
-  });
-}
-
-export async function finishOAuthLogin(sessionId: string, callback: string) {
-  return httpRequest<AccountMutationResponse>("/api/accounts/oauth/finish", {
-    method: "POST",
-    body: { session_id: sessionId, callback },
   });
 }
 
@@ -458,107 +459,258 @@ export async function updateAccount(
   });
 }
 
-export async function generateImage(prompt: string, model?: ImageModel, size?: string, quality = "auto") {
-  return httpRequest<ImageResponse>(
-    "/v1/images/generations",
-    {
-      method: "POST",
-      body: {
-        prompt,
-        ...(model ? { model } : {}),
-        ...(size ? { size } : {}),
-        quality,
-        n: 1,
-        response_format: "b64_json",
-      },
-    },
-  );
-}
+export type Account2FAProgress = {
+  action: "enable" | "disable";
+  percent: number;
+  message: string;
+  done: boolean;
+  ok: boolean;
+  error?: string | null;
+  items?: Account[] | null;
+  secret?: string | null;
+  otpauth_url?: string | null;
+};
 
-export async function editImage(files: File | File[], prompt: string, model?: ImageModel, size?: string, quality = "auto") {
-  const formData = new FormData();
-  const uploadFiles = Array.isArray(files) ? files : [files];
-
-  uploadFiles.forEach((file) => {
-    formData.append("image", file);
-  });
-  formData.append("prompt", prompt);
-  if (model) {
-    formData.append("model", model);
-  }
-  if (size) {
-    formData.append("size", size);
-  }
-  formData.append("quality", quality);
-  formData.append("n", "1");
-
-  return httpRequest<ImageResponse>(
-    "/v1/images/edits",
-    {
-      method: "POST",
-      body: formData,
-    },
-  );
-}
-
-export async function createImageGenerationTask(clientTaskId: string, prompt: string, model?: ImageModel, size?: string, quality = "auto") {
-  return httpRequest<ImageTask>("/api/image-tasks/generations", {
+export async function enable2FA(accessToken: string) {
+  return httpRequest<{ progress_id: string }>("/api/accounts/2fa/enable", {
     method: "POST",
-    body: {
-      client_task_id: clientTaskId,
-      prompt,
-      ...(model ? { model } : {}),
-      ...(size ? { size } : {}),
-      quality,
-    },
+    body: { access_token: accessToken },
   });
 }
 
-export async function createImageEditTask(
-  clientTaskId: string,
-  files: File | File[],
-  prompt: string,
-  model?: ImageModel,
-  size?: string,
-  quality = "auto",
+export async function disable2FA(accessToken: string) {
+  return httpRequest<{ progress_id: string }>("/api/accounts/2fa/disable", {
+    method: "POST",
+    body: { access_token: accessToken },
+  });
+}
+
+export async function fetch2FAProgress(progressId: string) {
+  return httpRequest<Account2FAProgress>(`/api/accounts/2fa/progress/${progressId}`);
+}
+
+// 导出账号凭据文本：每行 `邮箱----接码----密码----2FA密钥`。传空数组导出全部。
+export async function exportCredentials(
+  accessTokens: string[],
+  opts: { onlyUnused?: boolean; markUsed?: boolean } = {},
 ) {
-  const formData = new FormData();
-  const uploadFiles = Array.isArray(files) ? files : [files];
-
-  uploadFiles.forEach((file) => {
-    formData.append("image", file);
-  });
-  formData.append("client_task_id", clientTaskId);
-  formData.append("prompt", prompt);
-  if (model) {
-    formData.append("model", model);
-  }
-  if (size) {
-    formData.append("size", size);
-  }
-  formData.append("quality", quality);
-
-  return httpRequest<ImageTask>("/api/image-tasks/edits", {
+  const response = await request.request<string>({
+    url: "/api/accounts/export-credentials",
     method: "POST",
-    body: formData,
+    data: { access_tokens: accessTokens, only_unused: !!opts.onlyUnused, mark_used: !!opts.markUsed },
+    responseType: "text",
+  });
+  return response.data;
+}
+
+export async function markAccountsUsed(accessTokens: string[], used: boolean) {
+  return httpRequest<{ updated: number; items: Account[] }>("/api/accounts/mark-used", {
+    method: "POST",
+    body: { access_tokens: accessTokens, used },
   });
 }
 
-export async function fetchImageTasks(ids: string[]) {
+// ── Mailboxes ──────────────────────────────────────────────────────
+export type MailboxListParams = PageParams & {
+  q?: string;
+  status?: "unused" | "used" | "in_use";
+};
+
+export async function fetchMailboxes(params: MailboxListParams = {}) {
+  return httpRequest<MailboxListResponse>(`/api/mailboxes${buildQuery(params)}`);
+}
+
+export async function importMailboxes(text: string) {
+  return httpRequest<MailboxListPayload & { result: { added: number; updated: number; total: number } }>(
+    "/api/mailboxes",
+    {
+      method: "POST",
+      body: { text },
+    },
+  );
+}
+
+export async function deleteMailboxes(emails: string[]) {
+  return httpRequest<MailboxListPayload & { removed: number }>("/api/mailboxes", {
+    method: "DELETE",
+    body: { emails },
+  });
+}
+
+export async function markMailboxes(emails: string[], used: boolean) {
+  return httpRequest<MailboxListPayload & { changed: number }>("/api/mailboxes/mark", {
+    method: "POST",
+    body: { emails, used },
+  });
+}
+
+// ── CDKs ───────────────────────────────────────────────────────────
+
+export type CdkListParams = PageParams & {
+  q?: string;
+  status?: CdkStatus;
+  type?: CdkType;
+};
+
+export async function fetchCdks(params: CdkListParams = {}) {
+  return httpRequest<CdkListResponse>(`/api/cdks${buildQuery(params)}`);
+}
+
+export async function importCdks(text: string, type: CdkType) {
+  return httpRequest<CdkListPayload & { result: { added: number; updated: number; total: number } }>("/api/cdks", {
+    method: "POST",
+    body: { text, type },
+  });
+}
+
+export async function deleteCdks(cdks: string[]) {
+  return httpRequest<CdkListPayload & { removed: number }>("/api/cdks", {
+    method: "DELETE",
+    body: { cdks },
+  });
+}
+
+export async function exportCdks(type?: CdkType) {
   const params = new URLSearchParams();
-  if (ids.length > 0) {
-    params.set("ids", ids.join(","));
+  if (type) {
+    params.set("type", type);
   }
-  params.set("_t", String(Date.now()));
-  return httpRequest<ImageTaskListResponse>(`/api/image-tasks?${params.toString()}`);
+  const path = `/api/cdks/export${params.toString() ? `?${params.toString()}` : ""}`;
+  const response = await request.get<string>(path, { responseType: "text" });
+  const blob = new Blob([String(response.data ?? "")], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `cdks-${type ?? "all"}-${Date.now()}.txt`;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
 }
 
-export async function resumeImagePoll(taskId: string, extraTimeoutSecs = 30) {
-  return httpRequest<ImageTask>(`/api/image-tasks/${encodeURIComponent(taskId)}/resume-poll`, {
+// ── Phones ─────────────────────────────────────────────────────────
+
+export type PhoneListParams = PageParams & {
+  q?: string;
+  used?: "0" | "1";
+};
+
+export async function fetchPhones(params: PhoneListParams = {}) {
+  return httpRequest<PhoneListResponse>(`/api/phones${buildQuery(params)}`);
+}
+
+export async function importPhones(text: string) {
+  return httpRequest<PhoneListPayload & { result: { added: number; updated: number; total: number } }>("/api/phones", {
     method: "POST",
-    body: { extra_timeout_secs: extraTimeoutSecs },
+    body: { text },
   });
 }
+
+export async function deletePhones(phones: string[]) {
+  return httpRequest<PhoneListPayload & { removed: number }>("/api/phones", {
+    method: "DELETE",
+    body: { phones },
+  });
+}
+
+export async function setPhonesUsed(phones: string[], used: boolean) {
+  return httpRequest<PhoneListPayload & { changed: number }>("/api/phones/used", {
+    method: "PATCH",
+    body: { phones, used },
+  });
+}
+
+/** 累计使用次数 +delta（默认 +1），后端自动标记为已使用。 */
+export async function addPhoneUsage(phones: string[], delta = 1) {
+  return httpRequest<PhoneListPayload & { changed: number }>("/api/phones/use", {
+    method: "POST",
+    body: { phones, delta },
+  });
+}
+
+/** 拉取导出文本（`手机号----接码地址`）。only_unused=true 仅导出未使用。 */
+export async function fetchPhonesExportText(onlyUnused = false): Promise<string> {
+  const params = new URLSearchParams();
+  if (onlyUnused) params.set("only_unused", "true");
+  const path = `/api/phones/export${params.toString() ? `?${params.toString()}` : ""}`;
+  const response = await request.get<string>(path, { responseType: "text" });
+  return String(response.data ?? "");
+}
+
+// ── Dispatch（发号管理）────────────────────────────────────────────
+
+export type DispatchKind = "phone" | "account";
+export type DispatchAction = "checkout" | "cooldown" | "invalid" | "release";
+
+export type DispatchField = { label: string; value: string };
+
+export type DispatchItem = {
+  kind: DispatchKind;
+  id: string;
+  title: string;
+  fields: DispatchField[];
+  used_count?: number;
+  max_uses?: number;
+};
+
+export type DispatchSummary = {
+  account_available: number;
+  phone_available: number;
+};
+
+export async function fetchDispatchSummary() {
+  return httpRequest<DispatchSummary>("/api/dispatch/summary");
+}
+
+/** 发号：预占并返回最老的一个可用号。releaseId 用于「下一个」先释放当前预占。 */
+export async function acquireDispatch(kind: DispatchKind, releaseId?: string) {
+  return httpRequest<{ item: DispatchItem | null; summary: DispatchSummary }>("/api/dispatch/acquire", {
+    method: "POST",
+    body: { kind, release_id: releaseId },
+  });
+}
+
+/** 对已预占的号执行动作：出库 / 冷却 / 无效 / 释放。 */
+export async function dispatchAction(kind: DispatchKind, id: string, action: DispatchAction) {
+  return httpRequest<{ ok: boolean; summary: DispatchSummary }>("/api/dispatch/action", {
+    method: "POST",
+    body: { kind, id, action },
+  });
+}
+
+// ── Activation ─────────────────────────────────────────────────────
+
+export async function fetchActivation() {
+  return httpRequest<ActivationState>("/api/activation");
+}
+
+export async function updateActivationConfig(updates: Partial<{
+  base_url: string;
+  api_key: string;
+  concurrency: number;
+  poll_interval: number;
+  poll_timeout: number;
+  max_attempts_per_type: number;
+  auto_activate_after_register: boolean;
+}>) {
+  return httpRequest<{ config: ActivationConfig }>("/api/activation/config", {
+    method: "POST",
+    body: updates,
+  });
+}
+
+export async function startActivation(tokens?: string[]) {
+  return httpRequest<ActivationState>("/api/activation/start", {
+    method: "POST",
+    body: tokens && tokens.length > 0 ? { tokens } : {},
+  });
+}
+
+export async function stopActivation() {
+  return httpRequest<ActivationState>("/api/activation/stop", { method: "POST" });
+}
+
+// ── Settings ───────────────────────────────────────────────────────
 
 export async function fetchSettingsConfig() {
   return httpRequest<{ config: SettingsConfig }>("/api/settings");
@@ -571,151 +723,7 @@ export async function updateSettingsConfig(settings: SettingsConfig) {
   });
 }
 
-export async function fetchThirdPartyApps() {
-  return httpRequest<{ third_party_apps: ThirdPartyAppsSettings }>("/api/third-party-apps");
-}
-
-export async function testBackupConnection() {
-  return httpRequest<{ result: { ok: boolean; status: number } }>("/api/backup/test", {
-    method: "POST",
-    body: {},
-  });
-}
-
-export async function testImageStorageConnection() {
-  return httpRequest<{ result: { ok: boolean; status: number; error?: string } }>("/api/image-storage/test", {
-    method: "POST",
-    body: {},
-  });
-}
-
-export async function syncImageStorage() {
-  return httpRequest<{ result: { uploaded: number; skipped: number; failed: number } }>("/api/image-storage/sync", {
-    method: "POST",
-    body: {},
-  });
-}
-
-export async function fetchBackups() {
-  return httpRequest<{ items: BackupItem[]; state: BackupState; settings: BackupSettings }>("/api/backups");
-}
-
-export async function runBackupNow() {
-  return httpRequest<{ result: { key: string; size: number; encrypted: boolean } }>("/api/backups/run", {
-    method: "POST",
-    body: {},
-  });
-}
-
-export async function deleteBackup(key: string) {
-  return httpRequest<{ ok: boolean }>("/api/backups/delete", {
-    method: "POST",
-    body: { key },
-  });
-}
-
-export async function fetchBackupDetail(key: string) {
-  const params = new URLSearchParams();
-  params.set("key", key);
-  return httpRequest<{ item: BackupDetail }>(`/api/backups/detail?${params.toString()}`);
-}
-
-export function getBackupDownloadUrl(key: string) {
-  const params = new URLSearchParams();
-  params.set("key", key);
-  return `/api/backups/download?${params.toString()}`;
-}
-
-export async function fetchManagedImages(filters: { start_date?: string; end_date?: string }) {
-  const params = new URLSearchParams();
-  if (filters.start_date) params.set("start_date", filters.start_date);
-  if (filters.end_date) params.set("end_date", filters.end_date);
-  return httpRequest<{ items: ManagedImage[]; groups: Array<{ date: string; items: ManagedImage[] }> }>(
-    `/api/images${params.toString() ? `?${params.toString()}` : ""}`,
-  );
-}
-
-export async function deleteManagedImages(body: { paths?: string[]; start_date?: string; end_date?: string; all_matching?: boolean }) {
-  return httpRequest<{ removed: number }>("/api/images/delete", { method: "POST", body });
-}
-
-export async function downloadImages(paths: string[]) {
-  const response = await request.post("/api/images/download", { paths }, { responseType: "blob" });
-  const blob = response.data as Blob;
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = "images.zip";
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
-}
-
-export async function downloadSingleImage(path: string) {
-  const response = await request.get(`/api/images/download/${path}`, { responseType: "blob" });
-  const blob = response.data as Blob;
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = path.split("/").pop() || "image.png";
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
-}
-
-export async function fetchImageTags() {
-  return httpRequest<{ tags: string[] }>("/api/images/tags");
-}
-
-export async function setImageTags(path: string, tags: string[]) {
-  return httpRequest<{ ok: boolean; tags: string[] }>("/api/images/tags", {
-    method: "POST",
-    body: { path, tags },
-  });
-}
-
-export async function deleteImageTag(tag: string) {
-  return httpRequest<{ ok: boolean; removed_from: number }>(`/api/images/tags/${encodeURIComponent(tag)}`, {
-    method: "DELETE",
-  });
-}
-
-export type ImageStorageStats = {
-  disk_total_mb: number; disk_used_mb: number; disk_free_mb: number;
-  image_count: number; image_size_mb: number; image_size_bytes: number;
-};
-
-export async function fetchImageStorage() {
-  return httpRequest<ImageStorageStats>("/api/images/storage");
-}
-
-export async function compressAllImages() {
-  return httpRequest<{ compressed: number; saved_bytes: number; saved_mb: number }>("/api/images/storage/compress", { method: "POST" });
-}
-
-export async function deleteToTarget(targetFreeMb: number) {
-  return httpRequest<{ removed: number; freed_mb: number; done: boolean }>(
-    `/api/images/storage/cleanup-to-target?target_free_mb=${targetFreeMb}&dry_run=false`,
-    { method: "POST" },
-  );
-}
-
-export async function fetchSystemLogs(filters: { type?: string; start_date?: string; end_date?: string }) {
-  const params = new URLSearchParams();
-  if (filters.type) params.set("type", filters.type);
-  if (filters.start_date) params.set("start_date", filters.start_date);
-  if (filters.end_date) params.set("end_date", filters.end_date);
-  return httpRequest<{ items: SystemLog[] }>(`/api/logs${params.toString() ? `?${params.toString()}` : ""}`);
-}
-
-export async function deleteSystemLogs(ids: string[]) {
-  return httpRequest<{ removed: number }>("/api/logs/delete", {
-    method: "POST",
-    body: { ids },
-  });
-}
+// ── User keys ──────────────────────────────────────────────────────
 
 export async function fetchUserKeys() {
   return httpRequest<{ items: UserKey[] }>("/api/auth/users");
@@ -741,6 +749,8 @@ export async function deleteUserKey(keyId: string) {
   });
 }
 
+// ── Register ───────────────────────────────────────────────────────
+
 export async function fetchRegisterConfig() {
   return httpRequest<{ register: RegisterConfig }>("/api/register");
 }
@@ -764,180 +774,7 @@ export async function resetRegister() {
   return httpRequest<{ register: RegisterConfig }>("/api/register/reset", { method: "POST" });
 }
 
-export async function resetOutlookPool(scope: "all" | "failed" | "unused" = "all") {
-  return httpRequest<{ register: RegisterConfig }>("/api/register/outlook-pool/reset", {
-    method: "POST",
-    body: { scope },
-  });
-}
-
-// ── CPA (CLIProxyAPI) ──────────────────────────────────────────────
-
-export type CPAPool = {
-  id: string;
-  name: string;
-  base_url: string;
-  import_job?: CPAImportJob | null;
-};
-
-export type CPARemoteFile = {
-  name: string;
-  email: string;
-};
-
-export type CPAImportJob = {
-  job_id: string;
-  status: "pending" | "running" | "completed" | "failed";
-  created_at: string;
-  updated_at: string;
-  total: number;
-  completed: number;
-  added: number;
-  skipped: number;
-  refreshed: number;
-  failed: number;
-  errors: Array<{ name: string; error: string }>;
-};
-
-export async function fetchCPAPools() {
-  return httpRequest<{ pools: CPAPool[] }>("/api/cpa/pools");
-}
-
-export async function createCPAPool(pool: { name: string; base_url: string; secret_key: string }) {
-  return httpRequest<{ pool: CPAPool; pools: CPAPool[] }>("/api/cpa/pools", {
-    method: "POST",
-    body: pool,
-  });
-}
-
-export async function updateCPAPool(
-  poolId: string,
-  updates: { name?: string; base_url?: string; secret_key?: string },
-) {
-  return httpRequest<{ pool: CPAPool; pools: CPAPool[] }>(`/api/cpa/pools/${poolId}`, {
-    method: "POST",
-    body: updates,
-  });
-}
-
-export async function deleteCPAPool(poolId: string) {
-  return httpRequest<{ pools: CPAPool[] }>(`/api/cpa/pools/${poolId}`, {
-    method: "DELETE",
-  });
-}
-
-export async function fetchCPAPoolFiles(poolId: string) {
-  return httpRequest<{ pool_id: string; files: CPARemoteFile[] }>(`/api/cpa/pools/${poolId}/files`);
-}
-
-export async function startCPAImport(poolId: string, names: string[]) {
-  return httpRequest<{ import_job: CPAImportJob | null }>(`/api/cpa/pools/${poolId}/import`, {
-    method: "POST",
-    body: { names },
-  });
-}
-
-export async function fetchCPAPoolImportJob(poolId: string) {
-  return httpRequest<{ import_job: CPAImportJob | null }>(`/api/cpa/pools/${poolId}/import`);
-}
-
-// ── Sub2API ────────────────────────────────────────────────────────
-
-export type Sub2APIServer = {
-  id: string;
-  name: string;
-  base_url: string;
-  email: string;
-  has_api_key: boolean;
-  group_id: string;
-  import_job?: CPAImportJob | null;
-};
-
-export type Sub2APIRemoteAccount = {
-  id: string;
-  name: string;
-  email: string;
-  plan_type: string;
-  status: string;
-  expires_at: string;
-  has_refresh_token: boolean;
-};
-
-export type Sub2APIRemoteGroup = {
-  id: string;
-  name: string;
-  description: string;
-  platform: string;
-  status: string;
-  account_count: number;
-  active_account_count: number;
-};
-
-export async function fetchSub2APIServers() {
-  return httpRequest<{ servers: Sub2APIServer[] }>("/api/sub2api/servers");
-}
-
-export async function createSub2APIServer(server: {
-  name: string;
-  base_url: string;
-  email: string;
-  password: string;
-  api_key: string;
-  group_id: string;
-}) {
-  return httpRequest<{ server: Sub2APIServer; servers: Sub2APIServer[] }>("/api/sub2api/servers", {
-    method: "POST",
-    body: server,
-  });
-}
-
-export async function updateSub2APIServer(
-  serverId: string,
-  updates: {
-    name?: string;
-    base_url?: string;
-    email?: string;
-    password?: string;
-    api_key?: string;
-    group_id?: string;
-  },
-) {
-  return httpRequest<{ server: Sub2APIServer; servers: Sub2APIServer[] }>(`/api/sub2api/servers/${serverId}`, {
-    method: "POST",
-    body: updates,
-  });
-}
-
-export async function fetchSub2APIServerGroups(serverId: string) {
-  return httpRequest<{ server_id: string; groups: Sub2APIRemoteGroup[] }>(
-    `/api/sub2api/servers/${serverId}/groups`,
-  );
-}
-
-export async function deleteSub2APIServer(serverId: string) {
-  return httpRequest<{ servers: Sub2APIServer[] }>(`/api/sub2api/servers/${serverId}`, {
-    method: "DELETE",
-  });
-}
-
-export async function fetchSub2APIServerAccounts(serverId: string) {
-  return httpRequest<{ server_id: string; accounts: Sub2APIRemoteAccount[] }>(
-    `/api/sub2api/servers/${serverId}/accounts`,
-  );
-}
-
-export async function startSub2APIImport(serverId: string, accountIds: string[]) {
-  return httpRequest<{ import_job: CPAImportJob | null }>(`/api/sub2api/servers/${serverId}/import`, {
-    method: "POST",
-    body: { account_ids: accountIds },
-  });
-}
-
-export async function fetchSub2APIImportJob(serverId: string) {
-  return httpRequest<{ import_job: CPAImportJob | null }>(`/api/sub2api/servers/${serverId}/import`);
-}
-
-// ── Upstream proxy ────────────────────────────────────────────────
+// ── Upstream proxy ─────────────────────────────────────────────────
 
 export type ProxySettings = {
   enabled: boolean;
@@ -949,18 +786,6 @@ export type ProxyTestResult = {
   status: number;
   latency_ms: number;
   error: string | null;
-  proxy_source?: string;
-  has_proxy?: boolean;
-};
-
-export type ClearanceTestResult = {
-  ok: boolean;
-  status: string;
-  latency_ms: number;
-  has_cookies: boolean;
-  user_agent: string;
-  error: string | null;
-  runtime: ProxyRuntimeStatus;
 };
 
 export async function fetchProxy() {
@@ -981,20 +806,42 @@ export async function testProxy(url?: string) {
   });
 }
 
-export async function fetchProxyRuntime() {
-  return httpRequest<ProxyRuntimeResponse>("/api/proxy/runtime");
+// ── One-click Run（一键运行编排）─────────────────────────────────────
+export type RunStats = {
+  target: number;
+  registered: number;
+  activated: number;
+  failed: number;
+  running: number;
+  phase: string;
+  job_id?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+  updated_at?: string | null;
+};
+
+export type RunLog = { time: string; text: string; level: string };
+
+export type RunState = {
+  running: boolean;
+  stats: RunStats;
+  summary: { free: number; activated: number; activating: number; total: number };
+  cdk: CdkCounts;
+  mailbox_available: number;
+  logs: RunLog[];
+};
+
+export async function fetchRun() {
+  return httpRequest<RunState>("/api/run");
 }
 
-export async function updateProxyRuntime(runtime: ProxyRuntimeSettings) {
-  return httpRequest<ProxyRuntimeResponse>("/api/proxy/runtime", {
+export async function startRun(target: number, autoReplenish: boolean) {
+  return httpRequest<RunState>("/api/run/start", {
     method: "POST",
-    body: runtime,
+    body: { target, auto_replenish: autoReplenish },
   });
 }
 
-export async function testProxyClearance(targetUrl?: string) {
-  return httpRequest<{ result: ClearanceTestResult }>("/api/proxy/clearance/test", {
-    method: "POST",
-    body: { target_url: targetUrl ?? "https://chatgpt.com" },
-  });
+export async function stopRun() {
+  return httpRequest<RunState>("/api/run/stop", { method: "POST" });
 }

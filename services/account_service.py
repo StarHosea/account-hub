@@ -2146,6 +2146,16 @@ class AccountService:
             password = str(account.get("password") or "").strip()
             if password:
                 item["password"] = password
+            # 迁移到另一套系统时保留账号级代理及其地区信息，导入端 _normalize_account 会原样收下。
+            proxy = str(account.get("proxy") or "").strip()
+            if proxy:
+                item["proxy"] = proxy
+            country = str(account.get("country") or "").strip()
+            if country:
+                item["country"] = country
+            exit_ip = str(account.get("exit_ip") or "").strip()
+            if exit_ip:
+                item["exit_ip"] = exit_ip
             items.append(item)
         return items
 

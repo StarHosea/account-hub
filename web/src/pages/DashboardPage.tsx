@@ -10,6 +10,7 @@ import {
   Toast,
   Space,
   Banner,
+  Popconfirm,
 } from "@douyinfe/semi-ui-19";
 import { IconPlay, IconStop, IconUpload, IconDownload } from "@douyinfe/semi-icons";
 
@@ -189,9 +190,15 @@ export default function DashboardPage() {
             <Switch checked={autoReplenish} onChange={setAutoReplenish} disabled={running} />
           </Space>
           {running ? (
-            <Button theme="solid" type="danger" icon={<IconStop />} loading={submitting} onClick={() => void handleStop()}>
-              停止
-            </Button>
+            <Popconfirm
+              title="确认停止运行？"
+              content="将中断正在进行的注册 / 激活流程"
+              onConfirm={() => void handleStop()}
+            >
+              <Button theme="solid" type="danger" icon={<IconStop />} loading={submitting}>
+                停止
+              </Button>
+            </Popconfirm>
           ) : (
             <Button theme="solid" type="primary" icon={<IconPlay />} loading={submitting} onClick={() => void handleStart()}>
               一键开始

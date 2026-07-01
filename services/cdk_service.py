@@ -9,6 +9,9 @@ from services.config import DATA_DIR
 
 CDK_FILE = DATA_DIR / "cdks.json"
 
+# 单次批量导入上限（防止一次性提交超大文本拖慢全量重写）。
+MAX_IMPORT_ROWS = 2000
+
 # 本地 CDK 分类标签（仅用于激活策略「每类各试 3 次」，不参与兑换请求）。
 CDK_TYPES = ("UPI", "IDEL")
 
@@ -119,8 +122,11 @@ class CdkService:
     def import_text(self, text: str, cdk_type: str) -> dict[str, int]:
         cdk_type = normalize_type(cdk_type)
         parsed = parse_cdk_lines(text)
+        if len(parsed) > MAX_IMPORT_ROWS:
+            raise ValueError(f"单次最多导入 {MAX_IMPORT_ROWS} 条，当前解析到 {len(parsed)} 条，请分批导入")
         added = 0
         updated = 0
+        skipped = 0
         with self._lock:
             for cdk in parsed:
                 existing = self._cdks.get(cdk)
@@ -128,11 +134,14 @@ class CdkService:
                     if existing["type"] != cdk_type:
                         existing["type"] = cdk_type
                         updated += 1
+                    else:
+                        # 完全重复（类型也相同）：跳过，计入 skipped。
+                        skipped += 1
                 else:
                     self._cdks[cdk] = self._normalize({"cdk": cdk, "type": cdk_type, "imported_at": _now()})
                     added += 1
             self._save()
-        return {"added": added, "updated": updated, "total": len(self._cdks)}
+        return {"added": added, "updated": updated, "skipped": skipped, "total": len(self._cdks)}
 
     def delete(self, cdks: list[str]) -> int:
         removed = 0

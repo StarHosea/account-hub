@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Card, Button, Typography, Toast, Space, Tag, RadioGroup, Radio, Spin } from "@douyinfe/semi-ui-19";
+import { Card, Button, Typography, Toast, Space, Tag, RadioGroup, Radio, Spin, Popconfirm } from "@douyinfe/semi-ui-19";
 import { IconCopy, IconSend, IconTickCircle, IconClose, IconRefresh, IconClock } from "@douyinfe/semi-icons";
 
 import {
@@ -49,7 +49,11 @@ export default function DispatchPage() {
   // 切换发号类型：先释放当前预占，避免占着不放。
   const switchKind = async (next: DispatchKind) => {
     if (next === kind) return;
-    if (item) void dispatchAction(kind, item.id, "release");
+    if (item) {
+      void dispatchAction(kind, item.id, "release").catch((e) => {
+        Toast.error(e instanceof Error ? `释放当前号失败：${e.message}` : "释放当前号失败");
+      });
+    }
     setItem(null);
     setKind(next);
     void refreshSummary();
@@ -193,30 +197,40 @@ export default function DispatchPage() {
 
           {/* 标记动作 */}
           <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 16 }}>
-            <Button
-              theme="solid"
-              type="primary"
-              icon={<IconTickCircle />}
-              loading={busy}
-              style={{ flex: 1, minWidth: 96 }}
-              onClick={() => void act("checkout")}
+            <Popconfirm
+              title="确认出库？"
+              content={`出库后该${kindLabel}将被标记消耗，不可撤销`}
+              onConfirm={() => void act("checkout")}
             >
-              出库
-            </Button>
+              <Button
+                theme="solid"
+                type="primary"
+                icon={<IconTickCircle />}
+                loading={busy}
+                style={{ flex: 1, minWidth: 96 }}
+              >
+                出库
+              </Button>
+            </Popconfirm>
             {kind === "phone" ? (
               <Button icon={<IconClock />} loading={busy} style={{ flex: 1, minWidth: 96 }} onClick={() => void act("cooldown")}>
                 冷却
               </Button>
             ) : null}
-            <Button
-              type="danger"
-              icon={<IconClose />}
-              loading={busy}
-              style={{ flex: 1, minWidth: 96 }}
-              onClick={() => void act("invalid")}
+            <Popconfirm
+              title="确认标记无效？"
+              content={`标记后该${kindLabel}将不再参与发号，不可撤销`}
+              onConfirm={() => void act("invalid")}
             >
-              无效
-            </Button>
+              <Button
+                type="danger"
+                icon={<IconClose />}
+                loading={busy}
+                style={{ flex: 1, minWidth: 96 }}
+              >
+                无效
+              </Button>
+            </Popconfirm>
             <Button icon={<IconRefresh />} loading={busy} style={{ flex: 1, minWidth: 96 }} onClick={next}>
               不可用，下一个
             </Button>

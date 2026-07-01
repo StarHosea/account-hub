@@ -21,6 +21,7 @@ import type { ColumnProps } from "@douyinfe/semi-ui-19/lib/es/table";
 import { fetchMailboxes, importMailboxes, deleteMailboxes, markMailboxes, type Mailbox, type MailboxStats, type MailboxListParams } from "@/lib/api";
 import { useDebouncedValue } from "@/lib/use-debounced-value";
 import { useIsMobile } from "@/lib/use-is-mobile";
+import { MAX_IMPORT_ROWS, countImportRows } from "@/lib/utils";
 import { StatCards } from "@/components/StatCards";
 import { MobileFilters } from "@/components/MobileFilters";
 
@@ -29,9 +30,13 @@ const { Title, Text } = Typography;
 const PAGE_SIZE = 10;
 const EMPTY_STATS: MailboxStats = { total: 0, used: 0, unused: 0, in_use: 0 };
 
-function copy(text: string, label: string) {
-  void navigator.clipboard.writeText(text);
-  Toast.success(`${label}已复制`);
+async function copy(text: string, label: string) {
+  try {
+    await navigator.clipboard.writeText(text);
+    Toast.success(`${label}已复制`);
+  } catch {
+    Toast.error("复制失败，请检查浏览器剪贴板权限");
+  }
 }
 
 function statusTag(m: Mailbox) {
@@ -94,13 +99,20 @@ export default function MailboxesPage() {
       Toast.warning("请粘贴邮箱");
       return;
     }
+    const rows = countImportRows(importText);
+    if (rows > MAX_IMPORT_ROWS) {
+      Toast.warning(`单次最多导入 ${MAX_IMPORT_ROWS} 条，当前 ${rows} 条，请分批导入`);
+      return;
+    }
     setBusy(true);
     try {
       const data = await importMailboxes(importText);
       setImportText("");
       setImportOpen(false);
       await load(true);
-      Toast.success(`导入完成，新增 ${data.result.added}，更新 ${data.result.updated}`);
+      Toast.success(
+        `导入完成，新增 ${data.result.added}，更新 ${data.result.updated}，跳过重复 ${data.result.skipped}`,
+      );
     } catch (e) {
       Toast.error(e instanceof Error ? e.message : "导入失败");
     } finally {

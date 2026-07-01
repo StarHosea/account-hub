@@ -503,6 +503,20 @@ export async function exportCredentials(
   return response.data;
 }
 
+// 迁移导出：完整 JSON（含 access/refresh/id token + proxy/country/exit_ip + 密码/2FA），用于在两套系统间搬账号。
+export async function exportAccounts(
+  accessTokens: string[],
+  format: "json" | "zip" = "json",
+) {
+  const response = await request.request<string>({
+    url: "/api/accounts/export",
+    method: "POST",
+    data: { access_tokens: accessTokens, format },
+    responseType: "text",
+  });
+  return response.data;
+}
+
 export async function markAccountsUsed(accessTokens: string[], used: boolean) {
   return httpRequest<{ updated: number; items: Account[] }>("/api/accounts/mark-used", {
     method: "POST",
@@ -521,7 +535,7 @@ export async function fetchMailboxes(params: MailboxListParams = {}) {
 }
 
 export async function importMailboxes(text: string) {
-  return httpRequest<MailboxListPayload & { result: { added: number; updated: number; total: number } }>(
+  return httpRequest<MailboxListPayload & { result: { added: number; updated: number; skipped: number; total: number } }>(
     "/api/mailboxes",
     {
       method: "POST",
@@ -557,7 +571,7 @@ export async function fetchCdks(params: CdkListParams = {}) {
 }
 
 export async function importCdks(text: string, type: CdkType) {
-  return httpRequest<CdkListPayload & { result: { added: number; updated: number; total: number } }>("/api/cdks", {
+  return httpRequest<CdkListPayload & { result: { added: number; updated: number; skipped: number; total: number } }>("/api/cdks", {
     method: "POST",
     body: { text, type },
   });

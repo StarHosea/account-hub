@@ -9,6 +9,9 @@ from services.config import DATA_DIR
 
 MAILBOX_FILE = DATA_DIR / "mailboxes.json"
 
+# 单次批量导入上限（防止一次性提交超大文本拖慢全量重写）。
+MAX_IMPORT_ROWS = 2000
+
 # 占用态超过该秒数视为陈旧（注册进程崩溃残留），可被重新领用。
 IN_USE_STALE_SECONDS = 3600
 
@@ -132,8 +135,11 @@ class MailboxService:
 
     def import_text(self, text: str) -> dict[str, int]:
         parsed = parse_mailbox_lines(text)
+        if len(parsed) > MAX_IMPORT_ROWS:
+            raise ValueError(f"单次最多导入 {MAX_IMPORT_ROWS} 条，当前解析到 {len(parsed)} 条，请分批导入")
         added = 0
         updated = 0
+        skipped = 0
         with self._lock:
             for entry in parsed:
                 key = _norm_email(entry["email"])
@@ -143,11 +149,14 @@ class MailboxService:
                     if existing["fetch_url"] != entry["fetch_url"]:
                         existing["fetch_url"] = entry["fetch_url"]
                         updated += 1
+                    else:
+                        # 完全重复（取件地址也相同）：跳过，计入 skipped。
+                        skipped += 1
                 else:
                     self._mailboxes[key] = self._normalize({**entry, "imported_at": _now()})
                     added += 1
             self._save()
-        return {"added": added, "updated": updated, "total": len(self._mailboxes)}
+        return {"added": added, "updated": updated, "skipped": skipped, "total": len(self._mailboxes)}
 
     def delete(self, emails: list[str]) -> int:
         removed = 0

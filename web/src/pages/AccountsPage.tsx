@@ -44,8 +44,10 @@ import {
   disable2FA,
   fetch2FAProgress,
   exportCredentials,
+  exportAccounts,
   markAccountsUsed,
   type Account,
+  type AccountImportPayload,
   type AccountStatus,
   type AccountSummary,
   type AccountListParams,
@@ -64,9 +66,13 @@ type TwoFAAction = "enable" | "disable";
 const PAGE_SIZE = 10;
 const EMPTY_SUMMARY: AccountSummary = { total: 0, alive: 0, dead: 0, activated: 0, unused: 0 };
 
-function copy(text: string, label: string) {
-  void navigator.clipboard.writeText(text);
-  Toast.success(`${label}已复制`);
+async function copy(text: string, label: string) {
+  try {
+    await navigator.clipboard.writeText(text);
+    Toast.success(`${label}已复制`);
+  } catch {
+    Toast.error("复制失败，请检查浏览器剪贴板权限");
+  }
 }
 
 // 真实订阅档位（OpenAI 返回的 type），与「状态」的激活流程区分开。供表格与卡片共用。
@@ -378,6 +384,26 @@ export default function AccountsPage() {
     }
   };
 
+  // 迁移导出：选中则导出选中，未选中则导出全部；下载完整 JSON（含代理），不标记已出库。
+  const handleExportMigration = async () => {
+    setBusy(true);
+    try {
+      const text = await exportAccounts(selectedKeys, "json");
+      if (!text.trim()) {
+        Toast.warning("没有可导出的账号");
+        return;
+      }
+      downloadText(text, `accounts-migration-${Date.now()}.json`);
+      Toast.success(
+        `已导出迁移文件${selectedKeys.length ? `（选中 ${selectedKeys.length} 个）` : "（全部）"}`,
+      );
+    } catch (e) {
+      Toast.error(e instanceof Error ? e.message : "导出失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const openEdit = (a: Account) => {
     setEditTarget(a);
     setEditStatus(a.status);
@@ -403,17 +429,48 @@ export default function AccountsPage() {
   };
 
   const handleImport = async () => {
-    const tokens = importText
-      .split(/[\n,]/)
-      .map((s) => s.trim())
-      .filter(Boolean);
-    if (!tokens.length) {
-      Toast.warning("请粘贴要导入的 access_token");
+    const raw = importText.trim();
+    if (!raw) {
+      Toast.warning("请粘贴要导入的 access_token 或迁移 JSON");
       return;
+    }
+    let tokens: string[] = [];
+    let accounts: AccountImportPayload[] = [];
+    // 迁移 JSON（[...] 或 {...}）整包导入，携带 proxy/country 等字段；否则按纯 access_token 逐行导入。
+    if (raw.startsWith("[") || raw.startsWith("{")) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        Toast.error("JSON 解析失败，请检查迁移文件格式");
+        return;
+      }
+      const arr = Array.isArray(parsed) ? parsed : [parsed];
+      accounts = arr.filter(
+        (it): it is AccountImportPayload =>
+          !!it &&
+          typeof it === "object" &&
+          typeof (it as { access_token?: unknown }).access_token === "string" &&
+          !!(it as { access_token?: string }).access_token,
+      );
+      tokens = accounts.map((a) => a.access_token);
+      if (!accounts.length) {
+        Toast.warning("JSON 里没有找到带 access_token 的账号");
+        return;
+      }
+    } else {
+      tokens = raw
+        .split(/[\n,]/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (!tokens.length) {
+        Toast.warning("请粘贴要导入的 access_token");
+        return;
+      }
     }
     setBusy(true);
     try {
-      const data = await createAccounts(tokens);
+      const data = await createAccounts(tokens, accounts);
       setImportOpen(false);
       setImportText("");
       await load(true);
@@ -563,15 +620,20 @@ export default function AccountsPage() {
               onClick={() => void handleRefresh([a.access_token])}
             />
             {a.totp_secret ? (
-              <Button
-                size="small"
-                theme="borderless"
-                type="warning"
-                title="关闭 2FA"
-                loading={pending}
-                icon={<IconShield />}
-                onClick={() => void handle2FA(a.access_token, "disable")}
-              />
+              <Popconfirm
+                title="确认关闭 2FA？"
+                content="将移除该账号的两步验证，请确保已知晓风险"
+                onConfirm={() => void handle2FA(a.access_token, "disable")}
+              >
+                <Button
+                  size="small"
+                  theme="borderless"
+                  type="warning"
+                  title="关闭 2FA"
+                  loading={pending}
+                  icon={<IconShield />}
+                />
+              </Popconfirm>
             ) : (
               <Button
                 size="small"
@@ -720,6 +782,14 @@ export default function AccountsPage() {
           </Button>
           <Button
             icon={<IconDownload />}
+            loading={busy}
+            // 迁移导出：完整 JSON（含代理），选中则导出选中，否则全部；不标记已出库。
+            onClick={() => void handleExportMigration()}
+          >
+            导出迁移文件{selectedKeys.length ? `（${selectedKeys.length}）` : "（全部）"}
+          </Button>
+          <Button
+            icon={<IconDownload />}
             theme="solid"
             type="primary"
             disabled={!selectedKeys.length}
@@ -814,7 +884,7 @@ export default function AccountsPage() {
 
       {/* 导入弹窗 */}
       <Modal
-        title="导入账号 Token"
+        title="导入账号"
         visible={importOpen}
         onCancel={() => setImportOpen(false)}
         onOk={() => void handleImport()}
@@ -822,13 +892,15 @@ export default function AccountsPage() {
         confirmLoading={busy}
         fullScreen={isMobile}
       >
-        <Text type="tertiary">一行一个 access_token。</Text>
+        <Text type="tertiary">
+          一行一个 access_token；或直接粘贴「导出迁移文件」的 JSON（含代理会一并导入）。
+        </Text>
         <TextArea
           value={importText}
           onChange={(v) => setImportText(v)}
           rows={10}
           style={{ marginTop: 8, fontFamily: "monospace" }}
-          placeholder={"粘贴 access_token，每行一个..."}
+          placeholder={"粘贴 access_token（每行一个），或迁移导出的 JSON..."}
         />
       </Modal>
     </div>
@@ -973,15 +1045,32 @@ function AccountMobileList({
                   loading={refreshing.has(a.access_token)}
                   onClick={() => onRefresh(a.access_token)}
                 />
-                <Button
-                  size="small"
-                  theme="borderless"
-                  type={a.totp_secret ? "warning" : "tertiary"}
-                  title={a.totp_secret ? "关闭 2FA" : "开启 2FA"}
-                  loading={pending}
-                  icon={<IconShield />}
-                  onClick={() => on2FA(a.access_token, a.totp_secret ? "disable" : "enable")}
-                />
+                {a.totp_secret ? (
+                  <Popconfirm
+                    title="确认关闭 2FA？"
+                    content="将移除该账号的两步验证，请确保已知晓风险"
+                    onConfirm={() => on2FA(a.access_token, "disable")}
+                  >
+                    <Button
+                      size="small"
+                      theme="borderless"
+                      type="warning"
+                      title="关闭 2FA"
+                      loading={pending}
+                      icon={<IconShield />}
+                    />
+                  </Popconfirm>
+                ) : (
+                  <Button
+                    size="small"
+                    theme="borderless"
+                    type="tertiary"
+                    title="开启 2FA"
+                    loading={pending}
+                    icon={<IconShield />}
+                    onClick={() => on2FA(a.access_token, "enable")}
+                  />
+                )}
                 <Button size="small" theme="borderless" icon={<IconEdit />} title="编辑" onClick={() => onEdit(a)} />
                 <Popconfirm title="删除该账号？" onConfirm={() => onDelete(a.access_token)}>
                   <Button size="small" theme="borderless" type="danger" icon={<IconDelete />} title="删除" />

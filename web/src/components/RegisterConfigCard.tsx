@@ -1,4 +1,4 @@
-import { Card, Button, Input, InputNumber, Select, Switch, TextArea, Typography, Space, Toast } from "@douyinfe/semi-ui-19";
+import { Card, Button, Input, InputNumber, Select, Switch, TextArea, Typography, Space, Toast, Popconfirm } from "@douyinfe/semi-ui-19";
 import { IconSave, IconRefresh2 } from "@douyinfe/semi-icons";
 
 import { useSettingsStore } from "@/store/settings";
@@ -48,9 +48,11 @@ export default function RegisterConfigCard() {
         style={{ marginBottom: 16 }}
         headerExtraContent={
           <Space>
-            <Button icon={<IconRefresh2 />} size="small" onClick={() => void reset()} disabled={running}>
-              重置统计
-            </Button>
+            <Popconfirm title="确认重置统计？" content="将清空当前注册统计数据" onConfirm={() => void reset()}>
+              <Button icon={<IconRefresh2 />} size="small" disabled={running}>
+                重置统计
+              </Button>
+            </Popconfirm>
             <Button icon={<IconSave />} theme="solid" type="primary" size="small" onClick={() => void handleSave()} loading={isSaving} disabled={running}>
               保存
             </Button>

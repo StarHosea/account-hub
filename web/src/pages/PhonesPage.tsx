@@ -44,6 +44,7 @@ import {
 } from "@/lib/api";
 import { useDebouncedValue } from "@/lib/use-debounced-value";
 import { useIsMobile } from "@/lib/use-is-mobile";
+import { copyToClipboard as copy } from "@/lib/clipboard";
 import { StatCards } from "@/components/StatCards";
 import { MobileFilters } from "@/components/MobileFilters";
 
@@ -52,15 +53,6 @@ const { Title, Text } = Typography;
 const PAGE_SIZE = 10;
 
 const EMPTY_COUNTS: PhoneCounts = { total: 0, available: 0, cooldown: 0, used: 0, invalid: 0, total_uses: 0 };
-
-async function copy(text: string, label: string) {
-  try {
-    await navigator.clipboard.writeText(text);
-    Toast.success(`${label}已复制`);
-  } catch {
-    Toast.error("复制失败，请检查浏览器剪贴板权限");
-  }
-}
 
 function fmtTime(v: string | null) {
   return v ? new Date(v).toLocaleString() : "—";
@@ -489,6 +481,7 @@ export default function PhonesPage() {
         onOk={() => void handleImport()}
         okText="导入"
         confirmLoading={busy}
+        maskClosable={false}
         fullScreen={isMobile}
       >
         <div style={{ display: "flex", flexDirection: "column", gap: 12, paddingTop: 8 }}>

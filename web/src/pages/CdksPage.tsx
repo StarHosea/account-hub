@@ -30,6 +30,7 @@ import {
   type CdkStatus,
   type CdkListParams,
 } from "@/lib/api";
+import { copyToClipboard as copy } from "@/lib/clipboard";
 import { useDebouncedValue } from "@/lib/use-debounced-value";
 import { useIsMobile } from "@/lib/use-is-mobile";
 import { MAX_IMPORT_ROWS, countImportRows } from "@/lib/utils";
@@ -51,15 +52,6 @@ const EMPTY_COUNTS: CdkCounts = {
   available: 0,
   total: 0,
 };
-
-async function copy(text: string, label: string) {
-  try {
-    await navigator.clipboard.writeText(text);
-    Toast.success(`${label}已复制`);
-  } catch {
-    Toast.error("复制失败，请检查浏览器剪贴板权限");
-  }
-}
 
 function maskCdk(c: string) {
   return c.length <= 12 ? c : `${c.slice(0, 6)}...${c.slice(-4)}`;
@@ -375,7 +367,7 @@ export default function CdksPage() {
       )}
 
       {/* 导入弹窗 */}
-      <Modal title="导入 CDK" visible={importOpen} onCancel={() => setImportOpen(false)} onOk={() => void handleImport()} okText="导入" confirmLoading={busy} fullScreen={isMobile}>
+      <Modal title="导入 CDK" visible={importOpen} onCancel={() => setImportOpen(false)} onOk={() => void handleImport()} okText="导入" confirmLoading={busy} maskClosable={false} fullScreen={isMobile}>
         <div style={{ display: "flex", flexDirection: "column", gap: 12, paddingTop: 8 }}>
           <div>
             <Text style={{ display: "block", marginBottom: 6 }}>类型</Text>
@@ -397,7 +389,7 @@ export default function CdksPage() {
       </Modal>
 
       {/* 绑定账号穿透弹窗 */}
-      <Modal title="绑定账号信息" visible={!!detail} onCancel={() => setDetail(null)} footer={null} fullScreen={isMobile}>
+      <Modal title="绑定账号信息" visible={!!detail} onCancel={() => setDetail(null)} footer={null} maskClosable={false} fullScreen={isMobile}>
         {acc ? (
           <div style={{ display: "flex", flexDirection: "column", gap: 10, paddingTop: 8 }}>
             <Space>

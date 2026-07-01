@@ -11,19 +11,11 @@ import {
   type DispatchSummary,
 } from "@/lib/api";
 import { useIsMobile } from "@/lib/use-is-mobile";
+import { copyToClipboard as copy } from "@/lib/clipboard";
 
 const { Title, Text } = Typography;
 
 const EMPTY_SUMMARY: DispatchSummary = { account_available: 0, phone_available: 0 };
-
-async function copy(text: string, label: string) {
-  try {
-    await navigator.clipboard.writeText(text);
-    Toast.success(`${label}已复制`);
-  } catch {
-    Toast.error("复制失败，请检查浏览器剪贴板权限");
-  }
-}
 
 export default function DispatchPage() {
   const isMobile = useIsMobile();

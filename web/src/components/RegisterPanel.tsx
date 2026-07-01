@@ -27,6 +27,7 @@ export default function RegisterPanel() {
       Modal.confirm({
         title: "确认停止注册机？",
         content: "将中断正在进行的注册流程",
+        maskClosable: false,
         onOk: () => void toggle(),
       });
     } else {

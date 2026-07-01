@@ -1,48 +1,66 @@
 import unittest
+from datetime import datetime
 
 from services.register import mail_provider as mp
 
+T0 = datetime(2026, 7, 1, 22, 0, 0)
+T1 = datetime(2026, 7, 1, 22, 5, 0)  # 更晚（发码后新到达）
+
 
 class _FakeProvider(mp.BaseMailProvider):
-    """按序返回验证码，模拟「信箱残留旧码 + 新码稍后到达」。"""
+    """按序返回 (code, received_at)，模拟信箱里最新邮件随时间变化。"""
 
-    def __init__(self, seq: list[str]) -> None:
+    def __init__(self, seq) -> None:
         super().__init__({"wait_timeout": 3, "wait_interval": 0.2, "user_agent": "x"}, "fake")
         self._seq = list(seq)
         self._i = -1
 
     def fetch_latest_message(self, mailbox):  # type: ignore[override]
         self._i += 1
-        code = self._seq[min(self._i, len(self._seq) - 1)]
-        if not code:
+        item = self._seq[min(self._i, len(self._seq) - 1)]
+        if not item:
             return None
+        code, received_at = item
         return {
             "provider": "fake",
             "mailbox": "m",
             "subject": "",
             "text_content": f"Your code is {code}",
             "html_content": "",
-            "received_at": None,
+            "received_at": received_at,
         }
 
 
-class WaitForCodeExcludeTests(unittest.TestCase):
-    """开关 2FA 登录邮箱 OTP：发码前记录旧码，只接受之后新到达的码（覆盖邮件迟到）。"""
+class ReceivedAtParseTests(unittest.TestCase):
+    def test_parses_labeled_time(self) -> None:
+        html = '<span>发件人：OpenAI</span><span>时间：2026-07-01 22:45:38</span>'
+        self.assertEqual(mp._extract_received_at(html), datetime(2026, 7, 1, 22, 45, 38))
 
-    def test_peek_returns_current_code(self) -> None:
-        self.assertEqual(_FakeProvider(["111111"]).peek_code({}), "111111")
+    def test_returns_none_when_absent(self) -> None:
+        self.assertIsNone(mp._extract_received_at("no timestamp here"))
 
-    def test_exclude_skips_stale_and_times_out(self) -> None:
-        # 信箱里只有旧码 111111：排除它 -> 不会返回旧码，等到超时返回 None。
-        self.assertIsNone(_FakeProvider(["111111"]).wait_for_code({}, exclude_code="111111"))
 
-    def test_exclude_returns_new_code_when_it_arrives(self) -> None:
-        # 前几轮仍是旧码，之后新码 222222 到达 -> 返回新码。
-        provider = _FakeProvider(["111111", "111111", "222222"])
-        self.assertEqual(provider.wait_for_code({}, exclude_code="111111"), "222222")
+class WaitForFreshCodeTests(unittest.TestCase):
+    """开关 2FA 邮箱 OTP：按到达时间判断新邮件，只接受发码后新到达的码。"""
 
-    def test_no_exclude_keeps_old_behavior(self) -> None:
-        self.assertEqual(_FakeProvider(["111111"]).wait_for_code({}), "111111")
+    def test_peek_returns_latest_received_at(self) -> None:
+        self.assertEqual(_FakeProvider([("111111", T0)]).peek_received_at({}), T0)
+
+    def test_skips_stale_email_and_times_out(self) -> None:
+        # 信箱里只有发码前那封（T0），after=T0 -> 不接受，等到超时 None。
+        self.assertIsNone(_FakeProvider([("111111", T0)]).wait_for_code({}, after_received_at=T0))
+
+    def test_accepts_newer_email_even_with_same_code(self) -> None:
+        # 关键：OpenAI 重发相同的码，但到达时间更晚 -> 应接受（按时间而非码值判断）。
+        provider = _FakeProvider([("111111", T0), ("111111", T0), ("111111", T1)])
+        self.assertEqual(provider.wait_for_code({}, after_received_at=T0), "111111")
+
+    def test_accepts_newer_email_with_new_code(self) -> None:
+        provider = _FakeProvider([("111111", T0), ("222222", T1)])
+        self.assertEqual(provider.wait_for_code({}, after_received_at=T0), "222222")
+
+    def test_no_baseline_keeps_old_behavior(self) -> None:
+        self.assertEqual(_FakeProvider([("111111", T0)]).wait_for_code({}), "111111")
 
 
 if __name__ == "__main__":

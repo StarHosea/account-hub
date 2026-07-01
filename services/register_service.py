@@ -209,7 +209,9 @@ class RegisterService:
     def _dispatch_activation(self, token: str) -> None:
         try:
             from services.activation_service import activation_service
-            activation_service.activate_token_async(token)
+            # 传入注册机日志回调：自动激活全过程（派发 → UPI/IDEL 逐次尝试 → 成功/失败）
+            # 同步显示到注册机日志面板，用户在同一处追踪注册→激活全链路。
+            activation_service.activate_token_async(token, log_sink=self._append_log)
         except Exception as exc:  # noqa: BLE001
             self._append_log(f"自动激活派发失败：{exc}", "red")
 

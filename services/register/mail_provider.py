@@ -204,18 +204,28 @@ class BaseMailProvider:
             time.sleep(max(0.2, self.conf["wait_interval"]))
         return None
 
-    def wait_for_code(self, mailbox: dict[str, Any]) -> str | None:
+    def peek_code(self, mailbox: dict[str, Any]) -> str | None:
+        """立即取一次信箱里当前最新的验证码（不等待），用于发码前记录旧码基线。"""
+        message = self.fetch_latest_message(mailbox)
+        return _extract_code(message) if message else None
+
+    def wait_for_code(self, mailbox: dict[str, Any], exclude_code: str | None = None) -> str | None:
+        """轮询取验证码。exclude_code 给定时，跳过与其相同的码（发码前的旧码），
+        继续等待新码到达——用于邮件迟到、信箱里残留上一次验证码的场景。"""
         seen_value = mailbox.setdefault("_seen_code_message_refs", [])
         if not isinstance(seen_value, list):
             seen_value = []
             mailbox["_seen_code_message_refs"] = seen_value
         seen_refs = {str(item) for item in seen_value}
+        exclude = str(exclude_code or "").strip()
 
         def extract_unseen_code(message: dict[str, Any]) -> str | None:
             ref = _message_tracking_ref(message)
             if ref in seen_refs:
                 return None
             code = _extract_code(message)
+            if code and exclude and code == exclude:
+                return None  # 与发码前的旧码相同，视为尚未收到新码，继续等待
             if code:
                 seen_value.append(ref)
                 seen_refs.add(ref)
@@ -435,10 +445,21 @@ def create_mailbox(mail_config: dict, username: str | None = None) -> dict:
         provider.close()
 
 
-def wait_for_code(mail_config: dict, mailbox: dict) -> str | None:
+def wait_for_code(mail_config: dict, mailbox: dict, exclude_code: str | None = None) -> str | None:
     provider = _create_provider(mail_config, str(mailbox.get("provider") or ""), str(mailbox.get("provider_ref") or ""))
     try:
-        return provider.wait_for_code(mailbox)
+        return provider.wait_for_code(mailbox, exclude_code=exclude_code)
+    finally:
+        provider.close()
+
+
+def peek_code(mail_config: dict, mailbox: dict) -> str | None:
+    """立即取一次信箱当前最新验证码（不等待），失败/无则返回 None。"""
+    provider = _create_provider(mail_config, str(mailbox.get("provider") or ""), str(mailbox.get("provider_ref") or ""))
+    try:
+        return provider.peek_code(mailbox)
+    except Exception:
+        return None
     finally:
         provider.close()
 

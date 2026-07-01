@@ -971,6 +971,14 @@ class AccountService:
             "referer": f"{auth_base}/email-verification",
             "user-agent": user_agent,
         }
+        # 发码前先记录信箱里已有的验证码（可能是上一次残留的旧码）。邮件常有延迟，
+        # 若不排除旧码，会在发码后立刻抓到旧码提交，导致校验异常/拿不到 auth code。
+        baseline = None
+        if hasattr(otp_fetch, "peek"):
+            try:
+                baseline = otp_fetch.peek()
+            except Exception:
+                baseline = None
         try:
             session.get(
                 f"{auth_base}/api/accounts/email-otp/send",
@@ -981,7 +989,9 @@ class AccountService:
         except Exception:
             pass
         try:
-            code = otp_fetch()
+            code = otp_fetch(exclude=baseline)  # 等待与旧码不同的新码（覆盖邮件迟到）
+        except TypeError:
+            code = otp_fetch()  # 兼容不支持 exclude 的回调
         except Exception:
             code = None
         if not code:
@@ -1060,10 +1070,16 @@ class AccountService:
         }
         mailbox = {"provider": mail_provider.API_MAILBOX_TYPE, "address": email, "fetch_url": fetch_url}
 
-        def _fetch():
-            return mail_provider.wait_for_code(mail_config, mailbox)
+        class _OtpFetcher:
+            """取码回调：__call__ 等待验证码（可排除发码前的旧码）；peek() 立即读当前旧码基线。"""
 
-        return _fetch
+            def peek(self) -> str | None:
+                return mail_provider.peek_code(mail_config, mailbox)
+
+            def __call__(self, exclude: str | None = None) -> str | None:
+                return mail_provider.wait_for_code(mail_config, mailbox, exclude_code=exclude)
+
+        return _OtpFetcher()
 
     def _establish_chatgpt_session(self, email: str, password: str, totp_secret: str | None = None, on_progress=None, account: dict | None = None) -> dict:
         """密码登录拿到可调 mfa 接口的新鲜会话 + token（开/关 2FA 用）。

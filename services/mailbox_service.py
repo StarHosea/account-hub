@@ -235,5 +235,39 @@ class MailboxService:
             item["registered_at"] = _now()
             self._save()
 
+    def register_imported(self, email: str, fetch_url: str, account_token: str | None = None) -> bool:
+        """迁移导入账号时把其绑定邮箱登记进邮箱管理：写入/更新取件地址。
+
+        迁移的是存量已注册账号，故标记 used 并绑定账号 token，避免注册机再次领用。
+        返回是否新增。
+        """
+        email = str(email or "").strip()
+        fetch_url = str(fetch_url or "").strip()
+        if not email or not fetch_url:
+            return False
+        key = _norm_email(email)
+        token = str(account_token or "").strip() or None
+        with self._lock:
+            existing = self._mailboxes.get(key)
+            if existing is None:
+                self._mailboxes[key] = self._normalize({
+                    "email": email, "fetch_url": fetch_url, "used": True,
+                    "account_token": token, "registered_at": _now(), "imported_at": _now(),
+                })
+                self._save()
+                return True
+            changed = False
+            if existing["fetch_url"] != fetch_url:  # 更新取件地址
+                existing["fetch_url"] = fetch_url
+                changed = True
+            if token and not existing.get("account_token"):  # 补绑（不覆盖已有绑定）
+                existing["account_token"] = token
+                existing["used"] = True
+                existing["registered_at"] = existing.get("registered_at") or _now()
+                changed = True
+            if changed:
+                self._save()
+            return False
+
 
 mailbox_service = MailboxService()

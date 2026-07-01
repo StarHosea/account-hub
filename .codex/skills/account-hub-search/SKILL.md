@@ -1,9 +1,9 @@
 ---
-name: chatgpt2api-search
-description: Use when current web search is needed through this chatgpt2api server. Call the configured HTTP search endpoint with a prompt and return the answer with source URLs.
+name: account-hub-search
+description: Use when current web search is needed through this account-hub server. Call the configured HTTP search endpoint with a prompt and return the answer with source URLs.
 ---
 
-# ChatGPT2API Search
+# Account Hub Search
 
 Use this skill when the user asks for current web search, online lookup, recent information, or source-backed answers.
 
@@ -13,7 +13,7 @@ POST http://127.0.0.1:8000/v1/search
 
 Headers:
 
-Authorization: Bearer chatgpt2api
+Authorization: Bearer <auth-key>
 Content-Type: application/json
 
 Body:

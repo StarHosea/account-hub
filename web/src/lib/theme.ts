@@ -1,5 +1,5 @@
 // Semi 深色模式：body[theme-mode='dark']；持久化复用历史 key。
-const THEME_KEY = "chatgpt2api-theme";
+const THEME_KEY = "account-hub-theme";
 
 export type ThemeMode = "light" | "dark";
 

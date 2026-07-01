@@ -26,7 +26,7 @@ def create_app() -> FastAPI:
             stop_event.set()
             thread.join(timeout=1)
 
-    app = FastAPI(title="chatgpt2api", version=app_version, lifespan=lifespan)
+    app = FastAPI(title="小海豚", version=app_version, lifespan=lifespan)
     install_exception_handlers(app)
     app.add_middleware(
         CORSMiddleware,

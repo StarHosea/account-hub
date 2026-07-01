@@ -175,7 +175,7 @@ class CdkRedeemClient:
             "Content-Type": "application/json",
             "Accept": "application/json",
             "X-External-Api-Key": self._api_key,
-            "User-Agent": "chatgpt2api-cdk/1.0",
+            "User-Agent": "account-hub-cdk/1.0",
         }
 
     def _request(self, method: str, path: str, body: dict | None = None) -> dict | None:

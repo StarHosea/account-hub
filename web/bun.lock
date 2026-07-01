@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "chatgpt2api-web",
+      "name": "account-hub-web",
       "dependencies": {
         "@douyinfe/semi-icons": "^2.100.0",
         "@douyinfe/semi-ui-19": "^2.100.0",

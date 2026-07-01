@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { SideSheet, Button, Badge, Typography, Empty } from "@douyinfe/semi-ui-19";
+import { SideSheet, Button, Badge, Typography, Empty, Popconfirm, Toast } from "@douyinfe/semi-ui-19";
 import { IconBell, IconDelete } from "@douyinfe/semi-icons";
 
 import { useLogStore, type LogLevel } from "@/store/logs";
@@ -45,6 +45,11 @@ export function LogPanel() {
   const clear = useLogStore((s) => s.clear);
   const bottomRef = useRef<HTMLDivElement | null>(null);
 
+  const handleClear = () => {
+    clear();
+    Toast.success("已清空日志");
+  };
+
   // 新日志到达且面板打开时自动滚到底。
   useEffect(() => {
     if (open) bottomRef.current?.scrollIntoView({ block: "end" });
@@ -58,9 +63,11 @@ export function LogPanel() {
       width="min(680px, 92vw)"
       mask={false}
       footer={
-        <Button icon={<IconDelete />} type="tertiary" disabled={!entries.length} onClick={clear}>
-          清空
-        </Button>
+        <Popconfirm title="确认清空所有日志？" content="清空后不可恢复" onConfirm={handleClear}>
+          <Button icon={<IconDelete />} type="tertiary" disabled={!entries.length}>
+            清空
+          </Button>
+        </Popconfirm>
       }
     >
       {entries.length === 0 ? (

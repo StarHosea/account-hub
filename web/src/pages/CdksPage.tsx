@@ -32,6 +32,7 @@ import {
 } from "@/lib/api";
 import { useDebouncedValue } from "@/lib/use-debounced-value";
 import { useIsMobile } from "@/lib/use-is-mobile";
+import { MAX_IMPORT_ROWS, countImportRows } from "@/lib/utils";
 import { StatCards } from "@/components/StatCards";
 import { MobileFilters } from "@/components/MobileFilters";
 
@@ -51,9 +52,13 @@ const EMPTY_COUNTS: CdkCounts = {
   total: 0,
 };
 
-function copy(text: string, label: string) {
-  void navigator.clipboard.writeText(text);
-  Toast.success(`${label}已复制`);
+async function copy(text: string, label: string) {
+  try {
+    await navigator.clipboard.writeText(text);
+    Toast.success(`${label}已复制`);
+  } catch {
+    Toast.error("复制失败，请检查浏览器剪贴板权限");
+  }
 }
 
 function maskCdk(c: string) {
@@ -113,13 +118,20 @@ export default function CdksPage() {
       Toast.warning("请粘贴 CDK");
       return;
     }
+    const rows = countImportRows(importText);
+    if (rows > MAX_IMPORT_ROWS) {
+      Toast.warning(`单次最多导入 ${MAX_IMPORT_ROWS} 条，当前 ${rows} 条，请分批导入`);
+      return;
+    }
     setBusy(true);
     try {
       const data = await importCdks(importText, importType);
       setImportText("");
       setImportOpen(false);
       await load(true);
-      Toast.success(`导入完成，新增 ${data.result.added} 个，更新 ${data.result.updated} 个`);
+      Toast.success(
+        `导入完成，新增 ${data.result.added} 个，更新 ${data.result.updated} 个，跳过重复 ${data.result.skipped} 个`,
+      );
     } catch (e) {
       Toast.error(e instanceof Error ? e.message : "导入失败");
     } finally {
@@ -138,6 +150,15 @@ export default function CdksPage() {
       Toast.error(e instanceof Error ? e.message : "删除失败");
     } finally {
       setBusy(false);
+    }
+  };
+
+  const handleExport = async (type?: CdkType) => {
+    try {
+      await exportCdks(type);
+      Toast.success(type ? `已导出 ${type} CDK` : "已导出全部 CDK");
+    } catch (e) {
+      Toast.error(e instanceof Error ? e.message : "导出失败");
     }
   };
 
@@ -286,9 +307,9 @@ export default function CdksPage() {
             trigger="click"
             render={
               <Dropdown.Menu>
-                <Dropdown.Item onClick={() => void exportCdks()}>导出全部</Dropdown.Item>
-                <Dropdown.Item onClick={() => void exportCdks("UPI")}>仅导出 UPI</Dropdown.Item>
-                <Dropdown.Item onClick={() => void exportCdks("IDEL")}>仅导出 IDEL</Dropdown.Item>
+                <Dropdown.Item onClick={() => void handleExport()}>导出全部</Dropdown.Item>
+                <Dropdown.Item onClick={() => void handleExport("UPI")}>仅导出 UPI</Dropdown.Item>
+                <Dropdown.Item onClick={() => void handleExport("IDEL")}>仅导出 IDEL</Dropdown.Item>
               </Dropdown.Menu>
             }
           >

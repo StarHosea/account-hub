@@ -2,6 +2,8 @@
 
 ## Unreleased
 
++ [优化] 平台配置（基础设置等）改为持久化到存储后端（sqlite/postgres 入库、json 后端写 data/settings.json、git 写仓库），不再依赖仓库根目录的 config.json。首次启动自动将旧的 config.json 迁移进后端；config.json 仅保留为种子与 auth-key 兜底。
+
 ## 1.4.1 - 2026-06-03
 
 + [新增] 账号刷新改为异步模式，支持前端轮询刷新/重新登录进度。

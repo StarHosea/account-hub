@@ -227,8 +227,10 @@ class ConfigStore:
     def __init__(self, path: Path):
         self.path = path
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        self.data = self._load()
         self._storage_backend: StorageBackend | None = None
+        # 配置改为持久化到存储后端（sqlite/postgres/git，或 json 后端的 data/settings.json）。
+        # config.json 仅作为首启动种子与 auth-key 兜底来源。
+        self.data = self._load()
         if _is_invalid_auth_key(self.auth_key):
             raise ValueError(
                 "❌ auth-key 未设置！\n"
@@ -240,9 +242,42 @@ class ConfigStore:
             )
 
     def _load(self) -> dict[str, object]:
-        return _read_json_object(self.path, name="config.json")
+        """加载平台配置：优先从存储后端读取；后端为空时用 config.json 种子并迁移写回。
+
+        存储后端不可用时（如数据库暂时连不上），降级为直接读取 config.json，保证进程可启动。
+        """
+        seed = _read_json_object(self.path, name="config.json")
+        try:
+            backend = self.get_storage_backend()
+        except Exception as exc:  # 后端不可用：降级到本地文件，避免阻塞启动
+            print(f"[config] storage backend unavailable, falling back to config.json: {exc}")
+            return seed
+
+        try:
+            stored = backend.load_settings()
+        except Exception as exc:
+            print(f"[config] failed to load settings from storage backend, using config.json: {exc}")
+            return seed
+
+        if stored is not None:
+            return stored
+
+        # 首次迁移：后端尚无配置，用 config.json 作为种子写入后端。
+        try:
+            backend.save_settings(seed)
+            print("[config] migrated config.json into storage backend (first run)")
+        except Exception as exc:
+            print(f"[config] failed to seed storage backend from config.json: {exc}")
+        return seed
 
     def _save(self) -> None:
+        """持久化配置到存储后端。后端不可用时降级写回 config.json。"""
+        try:
+            backend = self.get_storage_backend()
+            backend.save_settings(self.data)
+            return
+        except Exception as exc:
+            print(f"[config] failed to save settings to storage backend, falling back to config.json: {exc}")
         self.path.write_text(json.dumps(self.data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     @property

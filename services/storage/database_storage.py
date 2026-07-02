@@ -30,6 +30,18 @@ class AuthKeyModel(Base):
     data = Column(Text, nullable=False)
 
 
+class SettingModel(Base):
+    """平台配置数据模型（单行 JSON 存储 config.json 的内容）"""
+    __tablename__ = "settings"
+
+    key = Column(String(255), primary_key=True)
+    data = Column(Text, nullable=False)  # JSON 格式存储完整配置
+
+
+# 平台配置在 settings 表中的固定主键
+SETTINGS_ROW_KEY = "config"
+
+
 class DatabaseStorageBackend(StorageBackend):
     """数据库存储后端（支持 SQLite、PostgreSQL、MySQL 等）"""
 
@@ -70,6 +82,38 @@ class DatabaseStorageBackend(StorageBackend):
     def save_auth_keys(self, auth_keys: list[dict[str, Any]]) -> None:
         """保存鉴权密钥数据到数据库"""
         self._save_rows(AuthKeyModel, auth_keys, "id", "key_id")
+
+    def load_settings(self) -> dict[str, Any] | None:
+        """从数据库加载平台配置（无记录时返回 None，表示尚未迁移）"""
+        session = self.Session()
+        try:
+            row = session.get(SettingModel, SETTINGS_ROW_KEY)
+            if row is None:
+                return None
+            try:
+                data = json.loads(row.data)
+            except json.JSONDecodeError:
+                return None
+            return data if isinstance(data, dict) else None
+        finally:
+            session.close()
+
+    def save_settings(self, settings: dict[str, Any]) -> None:
+        """保存平台配置到数据库（单行 upsert）"""
+        session = self.Session()
+        try:
+            payload = json.dumps(settings or {}, ensure_ascii=False)
+            row = session.get(SettingModel, SETTINGS_ROW_KEY)
+            if row is None:
+                session.add(SettingModel(key=SETTINGS_ROW_KEY, data=payload))
+            else:
+                row.data = payload
+            session.commit()
+        except Exception as e:
+            session.rollback()
+            raise e
+        finally:
+            session.close()
 
     def _load_rows(self, model: type[AccountModel] | type[AuthKeyModel]) -> list[dict[str, Any]]:
         session = self.Session()

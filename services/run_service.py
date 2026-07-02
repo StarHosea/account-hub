@@ -196,8 +196,11 @@ class RunService:
     def _activate_batch(self, client: CdkRedeemClient, tokens: list[str], cfg: dict) -> tuple[int, int]:
         """并发激活，返回 (成功数, 完成数)。"""
         success = completed = 0
+        # 把每账号的激活细节（尝试第几次 / 用哪张 CDK / 原始响应）转发到一键运行日志面板。
+        def _sink(text: str, level: str = "info") -> None:
+            self._append_log(text, level or "info")
         with ThreadPoolExecutor(max_workers=int(cfg["concurrency"])) as ex:
-            futures = [ex.submit(activation_service._activate_account, client, t, cfg) for t in tokens]
+            futures = [ex.submit(activation_service._activate_account, client, t, cfg, _sink) for t in tokens]
             for fut in as_completed(futures):
                 try:
                     if fut.result():

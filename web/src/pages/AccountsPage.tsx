@@ -87,6 +87,49 @@ function tierTag(type: string | null | undefined) {
   );
 }
 
+// Plus 激活流程状态（activation_service 维护，写在账号的 plus_* 字段里），与真实档位 type 区分。
+const PLUS_TAG_COLOR: Record<string, string> = {
+  未激活: "grey",
+  排队中: "blue",
+  激活中: "blue",
+  已激活: "green",
+  激活失败: "red",
+};
+
+// 号池里展示单个账号的激活进度：状态 + 尝试次数(UPI/IDEL) + 最新一条进度/失败原因 + 使用中的 CDK。
+function plusStatusCell(a: Account) {
+  const st = a.plus_status ?? "未激活";
+  const inProgress = st === "排队中" || st === "激活中";
+  const attempts = a.plus_attempts;
+  const tries =
+    attempts && (attempts.UPI || attempts.IDEL) ? `UPI ${attempts.UPI} / IDEL ${attempts.IDEL}` : "";
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0 }}>
+      <Space spacing={4}>
+        {inProgress ? <Spin size="small" /> : null}
+        <Tag color={(PLUS_TAG_COLOR[st] ?? "grey") as never} type="light">
+          {st}
+        </Tag>
+        {tries ? (
+          <Text type="tertiary" size="small">
+            {tries}
+          </Text>
+        ) : null}
+      </Space>
+      {a.plus_last_message ? (
+        <Text type="tertiary" size="small" ellipsis={{ showTooltip: true }} style={{ maxWidth: 220 }}>
+          {a.plus_last_message}
+        </Text>
+      ) : null}
+      {a.plus_cdk ? (
+        <Text type="tertiary" size="small" style={{ fontFamily: "monospace" }}>
+          CDK {maskSecret(a.plus_cdk)}
+        </Text>
+      ) : null}
+    </div>
+  );
+}
+
 // 账号有效性 + 进行中态（校验 / 2FA）。供表格与卡片共用。
 function accountStatusInfo(a: Account, pending: TwoFAAction | undefined, isRefreshing: boolean) {
   let text = "有效";
@@ -220,6 +263,17 @@ export default function AccountsPage() {
     void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [debouncedQuery, statusFilter, plusFilter, usedFilter, page]);
+
+  // 激活 / 一键运行进行中时，号池要能实时看到每个账号的激活进度：页面可见且无进行中操作时轻量轮询。
+  useEffect(() => {
+    const timer = setInterval(() => {
+      if (document.visibilityState !== "visible") return;
+      if (busy) return;
+      void load(true);
+    }, 5000);
+    return () => clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [debouncedQuery, statusFilter, plusFilter, usedFilter, page, busy]);
 
   const setRefreshFlag = (token: string, on: boolean) =>
     setRefreshing((prev) => {
@@ -637,6 +691,11 @@ export default function AccountsPage() {
       },
     },
     {
+      title: "Plus 激活",
+      width: 240,
+      render: (_: unknown, a: Account) => plusStatusCell(a),
+    },
+    {
       title: "密码",
       dataIndex: "password",
       width: 80,
@@ -934,7 +993,7 @@ export default function AccountsPage() {
           loading={loading}
           rowKey="access_token"
           tableLayout="fixed"
-          scroll={{ x: 1160 }}
+          scroll={{ x: 1400 }}
           pagination={{
             currentPage: page,
             pageSize: PAGE_SIZE,
@@ -1176,6 +1235,11 @@ function AccountMobileList({
                 )}
                 {a.country ? <Tag color="blue" type="light">{a.country}</Tag> : null}
               </div>
+
+              {/* Plus 激活进度：仅在参与过激活流程时展示 */}
+              {(a.plus_status && a.plus_status !== "未激活") || a.plus_last_message ? (
+                <div style={{ marginTop: 10 }}>{plusStatusCell(a)}</div>
+              ) : null}
 
               {/* 信息行：Token / 密码 / 2FA / 创建时间 */}
               <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 10, flexWrap: "wrap" }}>

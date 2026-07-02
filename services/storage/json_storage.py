@@ -10,11 +10,13 @@ from services.storage.base import StorageBackend
 class JSONStorageBackend(StorageBackend):
     """本地 JSON 文件存储后端"""
 
-    def __init__(self, file_path: Path, auth_keys_path: Path | None = None):
+    def __init__(self, file_path: Path, auth_keys_path: Path | None = None, settings_path: Path | None = None):
         self.file_path = file_path
         self.auth_keys_path = auth_keys_path or file_path.with_name("auth_keys.json")
+        self.settings_path = settings_path or file_path.with_name("settings.json")
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         self.auth_keys_path.parent.mkdir(parents=True, exist_ok=True)
+        self.settings_path.parent.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
     def _load_json_list(file_path: Path) -> list[dict[str, Any]]:
@@ -59,6 +61,24 @@ class JSONStorageBackend(StorageBackend):
         self.auth_keys_path.parent.mkdir(parents=True, exist_ok=True)
         self.auth_keys_path.write_text(
             json.dumps({"items": auth_keys}, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    def load_settings(self) -> dict[str, Any] | None:
+        """从 JSON 文件加载平台配置（不存在时返回 None，表示尚未迁移）"""
+        if not self.settings_path.exists():
+            return None
+        try:
+            data = json.loads(self.settings_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, Exception):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def save_settings(self, settings: dict[str, Any]) -> None:
+        """保存平台配置到 JSON 文件"""
+        self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+        self.settings_path.write_text(
+            json.dumps(settings or {}, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
 

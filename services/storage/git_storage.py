@@ -22,6 +22,7 @@ class GitStorageBackend(StorageBackend):
         branch: str = "main",
         file_path: str = "accounts.json",
         auth_keys_file_path: str = "auth_keys.json",
+        settings_file_path: str = "settings.json",
         local_cache_dir: Path | None = None,
     ):
         self.repo_url = repo_url
@@ -29,6 +30,7 @@ class GitStorageBackend(StorageBackend):
         self.branch = branch
         self.file_path = file_path
         self.auth_keys_file_path = auth_keys_file_path
+        self.settings_file_path = settings_file_path
         
         # 本地缓存目录
         if local_cache_dir is None:
@@ -113,6 +115,23 @@ class GitStorageBackend(StorageBackend):
         """保存鉴权密钥数据到 Git 仓库"""
         try:
             self._save_json_file(self.auth_keys_file_path, {"items": auth_keys}, "Update auth keys data")
+        except Exception as e:
+            print(f"[git-storage] save failed: {e}")
+            raise e
+
+    def load_settings(self) -> dict[str, Any] | None:
+        """从 Git 仓库加载平台配置（文件不存在时返回 None，表示尚未迁移）"""
+        try:
+            data = self._load_json_value(self.settings_file_path)
+        except Exception as e:
+            print(f"[git-storage] load failed: {e}")
+            raise
+        return data if isinstance(data, dict) else None
+
+    def save_settings(self, settings: dict[str, Any]) -> None:
+        """保存平台配置到 Git 仓库"""
+        try:
+            self._save_json_file(self.settings_file_path, settings or {}, "Update settings data")
         except Exception as e:
             print(f"[git-storage] save failed: {e}")
             raise e

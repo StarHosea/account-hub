@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
 import uuid
@@ -226,7 +227,7 @@ class ActivationService:
                 self._set_account(token, plus_status=STATUS_QUEUED, plus_cdk=cdk, plus_last_message=f"提交 {cdk_type} CDK 兑换")
                 self._append_log(f"[{email}] 尝试 {cdk_type} CDK（第 {attempts.get(cdk_type, 0) + 1}/{max_attempts} 次）", "", log_sink)
                 try:
-                    cls, status, message, task_id = self._attempt(client, token, cdk, cfg)
+                    cls, status, message, task_id = self._attempt(client, token, cdk, cfg, log_sink=log_sink)
                 except AuthError:
                     raise
                 except RedeemError as exc:
@@ -252,31 +253,61 @@ class ActivationService:
             self._append_log(f"[{email}] 两种类型 CDK 均激活失败，标记激活失败", "red", log_sink)
         return False
 
-    def _attempt(self, client: CdkRedeemClient, token: str, cdk: str, cfg: dict) -> tuple[str, str, str, str]:
-        """一次提交 + 轮询到终态。返回 (cls, status, message, task_id)。"""
+    def _log_raw(self, cdk: str, phase: str, js: object, log_sink=None) -> None:
+        """把兑换接口的原始响应（脱敏 + 截断）写进激活日志，便于本地定位真实信封结构与状态词。"""
+        try:
+            text = json.dumps(js, ensure_ascii=False)
+        except Exception:  # noqa: BLE001
+            text = str(js)
+        self._append_log(f"[{scrub(cdk)}] {phase} 原始响应: {scrub(text[:800])}", "", log_sink)
+
+    def _attempt(self, client: CdkRedeemClient, token: str, cdk: str, cfg: dict, log_sink=None) -> tuple[str, str, str, str]:
+        """一次提交 + 轮询到终态。返回 (cls, status, message, task_id)。
+
+        判定以「响应里该 CDK 对应的 item.status」为准：只要能在响应中定位到该项，就按 item 状态分类，
+        **忽略外层信封 code**（不同服务端成功码可能是 0 / 200 等，不能据此直接判失败——这正是旧逻辑把
+        每次提交都误判为失败、导致「查不到成功状态 / CDK 不消耗 / 刷新才发现已是 Plus」的根因）。
+        仅当响应里完全没有该项时，才回退用信封 code/msg 判断是否硬错误，否则视为已受理并进入轮询。
+        """
         js = client.submit(cdk, token)
-        code = cdk_redeem_client.env_code(js)
-        if code not in (None, 0):
-            return "fail", f"code={code}", cdk_redeem_client.env_msg(js) or "envelope code!=0", ""
+        self._log_raw(cdk, "submit", js, log_sink)
         it = item_for_cdk(js, cdk)
         task_id = item_task_id(it)
-        status = item_status(it)
-        cls = classify(status)
-        self._reflect_progress(token, it)
-        if cls in ("success", "fail", "cdk_invalid"):
-            return cls, status, item_message(it), task_id
+        status = ""
+        if it is not None:
+            status = item_status(it)
+            cls = classify(status)
+            self._reflect_progress(token, it)
+            if cls in ("success", "fail", "cdk_invalid"):
+                return cls, status, item_message(it), task_id
+        else:
+            code = cdk_redeem_client.env_code(js)
+            if code not in (None, 0):
+                return "fail", f"code={code}", cdk_redeem_client.env_msg(js) or "envelope code!=0", ""
 
         deadline = time.time() + float(cfg["poll_timeout"])
         interval = float(cfg["poll_interval"])
+        last_js: object = js
+        polled = 0
         while time.time() < deadline and not self._stop.is_set():
             time.sleep(interval)
             sjs = client.query_status([cdk])
+            last_js = sjs
+            polled += 1
             sit = item_for_cdk(sjs, cdk)
-            status = item_status(sit)
-            self._reflect_progress(token, sit)
-            cls = classify(status)
-            if cls in ("success", "fail", "cdk_invalid"):
-                return cls, status, item_message(sit), item_task_id(sit) or task_id
+            if polled == 1:
+                # 首个轮询响应固定记一条，便于确认「处理中/成功」时的真实字段与状态词。
+                self._log_raw(cdk, "status#1", sjs, log_sink)
+            if sit is not None:
+                status = item_status(sit)
+                self._reflect_progress(token, sit)
+                cls = classify(status)
+                if cls in ("success", "fail", "cdk_invalid"):
+                    if polled != 1:
+                        self._log_raw(cdk, f"status(final,{status or '空'})", sjs, log_sink)
+                    return cls, status, item_message(sit), item_task_id(sit) or task_id
+            # sit 为空：可能完成后已从队列消失，也可能仍在处理；继续轮询直到超时。
+        self._log_raw(cdk, "timeout", last_js, log_sink)
         return "fail", status or "timeout", "兑换超时（仍在排队/处理）", task_id
 
     def _reflect_progress(self, token: str, it: dict | None) -> None:

@@ -5,7 +5,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from services.config import DATA_DIR
+from services.config import DATA_DIR, config
 
 MAILBOX_FILE = DATA_DIR / "mailboxes.json"
 
@@ -53,20 +53,31 @@ class MailboxService:
 
     def __init__(self, store_file: Path = MAILBOX_FILE):
         self._store_file = store_file
+        self._storage = config.get_storage_backend()
         self._lock = threading.RLock()
         self._mailboxes: dict[str, dict] = self._load()
 
     # ----------------------------- 持久化 ----------------------------- #
 
     def _load(self) -> dict[str, dict]:
+        items = self._storage.load_collection("mailboxes")
+        if items is None:
+            items = self._read_legacy_items()
+            result = self._items_to_map(items)
+            self._storage.save_collection("mailboxes", list(result.values()))
+            return result
+        return self._items_to_map(items)
+
+    def _read_legacy_items(self) -> list:
         try:
             data = json.loads(self._store_file.read_text(encoding="utf-8"))
         except Exception:
-            return {}
-        result: dict[str, dict] = {}
+            return []
         items = data if isinstance(data, list) else data.get("items") if isinstance(data, dict) else None
-        if not isinstance(items, list):
-            return {}
+        return items if isinstance(items, list) else []
+
+    def _items_to_map(self, items: list) -> dict[str, dict]:
+        result: dict[str, dict] = {}
         for item in items:
             normalized = self._normalize(item)
             if normalized:
@@ -74,9 +85,23 @@ class MailboxService:
         return result
 
     def _save(self) -> None:
-        self._store_file.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"items": list(self._mailboxes.values())}
-        self._store_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self._storage.save_collection("mailboxes", list(self._mailboxes.values()))
+
+    def reconcile_in_use(self) -> int:
+        """启动对账：把硬杀残留、in_use=True 且 used=False 的邮箱立即复位 in_use=False、清 in_use_at。
+
+        比 IN_USE_STALE_SECONDS(1 小时) 超时回收更快，启动即释放。不动 cooldown_until。返回复位数。
+        """
+        with self._lock:
+            n = 0
+            for m in self._mailboxes.values():
+                if m.get("in_use") and not m.get("used"):
+                    m["in_use"] = False
+                    m["in_use_at"] = None
+                    n += 1
+            if n:
+                self._save()
+            return n
 
     @staticmethod
     def _normalize(item: dict) -> dict | None:

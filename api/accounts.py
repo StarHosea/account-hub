@@ -56,6 +56,15 @@ class AccountMarkUsedRequest(BaseModel):
     meta_by_token: dict[str, dict[str, str]] = Field(default_factory=dict)
 
 
+class AccountPlusAvailabilityRequest(BaseModel):
+    access_tokens: list[str] = Field(default_factory=list)
+    available: bool = True
+
+
+class AccountRevokeActivationRequest(BaseModel):
+    access_tokens: list[str] = Field(default_factory=list)
+
+
 class AccountCredentialsExportRequest(BaseModel):
     access_tokens: list[str] = Field(default_factory=list)
     only_unused: bool = False
@@ -118,7 +127,9 @@ def create_router() -> APIRouter:
         authorization: str | None = Header(default=None),
         q: str | None = Query(default=None),
         status: str | None = Query(default=None),
-        plus: str | None = Query(default=None),
+        plan: str | None = Query(default=None),
+        avail: str | None = Query(default=None),
+        activation: str | None = Query(default=None),
         used: bool | None = Query(default=None),
         page: int = Query(default=1, ge=1),
         page_size: int = Query(default=10, ge=1, le=200),
@@ -134,10 +145,18 @@ def create_router() -> APIRouter:
             "alive": sum(1 for a in items if a.get("status") in ("正常", "限流")),
             "dead": sum(1 for a in items if a.get("status") in ("异常", "禁用")),
             "activated": sum(1 for a in items if a.get("plus_status") == "已激活"),
+            # 待激活口径按 plus_status（激活流程剩余量），与「真实档位是否 Plus」分开。
+            "pending": sum(1 for a in items if a.get("plus_status", "未激活") == "未激活"),
+            # 不一致告警：plus_status=已激活 但真实档位仍非 Plus（如 CDK「假成功」），需人工核查。
+            "needs_review": sum(
+                1 for a in items
+                if a.get("plus_status") == "已激活"
+                and str(a.get("type") or "").strip().lower() != "plus"
+            ),
             "unused": sum(1 for a in items if not a.get("used")),
         }
 
-        # 过滤
+        # 过滤：支持按 邮箱 / 密码 / 激活用的 CDK / access_token(Token) 模糊匹配。
         keyword = (q or "").strip().lower()
         if keyword:
             items = [
@@ -145,15 +164,36 @@ def create_router() -> APIRouter:
                 for a in items
                 if keyword in str(a.get("email") or "").lower()
                 or keyword in str(a.get("password") or "").lower()
+                or keyword in str(a.get("plus_cdk") or "").lower()
+                or keyword in str(a.get("access_token") or "").lower()
             ]
         if status == "alive":
             items = [a for a in items if a.get("status") in ("正常", "限流")]
         elif status == "dead":
             items = [a for a in items if a.get("status") in ("异常", "禁用")]
-        if plus == "activated":
+        if plan == "plus":
+            items = [a for a in items if str(a.get("type") or "").strip().lower() == "plus"]
+        elif plan == "free":
+            items = [a for a in items if str(a.get("type") or "").strip().lower() in ("", "free")]
+        if avail == "available":
+            items = [a for a in items if not a.get("plus_unavailable")]
+        elif avail == "unavailable":
+            items = [a for a in items if a.get("plus_unavailable")]
+        # 激活流程状态筛选（按 plus_status）；review = 档位与 plus_status 不一致，需人工核查。
+        if activation == "pending":
+            items = [a for a in items if a.get("plus_status", "未激活") == "未激活"]
+        elif activation == "activated":
             items = [a for a in items if a.get("plus_status") == "已激活"]
-        elif plus == "inactive":
-            items = [a for a in items if a.get("plus_status") != "已激活"]
+        elif activation == "activating":
+            items = [a for a in items if a.get("plus_status") in ("排队中", "激活中")]
+        elif activation == "failed":
+            items = [a for a in items if a.get("plus_status") == "激活失败"]
+        elif activation == "review":
+            items = [
+                a for a in items
+                if a.get("plus_status") == "已激活"
+                and str(a.get("type") or "").strip().lower() != "plus"
+            ]
         if used is not None:
             items = [a for a in items if bool(a.get("used")) == used]
 
@@ -330,6 +370,23 @@ def create_router() -> APIRouter:
         if not tokens:
             raise HTTPException(status_code=400, detail={"error": "access_tokens is required"})
         return account_service.mark_used(tokens, bool(body.used), body.meta_by_token)
+
+    @router.post("/api/accounts/mark-plus-available")
+    async def mark_plus_available(body: AccountPlusAvailabilityRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        tokens = _unique_tokens(body.access_tokens)
+        if not tokens:
+            raise HTTPException(status_code=400, detail={"error": "access_tokens is required"})
+        return account_service.set_plus_availability(tokens, bool(body.available))
+
+    @router.post("/api/accounts/revoke-activation")
+    async def revoke_activation(body: AccountRevokeActivationRequest, authorization: str | None = Header(default=None)):
+        """危险操作：批量撤销账号激活状态（复位为未激活）。仅供程序误标激活时人工纠正。"""
+        require_admin(authorization)
+        tokens = _unique_tokens(body.access_tokens)
+        if not tokens:
+            raise HTTPException(status_code=400, detail={"error": "access_tokens is required"})
+        return account_service.revoke_activation(tokens)
 
     @router.post("/api/accounts/update")
     async def update_account(body: AccountUpdateRequest, authorization: str | None = Header(default=None)):

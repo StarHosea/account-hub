@@ -46,14 +46,13 @@ import {
   fetch2FAProgress,
   exportAccounts,
   markAccountsUsed,
-  startActivation,
-  fetchActivation,
+  markPlusAvailable,
+  revokeActivation,
   type Account,
   type AccountImportPayload,
   type AccountStatus,
   type AccountSummary,
   type AccountListParams,
-  type ActivationLog,
 } from "@/lib/api";
 import { useDebouncedValue } from "@/lib/use-debounced-value";
 import { useIsMobile } from "@/lib/use-is-mobile";
@@ -61,14 +60,13 @@ import { copyToClipboard as copy } from "@/lib/clipboard";
 import { StatCards } from "@/components/StatCards";
 import { MobileFilters } from "@/components/MobileFilters";
 import { log, useLogStore } from "@/store/logs";
-import RegisterPanel from "@/components/RegisterPanel";
 
 const { Title, Text } = Typography;
 
 type TwoFAAction = "enable" | "disable";
 
 const PAGE_SIZE = 10;
-const EMPTY_SUMMARY: AccountSummary = { total: 0, alive: 0, dead: 0, activated: 0, unused: 0 };
+const EMPTY_SUMMARY: AccountSummary = { total: 0, alive: 0, dead: 0, activated: 0, pending: 0, needs_review: 0, unused: 0 };
 
 // 真实订阅档位（OpenAI 返回的 type），与「状态」的激活流程区分开。供表格与卡片共用。
 function tierTag(type: string | null | undefined) {
@@ -88,49 +86,7 @@ function tierTag(type: string | null | undefined) {
 }
 
 // Plus 激活流程状态（activation_service 维护，写在账号的 plus_* 字段里），与真实档位 type 区分。
-const PLUS_TAG_COLOR: Record<string, string> = {
-  未激活: "grey",
-  排队中: "blue",
-  激活中: "blue",
-  已激活: "green",
-  激活失败: "red",
-};
-
-// 号池里展示单个账号的激活进度：状态 + 尝试次数(UPI/IDEL) + 最新一条进度/失败原因 + 使用中的 CDK。
-function plusStatusCell(a: Account) {
-  const st = a.plus_status ?? "未激活";
-  const inProgress = st === "排队中" || st === "激活中";
-  const attempts = a.plus_attempts;
-  const tries =
-    attempts && (attempts.UPI || attempts.IDEL) ? `UPI ${attempts.UPI} / IDEL ${attempts.IDEL}` : "";
-  return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0 }}>
-      <Space spacing={4}>
-        {inProgress ? <Spin size="small" /> : null}
-        <Tag color={(PLUS_TAG_COLOR[st] ?? "grey") as never} type="light">
-          {st}
-        </Tag>
-        {tries ? (
-          <Text type="tertiary" size="small">
-            {tries}
-          </Text>
-        ) : null}
-      </Space>
-      {a.plus_last_message ? (
-        <Text type="tertiary" size="small" ellipsis={{ showTooltip: true }} style={{ maxWidth: 220 }}>
-          {a.plus_last_message}
-        </Text>
-      ) : null}
-      {a.plus_cdk ? (
-        <Text type="tertiary" size="small" style={{ fontFamily: "monospace" }}>
-          CDK {maskSecret(a.plus_cdk)}
-        </Text>
-      ) : null}
-    </div>
-  );
-}
-
-// 账号有效性 + 进行中态（校验 / 2FA）。供表格与卡片共用。
+// 账号有效性 + 可用性 + 进行中态（校验 / 2FA）合并为一个「状态」。供表格与卡片共用。
 function accountStatusInfo(a: Account, pending: TwoFAAction | undefined, isRefreshing: boolean) {
   let text = "有效";
   let color: string = "green";
@@ -139,11 +95,37 @@ function accountStatusInfo(a: Account, pending: TwoFAAction | undefined, isRefre
   else if (pending === "disable") [text, color, spin] = ["关闭 2FA 中", "blue", true];
   else if (isRefreshing) [text, color, spin] = ["校验中", "blue", true];
   else if (a.status === "异常" || a.status === "禁用") [text, color] = ["失效", "red"];
+  else if (a.plus_unavailable) [text, color] = ["不可用", "red"];
   return { text, color, spin };
 }
 
-function maskSecret(s: string) {
-  return s.length > 10 ? `${s.slice(0, 4)}····${s.slice(-4)}` : s;
+// 号池列表的「激活」列：只展示粗粒度激活流程状态（激活中/激活失败/激活成功/待激活）+ CDK 类型标识
+// （UPI/IDEL），不展示具体 CDK 码与进度文案。若 plus_status=已激活 但真实档位仍非 Plus，标记「需人工核查」。
+function renderActivation(a: Account) {
+  const st = a.plus_status ?? "未激活";
+  let text = "待激活";
+  let color = "grey";
+  if (st === "已激活") [text, color] = ["激活成功", "green"];
+  else if (st === "排队中" || st === "激活中") [text, color] = ["激活中", "blue"];
+  else if (st === "激活失败") [text, color] = ["激活失败", "red"];
+  const mismatch = st === "已激活" && String(a.type ?? "").trim().toLowerCase() !== "plus";
+  return (
+    <Space spacing={4} wrap>
+      <Tag color={color as never} type="light">
+        {text}
+      </Tag>
+      {a.plus_cdk_type ? (
+        <Tag color="violet" type="light">
+          {a.plus_cdk_type}
+        </Tag>
+      ) : null}
+      {mismatch ? (
+        <Tag color="orange" type="light">
+          需人工核查
+        </Tag>
+      ) : null}
+    </Space>
+  );
 }
 
 // 敏感字段（密码 / 2FA）只露图标标识是否设置；悬浮看真实值，点击复制。
@@ -199,13 +181,16 @@ export default function AccountsPage() {
   const [twofaPending, setTwofaPending] = useState<Record<string, TwoFAAction>>({});
   const [refreshing, setRefreshing] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
-  const [activating, setActivating] = useState(false);
 
   // 搜索 / 筛选
   const [query, setQuery] = useState("");
   const debouncedQuery = useDebouncedValue(query, 300);
-  const [statusFilter, setStatusFilter] = useState<"" | "alive" | "dead">("");
-  const [plusFilter, setPlusFilter] = useState<"" | "activated" | "inactive">("");
+  const [statusFilter, setStatusFilter] = useState<"" | "valid" | "dead" | "unavailable">("valid");
+  const [planFilter, setPlanFilter] = useState<"" | "free" | "plus">("");
+  // 激活流程筛选：默认显示「已激活」。review = 档位与 plus_status 不一致，需人工核查。
+  const [activationFilter, setActivationFilter] = useState<
+    "" | "pending" | "activated" | "activating" | "failed" | "review"
+  >("activated");
   const [usedFilter, setUsedFilter] = useState<"" | "used" | "unused">("");
 
   const [editTarget, setEditTarget] = useState<Account | null>(null);
@@ -233,10 +218,15 @@ export default function AccountsPage() {
   // 按 token 反查邮箱，作为日志 scope，定位到具体账号。
   const emailOf = (token: string) => accounts.find((a) => a.access_token === token)?.email ?? `${token.slice(0, 8)}…`;
 
+  // 「状态」是有效 / 失效 / 不可用三选一（与表格状态列口径一致）：
+  // 有效 = Token 存活且可激活；失效 = Token 失效；不可用 = Token 存活但被标记无法激活。
   const buildParams = (overrides?: Partial<AccountListParams>): AccountListParams => ({
     q: debouncedQuery.trim() || undefined,
-    status: statusFilter || undefined,
-    plus: plusFilter || undefined,
+    status: statusFilter === "dead" ? "dead" : statusFilter === "" ? undefined : "alive",
+    avail:
+      statusFilter === "valid" ? "available" : statusFilter === "unavailable" ? "unavailable" : undefined,
+    plan: planFilter || undefined,
+    activation: activationFilter || undefined,
     used: usedFilter ? usedFilter === "used" : undefined,
     page,
     page_size: PAGE_SIZE,
@@ -262,7 +252,7 @@ export default function AccountsPage() {
   useEffect(() => {
     void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [debouncedQuery, statusFilter, plusFilter, usedFilter, page]);
+  }, [debouncedQuery, statusFilter, planFilter, activationFilter, usedFilter, page]);
 
   // 激活 / 一键运行进行中时，号池要能实时看到每个账号的激活进度：页面可见且无进行中操作时轻量轮询。
   useEffect(() => {
@@ -273,7 +263,7 @@ export default function AccountsPage() {
     }, 5000);
     return () => clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [debouncedQuery, statusFilter, plusFilter, usedFilter, page, busy]);
+  }, [debouncedQuery, statusFilter, planFilter, activationFilter, usedFilter, page, busy]);
 
   const setRefreshFlag = (token: string, on: boolean) =>
     setRefreshing((prev) => {
@@ -426,79 +416,46 @@ export default function AccountsPage() {
     }
   };
 
-  // 批量激活 Plus：对已注册但未激活的账号做补偿激活（走 CDK 兑换，直连不走代理）。
-  // 选中优先——勾了账号就激活这些（后端会重置尝试次数给新机会）；没勾就激活号池内全部未激活。
-  // 激活是全局单例任务，进度通过轮询 fetchActivation 增量汇入右下角共享日志面板。
-  const forwardActivationLogs = (() => {
-    // 闭包内维护「已转发条数」，跨 tick 增量转发；日志被裁剪（后端仅留末 300 条）则重放。
-    return (scope: string, logs: ActivationLog[], state: { seen: number }) => {
-      if (logs.length < state.seen) state.seen = 0;
-      for (let i = state.seen; i < logs.length; i++) {
-        const { text, level } = logs[i];
-        if (!text) continue;
-        if (level === "green") log.success(scope, text);
-        else if (level === "red") log.error(scope, text);
-        else log.info(scope, text); // yellow / info / 中性
-      }
-      state.seen = logs.length;
-    };
-  })();
-
-  const pollActivation = (scope: string, initial: ActivationLog[]) =>
-    new Promise<void>((resolve) => {
-      const cursor = { seen: 0 };
-      forwardActivationLogs(scope, initial, cursor);
-      const timer = setInterval(async () => {
-        try {
-          const s = await fetchActivation();
-          forwardActivationLogs(scope, s.activation.logs, cursor);
-          if (!s.activation.running) {
-            clearInterval(timer);
-            const st = s.activation.stats;
-            const done = `激活结束：成功 ${st.success}，失败 ${st.fail}`;
-            log.success(scope, done);
-            Toast.success(done);
-            resolve();
-          }
-        } catch (err) {
-          clearInterval(timer);
-          log.error(scope, err instanceof Error ? err.message : "获取激活进度失败");
-          resolve();
-        }
-      }, 1000);
-    });
-
-  const handleActivate = async (tokens: string[]) => {
-    const scope = tokens.length ? `激活 Plus · 选中 ${tokens.length} 个` : "激活 Plus · 全部未激活";
-    setActivating(true);
-    log.info(scope, "开始激活");
+  const handleMarkPlusAvailable = async (tokens: string[], available: boolean) => {
+    if (!tokens.length) {
+      Toast.warning("请先选择账号");
+      return;
+    }
+    setBusy(true);
     try {
-      const { activation } = await startActivation(tokens);
-      // 未真正起线程：无目标 / 未配置 API Key 等，后端把原因写在最后一条日志里。
-      if (!activation.running) {
-        const last = activation.logs[activation.logs.length - 1];
-        const msg = last?.text || "没有需要激活的账号";
-        if (last?.level === "red") {
-          log.error(scope, msg);
-          openLog(true);
-          Toast.error(msg);
-        } else {
-          log.info(scope, msg);
-          Toast.warning(msg);
-        }
-        return;
-      }
-      openLog(true);
-      Toast.success("已开始激活，进度见日志面板");
-      await pollActivation(scope, activation.logs);
+      const data = await markPlusAvailable(tokens, available);
       await load(true);
+      if (data.updated) {
+        Toast.success(`已标记 ${data.updated} 个账号激活${available ? "可用" : "不可用"}`);
+      } else {
+        Toast.info("没有需要变更的账号");
+      }
     } catch (e) {
-      const msg = e instanceof Error ? e.message : "激活失败";
-      log.error(scope, msg);
-      openLog(true);
-      Toast.error(msg);
+      Toast.error(e instanceof Error ? e.message : "标记失败");
     } finally {
-      setActivating(false);
+      setBusy(false);
+    }
+  };
+
+  // 危险操作：批量撤销激活，把选中账号的激活状态复位为未激活（不动真实档位 type）。
+  const handleRevokeActivation = async (tokens: string[]) => {
+    if (!tokens.length) {
+      Toast.warning("请先选择账号");
+      return;
+    }
+    setBusy(true);
+    try {
+      const data = await revokeActivation(tokens);
+      await load(true);
+      if (data.updated) {
+        Toast.success(`已撤销 ${data.updated} 个账号的激活状态`);
+      } else {
+        Toast.info("没有需要变更的账号");
+      }
+    } catch (e) {
+      Toast.error(e instanceof Error ? e.message : "撤销失败");
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -639,6 +596,7 @@ export default function AccountsPage() {
       title: "邮箱",
       dataIndex: "email",
       width: 300,
+      fixed: "left",
       render: (email: string | null) =>
         email ? (
           <Space spacing={4} style={{ maxWidth: "100%" }}>
@@ -653,23 +611,25 @@ export default function AccountsPage() {
     },
     {
       title: "Token",
-      width: 140,
+      width: 120,
       render: (_: unknown, a: Account) => {
         const tk = a.access_token || "";
         return (
-          <Space spacing={4}>
-            <Text type="tertiary" style={{ fontFamily: "monospace", fontSize: 12 }}>
-              ····{tk.slice(-5)}
-            </Text>
-            <Button size="small" theme="borderless" icon={<IconCopy />} onClick={() => copy(tk, "accessToken")} />
-          </Space>
+          <Text type="tertiary" style={{ fontFamily: "monospace", fontSize: 12 }}>
+            ···{tk.slice(-10)}
+          </Text>
         );
       },
     },
     {
-      title: "档位",
+      title: "套餐",
       width: 90,
       render: (_: unknown, a: Account) => tierTag(a.type),
+    },
+    {
+      title: "激活",
+      width: 160,
+      render: (_: unknown, a: Account) => renderActivation(a),
     },
     {
       title: "状态",
@@ -689,11 +649,6 @@ export default function AccountsPage() {
           </Space>
         );
       },
-    },
-    {
-      title: "Plus 激活",
-      width: 240,
-      render: (_: unknown, a: Account) => plusStatusCell(a),
     },
     {
       title: "密码",
@@ -752,6 +707,12 @@ export default function AccountsPage() {
       render: (v: string | null) => <Text type="tertiary" size="small">{formatDateTime(v)}</Text>,
     },
     {
+      title: "更新时间",
+      dataIndex: "last_token_refresh_at",
+      width: 140,
+      render: (v: string | null) => <Text type="tertiary" size="small">{formatDateTime(v)}</Text>,
+    },
+    {
       title: "操作",
       width: 170,
       fixed: "right",
@@ -775,6 +736,21 @@ export default function AccountsPage() {
               loading={refreshing.has(a.access_token)}
               onClick={() => void handleRefresh([a.access_token])}
             />
+            {a.plus_unavailable ? (
+              <Popconfirm
+                title="标记该账号激活可用？"
+                content="将清除不可用标记并重置激活态（未激活），使其重新进入下一轮激活。"
+                onConfirm={() => void handleMarkPlusAvailable([a.access_token], true)}
+              >
+                <Button
+                  size="small"
+                  theme="borderless"
+                  type="secondary"
+                  title="标记激活可用"
+                  icon={<IconTickCircle />}
+                />
+              </Popconfirm>
+            ) : null}
             {a.totp_secret ? (
               <Popconfirm
                 title="确认关闭 2FA？"
@@ -827,7 +803,11 @@ export default function AccountsPage() {
     { label: "账户总数", value: summary.total },
     { label: "存活", value: summary.alive, color: "var(--semi-color-success)" },
     { label: "失效", value: summary.dead, color: "var(--semi-color-danger)" },
+    { label: "待激活", value: summary.pending, color: "var(--semi-color-primary)" },
     { label: "已激活", value: summary.activated, color: "var(--semi-color-success)" },
+    ...(summary.needs_review
+      ? [{ label: "需核查", value: summary.needs_review, color: "var(--semi-color-warning)" }]
+      : []),
     { label: "未出库", value: summary.unused, color: "var(--semi-color-primary)" },
   ];
 
@@ -841,33 +821,50 @@ export default function AccountsPage() {
           setPage(1);
         }}
         showClear
-        placeholder="搜索邮箱 / 密码"
+        placeholder="搜索邮箱 / 密码 / CDK / Token"
         style={{ width: isMobile ? "100%" : 240 }}
       />
       <Select
         value={statusFilter}
         onChange={(v) => {
-          setStatusFilter((v as "" | "alive" | "dead") ?? "");
+          setStatusFilter((v as "" | "valid" | "dead" | "unavailable") ?? "");
           setPage(1);
         }}
         style={{ width: isMobile ? "100%" : 130 }}
         optionList={[
           { label: "全部状态", value: "" },
-          { label: "有效", value: "alive" },
+          { label: "有效", value: "valid" },
           { label: "失效", value: "dead" },
+          { label: "不可用", value: "unavailable" },
         ]}
       />
       <Select
-        value={plusFilter}
+        value={planFilter}
         onChange={(v) => {
-          setPlusFilter((v as "" | "activated" | "inactive") ?? "");
+          setPlanFilter((v as "" | "free" | "plus") ?? "");
           setPage(1);
         }}
         style={{ width: isMobile ? "100%" : 130 }}
         optionList={[
-          { label: "全部激活", value: "" },
+          { label: "全部套餐", value: "" },
+          { label: "Free", value: "free" },
+          { label: "Plus", value: "plus" },
+        ]}
+      />
+      <Select
+        value={activationFilter}
+        onChange={(v) => {
+          setActivationFilter((v as typeof activationFilter) ?? "");
+          setPage(1);
+        }}
+        style={{ width: isMobile ? "100%" : 140 }}
+        optionList={[
+          { label: "全部激活态", value: "" },
           { label: "已激活", value: "activated" },
-          { label: "未激活", value: "inactive" },
+          { label: "待激活", value: "pending" },
+          { label: "激活中", value: "activating" },
+          { label: "激活失败", value: "failed" },
+          { label: "需人工核查", value: "review" },
         ]}
       />
       <Select
@@ -886,7 +883,7 @@ export default function AccountsPage() {
     </>
   );
   const activeFilterCount =
-    (query.trim() ? 1 : 0) + (statusFilter ? 1 : 0) + (plusFilter ? 1 : 0) + (usedFilter ? 1 : 0);
+    (query.trim() ? 1 : 0) + (statusFilter ? 1 : 0) + (planFilter ? 1 : 0) + (activationFilter ? 1 : 0) + (usedFilter ? 1 : 0);
 
   return (
     <div>
@@ -903,7 +900,6 @@ export default function AccountsPage() {
         <Title heading={isMobile ? 4 : 3} style={{ margin: 0 }}>
           号池管理
         </Title>
-        <RegisterPanel />
       </div>
 
       <StatCards mobile={isMobile} items={metricCards} />
@@ -927,22 +923,29 @@ export default function AccountsPage() {
                   删除选中
                 </Button>
               </Popconfirm>
+              <Popconfirm
+                title={`标记选中的 ${selectedKeys.length} 个账号激活可用？`}
+                content="将清除不可用标记并重置激活态（未激活），使其重新进入下一轮激活。"
+                onConfirm={() => void handleMarkPlusAvailable(selectedKeys, true)}
+              >
+                <Button size="small" theme="light" type="secondary" loading={busy}>
+                  标记可用
+                </Button>
+              </Popconfirm>
+              <Popconfirm
+                title={`⚠️ 撤销选中的 ${selectedKeys.length} 个账号的激活状态？`}
+                content="危险操作：把激活状态整体复位为「未激活」（清空激活记录与 CDK 绑定，不改动真实套餐）。仅在程序异常错误标记了激活状态时使用，请确认后再操作。"
+                okType="danger"
+                okText="确认撤销"
+                onConfirm={() => void handleRevokeActivation(selectedKeys)}
+              >
+                <Button size="small" type="danger" theme="light" loading={busy}>
+                  撤销激活
+                </Button>
+              </Popconfirm>
               <span style={{ width: 1, height: 18, background: "var(--semi-color-border)", display: "inline-block" }} />
             </>
           ) : null}
-          <Popconfirm
-            title="批量激活 Plus"
-            content={
-              selectedKeys.length
-                ? `对选中的 ${selectedKeys.length} 个账号发起 Plus 激活（已激活的自动跳过，直连不走代理）？`
-                : "对号池内【全部未激活】账号发起 Plus 激活？激活直连、不走代理。"
-            }
-            onConfirm={() => void handleActivate(selectedKeys)}
-          >
-            <Button icon={<IconTickCircle />} theme="light" type="primary" loading={activating}>
-              {selectedKeys.length ? `激活选中 (${selectedKeys.length})` : "激活未激活"}
-            </Button>
-          </Popconfirm>
           <Button icon={<IconRefresh />} onClick={() => void load()} loading={loading}>
             刷新
           </Button>
@@ -1001,6 +1004,7 @@ export default function AccountsPage() {
             onPageChange: setPage,
           }}
           rowSelection={{
+            fixed: true,
             selectedRowKeys: selectedKeys,
             onChange: (keys) => setSelectedKeys((keys ?? []) as string[]),
           }}
@@ -1225,7 +1229,7 @@ function AccountMobileList({
                 </Space>
               </div>
 
-              {/* 标签行：档位 / 出库 / 国家 */}
+              {/* 标签行：套餐 / 出库 / 国家（可用性已并入顶行状态） */}
               <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 10 }}>
                 {tierTag(a.type)}
                 {a.used ? (
@@ -1236,23 +1240,15 @@ function AccountMobileList({
                 {a.country ? <Tag color="blue" type="light">{a.country}</Tag> : null}
               </div>
 
-              {/* Plus 激活进度：仅在参与过激活流程时展示 */}
-              {(a.plus_status && a.plus_status !== "未激活") || a.plus_last_message ? (
-                <div style={{ marginTop: 10 }}>{plusStatusCell(a)}</div>
-              ) : null}
-
-              {/* 信息行：Token / 密码 / 2FA / 创建时间 */}
+              {/* 信息行：Token / 密码 / 2FA / 更新时间 */}
               <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
-                <Space spacing={2}>
-                  <Text type="tertiary" style={{ fontFamily: "monospace", fontSize: 12 }}>
-                    ····{token.slice(-5)}
-                  </Text>
-                  <Button size="small" theme="borderless" icon={<IconCopy />} onClick={() => copy(token, "accessToken")} />
-                </Space>
+                <Text type="tertiary" style={{ fontFamily: "monospace", fontSize: 12 }}>
+                  ···{token.slice(-10)}
+                </Text>
                 {renderSecret(a.password, a.password || "", "密码", <IconKey />)}
                 {renderSecret(a.totp_secret, a.totp_secret || "", "2FA 密钥", <IconShield />)}
                 <Text type="tertiary" size="small" style={{ marginLeft: "auto" }}>
-                  {formatDateTime(a.created_at)}
+                  {formatDateTime(a.last_token_refresh_at)}
                 </Text>
               </div>
 

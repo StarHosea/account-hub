@@ -49,11 +49,47 @@ class ActivationService:
         self._runner: threading.Thread | None = None
         self._stop = threading.Event()
         self._logs: list[dict] = []
-        self._stats: dict = self._empty_stats()
+        self._storage = config.get_storage_backend()
+        # stats 落库节流：Postgres 等 4s 一次；Git 后端仅在关键节点 force 落库（避免每次 commit）。
+        try:
+            _btype = self._storage.get_backend_info().get("type")
+        except Exception:
+            _btype = None
+        self._persist_interval = 1e9 if _btype == "git" else 4.0
+        self._last_persist_ts = 0.0
+        self._stats: dict = self._load_persisted_stats()
 
     @staticmethod
     def _empty_stats() -> dict:
-        return {"total": 0, "done": 0, "success": 0, "fail": 0, "running": 0, "started_at": None, "finished_at": None, "updated_at": None}
+        # running：在跑并发数（int，UI 展示）；job_running：整个批次是否运行中（bool，决定重启续跑）。
+        return {"total": 0, "done": 0, "success": 0, "fail": 0, "running": 0, "job_running": False,
+                "job_limit": None, "started_at": None, "finished_at": None, "updated_at": None}
+
+    def _load_persisted_stats(self) -> dict:
+        try:
+            st = self._storage.load_state("activation")
+        except Exception:
+            st = None
+        base = self._empty_stats()
+        if isinstance(st, dict) and st:
+            base.update(st)
+        return base
+
+    def _persist_stats(self, force: bool = False) -> None:
+        """把 stats 落库（节流）。force=True 用于 start/finish/stop 等关键节点，绕过节流立即写。
+
+        job_running 标志的准确性直接决定重启后是否续跑，故关键节点必须 force。
+        """
+        now = time.time()
+        if not force and (now - self._last_persist_ts) < self._persist_interval:
+            return
+        self._last_persist_ts = now
+        with self._lock:
+            snapshot = dict(self._stats)
+        try:
+            self._storage.save_state("activation", snapshot)
+        except Exception:
+            pass
 
     # ----------------------------- 对外只读 ----------------------------- #
 
@@ -62,7 +98,26 @@ class ActivationService:
         free = sum(1 for a in accounts if a.get("plus_status", STATUS_UNACTIVATED) == STATUS_UNACTIVATED)
         activated = sum(1 for a in accounts if a.get("plus_status") == STATUS_ACTIVATED)
         activating = sum(1 for a in accounts if a.get("plus_status") in (STATUS_QUEUED, STATUS_ACTIVATING))
-        return {"free": free, "activated": activated, "activating": activating, "total": len(accounts)}
+        # 按真实套餐 type 判定「是否已激活 Plus」：type==plus 视为已激活，其余（含 free/空）视为未激活。
+        # 与上面基于 plus_status 的 free/activated 口径分开：这两个字段供工作台卡片展示用。
+        plus_by_type = sum(1 for a in accounts if str(a.get("type") or "").strip().lower() == "plus")
+        not_plus_by_type = len(accounts) - plus_by_type
+        # 不一致告警：plus_status 已判定为「已激活」，但真实档位仍非 Plus（例如 CDK 服务端「假成功」，
+        # 或激活链路提前置位）。这类账号计入待激活口径无意义，需人工核查真实档位与 CDK 归属。
+        needs_review = sum(
+            1 for a in accounts
+            if a.get("plus_status") == STATUS_ACTIVATED
+            and str(a.get("type") or "").strip().lower() != "plus"
+        )
+        return {
+            "free": free,
+            "activated": activated,
+            "activating": activating,
+            "total": len(accounts),
+            "plus_by_type": plus_by_type,
+            "not_plus_by_type": not_plus_by_type,
+            "needs_review": needs_review,
+        }
 
     def get(self) -> dict:
         with self._lock:
@@ -89,10 +144,11 @@ class ActivationService:
         with self._lock:
             self._stats.update(updates)
             self._stats["updated_at"] = _now()
+        self._persist_stats()
 
     # ----------------------------- 启动/停止 ----------------------------- #
 
-    def start(self, tokens: list[str] | None = None) -> dict:
+    def start(self, tokens: list[str] | None = None, limit: int | None = None) -> dict:
         with self._lock:
             if self._runner and self._runner.is_alive():
                 return self.get()
@@ -100,21 +156,47 @@ class ActivationService:
             if not cfg["api_key"]:
                 self._append_log("未配置 CDK API Key，无法激活（请在设置中填写）", "red")
                 return self.get()
-            targets = self._resolve_targets(tokens)
+            targets = self._resolve_targets(tokens, limit)
             if not targets:
                 self._append_log("没有需要激活的账号", "yellow")
                 return self.get()
             self._stop.clear()
             self._logs = []
-            self._stats = {**self._empty_stats(), "job_id": uuid.uuid4().hex, "total": len(targets), "started_at": _now(), "updated_at": _now()}
+            self._stats = {**self._empty_stats(), "job_id": uuid.uuid4().hex, "total": len(targets),
+                           "job_running": True, "job_limit": limit, "started_at": _now(), "updated_at": _now()}
             self._runner = threading.Thread(target=self._run, args=(targets, cfg), daemon=True, name="cdk-activation")
             self._runner.start()
             self._append_log(f"激活任务启动，目标账号 {len(targets)} 个，并发 {cfg['concurrency']}", "yellow")
-            return self.get()
+        # 关键节点：立即落库 job_running=True，确保重启能识别到需续跑（锁外，避免持锁 I/O）。
+        self._persist_stats(force=True)
+        return self.get()
+
+    def resume_if_running(self) -> None:
+        """进程启动时由 lifespan 调用：若上次退出时激活任务处于运行态，自动续跑。
+
+        传 tokens=None 走默认「所有未激活」分支（避免显式选中分支清零 attempts）；
+        对账已把卡在「排队中/激活中」的账号复位成「未激活」，故它们会被自然重新纳入。
+        """
+        try:
+            st = self._storage.load_state("activation")
+        except Exception:
+            st = None
+        if st and st.get("job_running"):
+            self._append_log("检测到上次激活任务未结束，自动续跑（所有未激活账号）", "yellow")
+            self.start(tokens=None, limit=st.get("job_limit"))
 
     def stop(self) -> dict:
         self._stop.set()
+        with self._lock:
+            self._stats["job_running"] = False
+        self._persist_stats(force=True)
         self._append_log("已请求停止激活任务，正在等待当前任务结束", "yellow")
+        return self.get()
+
+    def clear_logs(self) -> dict:
+        """只清空日志，保留统计（供工作台「清空日志」使用）。"""
+        with self._lock:
+            self._logs = []
         return self.get()
 
     def activate_token_async(self, token: str, log_sink=None) -> bool:
@@ -149,7 +231,7 @@ class ActivationService:
         self._append_log(f"注册成功后已自动派发激活：{token[:8]}…", "", log_sink)
         return True
 
-    def _resolve_targets(self, tokens: list[str] | None) -> list[str]:
+    def _resolve_targets(self, tokens: list[str] | None, limit: int | None = None) -> list[str]:
         accounts = account_service.list_accounts()
         by_token = {a.get("access_token"): a for a in accounts}
         if tokens:
@@ -162,15 +244,32 @@ class ActivationService:
                 real = acct.get("access_token")
                 if acct.get("plus_status") == STATUS_ACTIVATED:
                     continue
+                # 已标记不可用：需先人工「标记可用」，本轮跳过（即便被显式选中）。
+                if acct.get("plus_unavailable"):
+                    self._append_log(f"账号 {real[:8]}… 已标记不可用，已跳过（请先标记可用）", "yellow")
+                    continue
                 account_service.update_account(real, {
                     "plus_status": STATUS_UNACTIVATED,
                     "plus_attempts": {"UPI": 0, "IDEL": 0},
                     "plus_last_message": None,
                 }, quiet=True)
                 result.append(real)
-            return result
-        # 默认：所有未激活账号。
-        return [a.get("access_token") for a in accounts if a.get("plus_status", STATUS_UNACTIVATED) == STATUS_UNACTIVATED]
+            return self._cap(result, limit)
+        # 默认：所有未激活且未被标记不可用的账号。
+        default = [
+            a.get("access_token")
+            for a in accounts
+            if a.get("plus_status", STATUS_UNACTIVATED) == STATUS_UNACTIVATED
+            and not a.get("plus_unavailable")
+        ]
+        return self._cap(default, limit)
+
+    @staticmethod
+    def _cap(targets: list[str], limit: int | None) -> list[str]:
+        """按「激活数量」截取前 N 个目标；limit 为空或 <=0 表示不限（全部）。"""
+        if limit is not None and limit > 0:
+            return targets[: int(limit)]
+        return targets
 
     # ----------------------------- 运行 ----------------------------- #
 
@@ -199,12 +298,31 @@ class ActivationService:
             self._append_log(f"{exc}，已停止整轮激活", "red")
         finally:
             client.close()
-        self._bump(running=0, finished_at=_now())
+        self._bump(running=0, job_running=False, finished_at=_now())
+        self._persist_stats(force=True)
         self._append_log(f"激活任务结束，成功 {success}，失败 {fail}", "yellow")
 
     def _set_account(self, token: str, **fields) -> None:
         fields["plus_updated_at"] = _now()
         account_service.update_account(token, fields, quiet=True)
+
+    def _verify_plan(self, token: str, email: str, log_sink=None) -> None:
+        """激活成功后向 OpenAI 核实真实套餐（读 plan_type 覆盖 type），确保档位是核实过的真值。
+
+        走 account_service.fetch_remote_info：内部会刷新 token、拉 get_user_info 并 update_account 合并，
+        真实 plan_type 覆盖 type，plus_status 等字段保持不变。核实失败不影响「激活成功」结论——仅记一条日志，
+        档位留待下次常规刷新纠正。
+        """
+        try:
+            acct = account_service.fetch_remote_info(token, event="activation_verify")
+            tier = str((acct or {}).get("type") or "未知")
+            level = "green" if tier.lower() == "plus" else "yellow"
+            self._append_log(f"[{email}] 已核实套餐：{tier}", level, log_sink)
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(
+                f"[{email}] 套餐核实失败（不影响激活成功，稍后刷新会纠正）：{scrub(str(exc))}",
+                "yellow", log_sink,
+            )
 
     def _activate_account(self, client: CdkRedeemClient, token: str, cfg: dict, log_sink=None) -> bool:
         if self._stop.is_set():
@@ -224,33 +342,45 @@ class ActivationService:
                     break
                 tried.add(cdk)
                 any_attempt = True
-                self._set_account(token, plus_status=STATUS_QUEUED, plus_cdk=cdk, plus_last_message=f"提交 {cdk_type} CDK 兑换")
+                # acquire_available 已把该 CDK 置为「进行中」防并发抢用；无论成功/失败/异常，
+                # 都必须在本次尝试结束时归还占用（consume/mark_invalid 会转终态，release 幂等）。
+                consumed = False
+                self._set_account(token, plus_status=STATUS_QUEUED, plus_cdk=cdk, plus_cdk_type=cdk_type, plus_last_message=f"提交 {cdk_type} CDK 兑换")
                 self._append_log(f"[{email}] 尝试 {cdk_type} CDK（第 {attempts.get(cdk_type, 0) + 1}/{max_attempts} 次）", "", log_sink)
                 try:
-                    cls, status, message, task_id = self._attempt(client, token, cdk, cfg, log_sink=log_sink)
-                except AuthError:
-                    raise
-                except RedeemError as exc:
-                    cls, status, message, task_id = "fail", "error", str(exc), ""
+                    try:
+                        cls, status, message, task_id = self._attempt(client, token, cdk, cfg, log_sink=log_sink)
+                    except AuthError:
+                        raise
+                    except RedeemError as exc:
+                        cls, status, message, task_id = "fail", "error", str(exc), ""
 
-                if cls == "success":
-                    cdk_service.consume(cdk, token)
-                    self._set_account(token, plus_status=STATUS_ACTIVATED, type="Plus", plus_task_id=task_id, plus_last_message=message or "兑换成功")
-                    self._append_log(f"[{email}] 激活成功（{cdk_type}）", "green", log_sink)
-                    return True
-                if cls == "cdk_invalid":
-                    cdk_service.mark_invalid(cdk)
-                    self._append_log(f"[{email}] CDK {scrub(cdk)} 无效(not_found)，换下一个", "yellow", log_sink)
-                    continue  # 不计入尝试次数
-                # fail / pending(timeout) / unknown → 计一次失败尝试，CDK 保持可用
-                attempts[cdk_type] = attempts.get(cdk_type, 0) + 1
-                self._set_account(token, plus_attempts=attempts, plus_last_message=message or status)
-                self._append_log(f"[{email}] {cdk_type} 第 {attempts[cdk_type]} 次失败：{scrub(message or status)}", "red", log_sink)
+                    if cls == "success":
+                        cdk_service.consume(cdk, token)
+                        consumed = True
+                        # 只置激活流程状态；真实档位(type)由下方刷新读 OpenAI plan_type 核实，避免写出「假 Plus」。
+                        self._set_account(token, plus_status=STATUS_ACTIVATED, plus_task_id=task_id, plus_last_message=message or "兑换成功")
+                        self._append_log(f"[{email}] 激活成功（{cdk_type}）", "green", log_sink)
+                        self._verify_plan(token, email, log_sink)
+                        return True
+                    if cls == "cdk_invalid":
+                        cdk_service.mark_invalid(cdk)
+                        consumed = True
+                        self._append_log(f"[{email}] CDK {scrub(cdk)} 无效(not_found)，换下一个", "yellow", log_sink)
+                        continue  # 不计入尝试次数
+                    # fail / pending(timeout) / unknown → 计一次失败尝试，CDK 保持可用
+                    attempts[cdk_type] = attempts.get(cdk_type, 0) + 1
+                    self._set_account(token, plus_attempts=attempts, plus_last_message=message or status)
+                    self._append_log(f"[{email}] {cdk_type} 第 {attempts[cdk_type]} 次失败：{scrub(message or status)}", "red", log_sink)
+                finally:
+                    if not consumed:
+                        cdk_service.release(cdk)
 
         self._set_account(token, plus_status=STATUS_FAILED,
-                          plus_last_message=("两种类型 CDK 均激活失败" if any_attempt else "无可用 CDK"))
+                          plus_unavailable=any_attempt,
+                          plus_last_message=("两种类型 CDK 均激活失败，已标记账号不可用" if any_attempt else "无可用 CDK"))
         if any_attempt:
-            self._append_log(f"[{email}] 两种类型 CDK 均激活失败，标记激活失败", "red", log_sink)
+            self._append_log(f"[{email}] 两种类型 CDK 均激活失败，标记账号不可用（下轮激活将跳过，可人工标记可用）", "red", log_sink)
         return False
 
     def _log_raw(self, cdk: str, phase: str, js: object, log_sink=None) -> None:

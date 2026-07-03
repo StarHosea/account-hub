@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from services.account_service import account_service
-from services.config import DATA_DIR
+from services.config import DATA_DIR, config
 from services.register import mail_provider, openai_register
 
 
@@ -113,27 +113,51 @@ def _normalize(raw: dict) -> dict:
 class RegisterService:
     def __init__(self, store_file: Path):
         self._store_file = store_file
+        self._storage = config.get_storage_backend()
         self._lock = threading.RLock()
         self._runner: threading.Thread | None = None
         self._logs: list[dict] = []
         openai_register.register_log_sink = self._append_log
         self._config = self._load()
-        if self._config["enabled"]:
+        # 注意：不在构造时 auto-start。续跑统一由 api/app.py lifespan 调 resume_if_enabled()，
+        # 确保「对账清中间态」先于「续跑」执行，且避免被 import 副作用意外拉起注册任务。
+
+    def resume_if_enabled(self) -> None:
+        """进程启动时由 lifespan 调用：若上次退出时任务处于运行态（enabled=True），自动续跑。
+
+        续跑语义 = 重新跑满 total（非精确断点续跑）；邮箱 used 标志保证不会重复注册同一邮箱。
+        """
+        with self._lock:
+            enabled = bool(self._config.get("enabled"))
+        if enabled:
+            self._append_log("检测到上次注册任务未结束，自动续跑（重新跑满目标数）", "yellow")
             self.start()
 
     def _load(self) -> dict:
+        data = self._storage.load_state("register")
+        if data is None:
+            # 后端首次启动：从旧 data/register.json 迁移种子配置。
+            data = self._read_legacy_config()
+            normalized = _normalize(data)
+            self._storage.save_state("register", normalized)
+            return normalized
+        return _normalize(data)
+
+    def _read_legacy_config(self) -> dict:
         try:
-            return _normalize(json.loads(self._store_file.read_text(encoding="utf-8")))
+            return json.loads(self._store_file.read_text(encoding="utf-8"))
         except Exception:
-            return _normalize({})
+            return {}
 
     def _save(self) -> None:
-        self._store_file.parent.mkdir(parents=True, exist_ok=True)
-        self._store_file.write_text(json.dumps(self._config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self._storage.save_state("register", self._config)
 
     def get(self) -> dict:
         with self._lock:
-            return json.loads(json.dumps({**self._config, "logs": self._logs[-300:]}, ensure_ascii=False))
+            base = json.loads(json.dumps({**self._config, "logs": self._logs[-300:]}, ensure_ascii=False))
+        # 正在注册的实时进度（按任务号），与 stats/logs 一起随 SSE 推给前端。
+        base["progress"] = openai_register.progress_snapshot()
+        return base
 
     def _push_to_worker(self) -> None:
         openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads", "enable_2fa", "regions", "ipweb_rotate", "ip_duration")})
@@ -153,6 +177,7 @@ class RegisterService:
                 return self.get()
             self._config["enabled"] = True
             self._logs = []
+            openai_register.reset_progress()
             metrics = self._pool_metrics()
             self._config["stats"] = {"job_id": uuid.uuid4().hex, "success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], **metrics, "started_at": _now(), "updated_at": _now()}
             self._push_to_worker()
@@ -178,6 +203,13 @@ class RegisterService:
             self._config["stats"] = {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, **self._pool_metrics(), "updated_at": _now()}
             with openai_register.stats_lock:
                 openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": 0.0})
+            self._save()
+            return self.get()
+
+    def clear_logs(self) -> dict:
+        """只清空日志，保留统计（供工作台「清空日志」使用）。"""
+        with self._lock:
+            self._logs = []
             self._save()
             return self.get()
 

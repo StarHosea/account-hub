@@ -2,6 +2,7 @@ import { Routes, Route, Navigate } from "react-router-dom";
 
 import AppLayout from "@/layouts/AppLayout";
 import LoginPage from "@/pages/LoginPage";
+import WorkbenchPage from "@/pages/WorkbenchPage";
 import AccountsPage from "@/pages/AccountsPage";
 import CdksPage from "@/pages/CdksPage";
 import MailboxesPage from "@/pages/MailboxesPage";
@@ -15,8 +16,9 @@ export default function App() {
     <Routes>
       <Route path="/login" element={<LoginPage />} />
       <Route element={<AppLayout />}>
-        <Route path="/" element={<Navigate to="/accounts" replace />} />
-        <Route path="/dashboard" element={<Navigate to="/accounts" replace />} />
+        <Route path="/" element={<Navigate to="/workbench" replace />} />
+        <Route path="/dashboard" element={<Navigate to="/workbench" replace />} />
+        <Route path="/workbench" element={<WorkbenchPage />} />
         <Route path="/accounts" element={<AccountsPage />} />
         <Route path="/finished-accounts" element={<FinishedAccountsPage />} />
         <Route path="/cdks" element={<CdksPage />} />

@@ -49,6 +49,7 @@ export type Account = {
   exit_ip?: string | null;
   password?: string | null;
   created_at?: string | null;
+  last_token_refresh_at?: string | null;
   mail_link?: string | null;
   // 2FA (TOTP) 相关字段
   totp_secret?: string | null;
@@ -70,9 +71,13 @@ export type Account = {
   plus_status?: PlusStatus;
   plus_attempts?: { UPI: number; IDEL: number };
   plus_cdk?: string | null;
+  // 激活成功/最近一次尝试所用的 CDK 类型（UPI/IDEL），用于号池列表的类型标识与 CDK↔账号绑定溯源。
+  plus_cdk_type?: CdkType | null;
   plus_task_id?: string | null;
   plus_last_message?: string | null;
   plus_updated_at?: string | null;
+  // 激活不可用标记：两种类型 CDK 均连续激活失败后置位，下轮激活自动跳过，直到人工标记可用。
+  plus_unavailable?: boolean;
 };
 
 export type AccountImportPayload = {
@@ -89,6 +94,10 @@ export type AccountSummary = {
   alive: number;
   dead: number;
   activated: number;
+  // 待激活（按 plus_status==未激活 的激活流程口径）。
+  pending: number;
+  // 不一致告警数：plus_status=已激活 但真实档位仍非 Plus，需人工核查。
+  needs_review: number;
   unused: number;
 };
 
@@ -327,6 +336,9 @@ export type ActivationSummary = {
   activated: number;
   activating: number;
   total: number;
+  // 按真实套餐 type 判定：plus_by_type=已是 Plus；not_plus_by_type=注册成功但还不是 Plus（待激活口径）。
+  plus_by_type?: number;
+  not_plus_by_type?: number;
 };
 
 export type ActivationLog = {
@@ -409,6 +421,17 @@ export type RegisterConfig = {
     text: string;
     level: string;
   }>;
+  // 正在注册的每个任务的实时进度（按任务号）：供工作台「正在注册账号」表展示。
+  progress?: RegisterProgressItem[];
+};
+
+export type RegisterProgressItem = {
+  index: number;
+  email: string;
+  step: string;
+  level: string;
+  status: "running" | "success" | "fail";
+  updated_at?: string;
 };
 
 // ── Auth ───────────────────────────────────────────────────────────
@@ -430,7 +453,10 @@ export async function login(authKey: string) {
 export type AccountListParams = PageParams & {
   q?: string;
   status?: "alive" | "dead";
-  plus?: "activated" | "inactive";
+  plan?: "free" | "plus";
+  avail?: "available" | "unavailable";
+  // 激活流程筛选：待激活/已激活/激活中/激活失败/需人工核查（review=档位与 plus_status 不一致）。
+  activation?: "pending" | "activated" | "activating" | "failed" | "review";
   used?: boolean;
 };
 
@@ -561,6 +587,22 @@ export async function markAccountsUsed(
   });
 }
 
+// 标记账号激活「可用/不可用」。available=true 会清除不可用标记并重置激活态，使其重新进入激活。
+export async function markPlusAvailable(accessTokens: string[], available: boolean) {
+  return httpRequest<{ updated: number; items: Account[] }>("/api/accounts/mark-plus-available", {
+    method: "POST",
+    body: { access_tokens: accessTokens, available },
+  });
+}
+
+// 危险操作：批量撤销账号激活（复位为未激活），仅供程序误标激活状态时人工纠正。
+export async function revokeActivation(accessTokens: string[]) {
+  return httpRequest<{ updated: number; items: Account[] }>("/api/accounts/revoke-activation", {
+    method: "POST",
+    body: { access_tokens: accessTokens },
+  });
+}
+
 // ── Mailboxes ──────────────────────────────────────────────────────
 export type MailboxListParams = PageParams & {
   q?: string;
@@ -617,6 +659,14 @@ export async function importCdks(text: string, type: CdkType) {
 export async function deleteCdks(cdks: string[]) {
   return httpRequest<CdkListPayload & { removed: number }>("/api/cdks", {
     method: "DELETE",
+    body: { cdks },
+  });
+}
+
+// 危险操作：批量撤销 CDK 使用（used/invalid → available，清除账号绑定），仅供程序误标时人工纠正。
+export async function revokeCdkUse(cdks: string[]) {
+  return httpRequest<CdkListPayload & { revoked: number }>("/api/cdks/revoke", {
+    method: "POST",
     body: { cdks },
   });
 }
@@ -725,9 +775,9 @@ export async function acquireDispatch(kind: DispatchKind, releaseId?: string) {
   });
 }
 
-/** 对已预占的号执行动作：出库 / 冷却 / 无效 / 释放。 */
+/** 对已预占的号执行动作：出库 / 冷却 / 无效 / 释放。account 出库会先做二次远端核验，未通过时 ok=false 且 message 说明原因。 */
 export async function dispatchAction(kind: DispatchKind, id: string, action: DispatchAction) {
-  return httpRequest<{ ok: boolean; summary: DispatchSummary }>("/api/dispatch/action", {
+  return httpRequest<{ ok: boolean; message?: string; summary: DispatchSummary }>("/api/dispatch/action", {
     method: "POST",
     body: { kind, id, action },
   });
@@ -748,7 +798,7 @@ export async function dispatchCheckout(
     pairCheckout?: boolean;
   },
 ) {
-  return httpRequest<{ ok: boolean; summary: DispatchSummary }>("/api/dispatch/action", {
+  return httpRequest<{ ok: boolean; message?: string; summary: DispatchSummary }>("/api/dispatch/action", {
     method: "POST",
     body: {
       kind,
@@ -788,15 +838,22 @@ export async function updateActivationConfig(updates: Partial<{
   });
 }
 
-export async function startActivation(tokens?: string[]) {
+export async function startActivation(tokens?: string[], limit?: number) {
+  const body: Record<string, unknown> = {};
+  if (tokens && tokens.length > 0) body.tokens = tokens;
+  if (limit && limit > 0) body.limit = limit;
   return httpRequest<ActivationState>("/api/activation/start", {
     method: "POST",
-    body: tokens && tokens.length > 0 ? { tokens } : {},
+    body,
   });
 }
 
 export async function stopActivation() {
   return httpRequest<ActivationState>("/api/activation/stop", { method: "POST" });
+}
+
+export async function clearActivationLogs() {
+  return httpRequest<ActivationState>("/api/activation/clear-logs", { method: "POST" });
 }
 
 // ── Settings ───────────────────────────────────────────────────────
@@ -861,6 +918,10 @@ export async function stopRegister() {
 
 export async function resetRegister() {
   return httpRequest<{ register: RegisterConfig }>("/api/register/reset", { method: "POST" });
+}
+
+export async function clearRegisterLogs() {
+  return httpRequest<{ register: RegisterConfig }>("/api/register/clear-logs", { method: "POST" });
 }
 
 // ── Upstream proxy ─────────────────────────────────────────────────

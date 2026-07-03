@@ -50,6 +50,11 @@ def create_router() -> APIRouter:
         require_admin(authorization)
         return {"register": register_service.reset()}
 
+    @router.post("/api/register/clear-logs")
+    async def clear_register_logs(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return {"register": register_service.clear_logs()}
+
     @router.get("/api/register/events")
     async def register_events(token: str = ""):
         require_admin(f"Bearer {token}")

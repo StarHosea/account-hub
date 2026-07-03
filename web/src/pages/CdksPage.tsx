@@ -23,6 +23,7 @@ import {
   fetchCdks,
   importCdks,
   deleteCdks,
+  revokeCdkUse,
   exportCdks,
   type Cdk,
   type CdkCounts,
@@ -73,7 +74,8 @@ export default function CdksPage() {
 
   const [query, setQuery] = useState("");
   const debouncedQuery = useDebouncedValue(query, 300);
-  const [statusFilter, setStatusFilter] = useState<"" | CdkStatus>("");
+  // 默认只看「可用」CDK（进入页面即过滤，减少已用/无效的干扰）；可切「全部状态」。
+  const [statusFilter, setStatusFilter] = useState<"" | CdkStatus>("available");
   const [typeFilter, setTypeFilter] = useState<"" | CdkType>("");
 
   const buildParams = (overrides?: Partial<CdkListParams>): CdkListParams => ({
@@ -140,6 +142,21 @@ export default function CdksPage() {
       Toast.success(`删除 ${data.removed} 个`);
     } catch (e) {
       Toast.error(e instanceof Error ? e.message : "删除失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // 危险操作：批量撤销 CDK 使用（used/invalid → available，清除账号绑定）。
+  const handleRevokeUse = async (items: string[]) => {
+    if (!items.length) return;
+    setBusy(true);
+    try {
+      const data = await revokeCdkUse(items);
+      await load(true);
+      Toast.success(`已撤销 ${data.revoked} 个 CDK 的使用状态`);
+    } catch (e) {
+      Toast.error(e instanceof Error ? e.message : "撤销失败");
     } finally {
       setBusy(false);
     }
@@ -325,6 +342,17 @@ export default function CdksPage() {
             <Popconfirm title={`删除选中的 ${selected.length} 个？`} onConfirm={() => void handleDelete(selected)}>
               <Button size="small" type="danger" icon={<IconDelete />}>
                 删除选中
+              </Button>
+            </Popconfirm>
+            <Popconfirm
+              title={`⚠️ 撤销选中的 ${selected.length} 个 CDK 的使用状态？`}
+              content="危险操作：把 CDK 从「已用/无效」复位为「可用」并清除账号绑定，之后可被重新领用。仅在程序异常错误标记了使用状态时使用，请确认后再操作。"
+              okType="danger"
+              okText="确认撤销"
+              onConfirm={() => void handleRevokeUse(selected)}
+            >
+              <Button size="small" type="danger" theme="light" loading={busy}>
+                撤销使用
               </Button>
             </Popconfirm>
           </Space>

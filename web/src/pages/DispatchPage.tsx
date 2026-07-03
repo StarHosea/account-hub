@@ -67,7 +67,7 @@ export default function DispatchPage() {
       const res = await acquireDispatch(kind, releaseId);
       setSummary(res.summary);
       setItem(res.item);
-      if (!res.item) Toast.warning(kind === "account" ? "暂无可发的已激活账号" : "暂无可发的手机号（可能都在冷却/已用尽）");
+      if (!res.item) Toast.warning(kind === "account" ? "暂无可发的 Plus 账号" : "暂无可发的手机号（可能都在冷却/已用尽）");
     } catch (e) {
       Toast.error(e instanceof Error ? e.message : "发号失败");
     } finally {
@@ -121,6 +121,12 @@ export default function DispatchPage() {
         pairCheckout,
       });
       setSummary(res.summary);
+      // 账号出库含二次核验：未通过时不消耗、保留当前卡片，提示原因，让管理员点「不可用，下一个」。
+      if (!res.ok) {
+        Toast.error(res.message || "核验未通过，未出库");
+        setCheckoutOpen(false);
+        return;
+      }
       setItem(null);
       setCheckoutOpen(false);
       Toast.success(pairCheckout ? "已完成成套出库" : "已出库");

@@ -19,6 +19,10 @@ class CdkDeleteRequest(BaseModel):
     cdks: list[str]
 
 
+class CdkRevokeRequest(BaseModel):
+    cdks: list[str]
+
+
 def _bound_email(token: str | None) -> str:
     """仅解析绑定账号的邮箱，用于 q 搜索匹配（账号已删返回空串）。"""
     if not token:
@@ -116,6 +120,13 @@ def create_router() -> APIRouter:
         require_admin(authorization)
         removed = cdk_service.delete(body.cdks)
         return {**_payload(), "removed": removed}
+
+    @router.post("/api/cdks/revoke")
+    async def revoke_cdks(body: CdkRevokeRequest, authorization: str | None = Header(default=None)):
+        """危险操作：批量撤销 CDK 使用（used/invalid → available，清除账号绑定）。仅供程序误标时人工纠正。"""
+        require_admin(authorization)
+        revoked = cdk_service.revoke_use(body.cdks)
+        return {**_payload(), "revoked": revoked}
 
     @router.get("/api/cdks/export")
     async def export_cdks(type: str | None = None, authorization: str | None = Header(default=None)):

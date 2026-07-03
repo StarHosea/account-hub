@@ -75,6 +75,45 @@ stats_lock = threading.Lock()
 stats = {"done": 0, "success": 0, "fail": 0, "start_time": 0.0}
 register_log_sink = None
 
+# 正在注册的每个任务的实时进度（按任务号）：供工作台「正在注册账号」表展示。
+# 结构：{index: {"index", "email", "step", "level", "status": running|success|fail, "updated_at"}}
+progress_lock = threading.Lock()
+progress: dict[int, dict] = {}
+
+
+def _progress_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def reset_progress() -> None:
+    """新一轮注册开始时清空上一轮的进度表。"""
+    with progress_lock:
+        progress.clear()
+
+
+def progress_snapshot() -> list[dict]:
+    """按任务号升序返回当前进度表副本（注册服务组装 SSE payload 时调用）。"""
+    with progress_lock:
+        return [dict(v) for _, v in sorted(progress.items())]
+
+
+def _progress_update(index: int, **fields) -> None:
+    with progress_lock:
+        entry = progress.get(index) or {"index": index, "email": "", "step": "", "level": "info", "status": "running"}
+        entry.update(fields)
+        entry["updated_at"] = _progress_now()
+        progress[index] = entry
+
+
+def set_progress_email(index: int, email: str) -> None:
+    """邮箱一旦分配即登记，让表格能显示是哪个邮箱在注册。"""
+    _progress_update(index, email=str(email or ""))
+
+
+def _remove_progress(index: int) -> None:
+    with progress_lock:
+        progress.pop(index, None)
+
 common_headers = {
     "accept": "application/json",
     "accept-encoding": "gzip, deflate, br",
@@ -139,6 +178,7 @@ def log(text: str, color: str = "") -> None:
 
 
 def step(index: int, text: str, color: str = "") -> None:
+    _progress_update(index, step=str(text), level=str(color or "info"))
     log(f"[任务{index}] {text}", color)
 
 
@@ -227,6 +267,15 @@ def _is_cloudflare_challenge(resp) -> bool:
 
 def _mail_config() -> dict:
     return {**config["mail"], "proxy": config["proxy"]}
+
+
+def _mailbox_verb() -> str:
+    """邮箱来源动词：API 邮箱池是从池中「获取」，CloudMail 是按需「生成」。"""
+    providers = (config.get("mail") or {}).get("providers") or []
+    for provider in providers:
+        if isinstance(provider, dict) and provider.get("enable") is not False:
+            return "生成" if str(provider.get("type")) == mail_provider.CLOUDMAIL_TYPE else "获取"
+    return "获取"
 
 
 def _authorize_landed_page(resp) -> str:
@@ -563,14 +612,16 @@ class PlatformRegistrar:
         return {"totp_secret": secret, "otpauth_url": build_otpauth_url(secret, email)}
 
     def register(self, index: int) -> dict:
-        step(index, "开始创建邮箱")
+        verb = _mailbox_verb()
+        step(index, f"开始{verb}邮箱")
         mailbox = create_mailbox()
         email = str(mailbox.get("address") or "").strip()
         if not email:
             mail_provider.release_mailbox(mailbox)
             raise RuntimeError("邮箱服务未返回 address")
         label = str(mailbox.get("label") or "")
-        step(index, f"邮箱创建完成[{label}]: {email}")
+        set_progress_email(index, email)
+        step(index, f"邮箱{verb}完成[{label}]: {email}")
         try:
             self._capture_exit_ip(index)
             password = _random_password()
@@ -648,6 +699,7 @@ def _resolve_account_proxy(identity) -> str:
 
 def worker(index: int) -> dict:
     start = time.time()
+    _progress_update(index, status="running", step="任务启动", email="")
     identity = build_identity(enabled_regions=config.get("regions") or ["US"])
     acct_proxy = _resolve_account_proxy(identity)
     registrar = PlatformRegistrar(acct_proxy, identity=identity)
@@ -674,4 +726,6 @@ def worker(index: int) -> dict:
         log(f"任务{index} 注册失败，本次耗时{cost:.1f}s，原因: {e}", "red")
         return {"ok": False, "index": index, "error": str(e)}
     finally:
+        # 任务结束即从「正在注册」表移除（成功/失败都不再是进行中）。
+        _remove_progress(index)
         registrar.close()

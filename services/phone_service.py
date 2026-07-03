@@ -5,7 +5,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-from services.config import DATA_DIR
+from services.config import DATA_DIR, config
 
 PHONE_FILE = DATA_DIR / "phones.json"
 
@@ -107,19 +107,30 @@ class PhoneService:
 
     def __init__(self, store_file: Path = PHONE_FILE):
         self._store_file = store_file
+        self._storage = config.get_storage_backend()
         self._lock = threading.RLock()
         self._phones: dict[str, dict] = self._load()
 
     # ----------------------------- 持久化 ----------------------------- #
 
     def _load(self) -> dict[str, dict]:
+        items = self._storage.load_collection("phones")
+        if items is None:
+            items = self._read_legacy_items()
+            result = self._items_to_map(items)
+            self._storage.save_collection("phones", list(result.values()))
+            return result
+        return self._items_to_map(items)
+
+    def _read_legacy_items(self) -> list:
         try:
             data = json.loads(self._store_file.read_text(encoding="utf-8"))
         except Exception:
-            return {}
+            return []
         items = data if isinstance(data, list) else data.get("items") if isinstance(data, dict) else None
-        if not isinstance(items, list):
-            return {}
+        return items if isinstance(items, list) else []
+
+    def _items_to_map(self, items: list) -> dict[str, dict]:
         result: dict[str, dict] = {}
         for item in items:
             normalized = self._normalize(item)
@@ -128,9 +139,22 @@ class PhoneService:
         return result
 
     def _save(self) -> None:
-        self._store_file.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"items": list(self._phones.values())}
-        self._store_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self._storage.save_collection("phones", list(self._phones.values()))
+
+    def reconcile_reserved(self) -> int:
+        """启动对账：清理所有 reserved_at（发号预占是瞬时态，重启即失效）。
+
+        不动 cooldown_until/used_count 等正常消耗态。返回清理数。
+        """
+        with self._lock:
+            n = 0
+            for p in self._phones.values():
+                if p.get("reserved_at"):
+                    p["reserved_at"] = None
+                    n += 1
+            if n:
+                self._save()
+            return n
 
     @staticmethod
     def _normalize(item: dict) -> dict | None:

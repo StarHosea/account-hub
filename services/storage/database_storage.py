@@ -38,8 +38,47 @@ class SettingModel(Base):
     data = Column(Text, nullable=False)  # JSON 格式存储完整配置
 
 
+class CdkModel(Base):
+    """CDK 池数据模型"""
+    __tablename__ = "cdks"
+
+    cdk = Column(String(512), primary_key=True)
+    data = Column(Text, nullable=False)  # JSON 格式存储完整 CDK 记录
+
+
+class MailboxModel(Base):
+    """邮箱池数据模型"""
+    __tablename__ = "mailboxes"
+
+    email = Column(String(512), primary_key=True)
+    data = Column(Text, nullable=False)
+
+
+class PhoneModel(Base):
+    """手机号池数据模型"""
+    __tablename__ = "phones"
+
+    phone = Column(String(255), primary_key=True)
+    data = Column(Text, nullable=False)
+
+
+class StateModel(Base):
+    """命名状态块数据模型（register / activation / run / 种子标志等，单键 JSON）"""
+    __tablename__ = "task_state"
+
+    key = Column(String(255), primary_key=True)
+    data = Column(Text, nullable=False)
+
+
 # 平台配置在 settings 表中的固定主键
 SETTINGS_ROW_KEY = "config"
+
+# 命名集合 → (模型, 主键字段名) 映射
+_COLLECTION_MODELS: dict[str, tuple[type, str]] = {
+    "cdks": (CdkModel, "cdk"),
+    "mailboxes": (MailboxModel, "email"),
+    "phones": (PhoneModel, "phone"),
+}
 
 
 class DatabaseStorageBackend(StorageBackend):
@@ -106,6 +145,73 @@ class DatabaseStorageBackend(StorageBackend):
             row = session.get(SettingModel, SETTINGS_ROW_KEY)
             if row is None:
                 session.add(SettingModel(key=SETTINGS_ROW_KEY, data=payload))
+            else:
+                row.data = payload
+            session.commit()
+        except Exception as e:
+            session.rollback()
+            raise e
+        finally:
+            session.close()
+
+    # ----------------------------- 命名集合（cdks/mailboxes/phones） ----------------------------- #
+
+    def load_collection(self, name: str) -> list[dict[str, Any]] | None:
+        """加载命名集合。空表且未打过种子标志 → 返回 None（触发种子迁移）；否则返回列表。"""
+        model, _ = self._collection_model(name)
+        rows = self._load_rows(model)
+        if rows:
+            return rows
+        # 表为空：区分「从未种子」与「用户删空」
+        if self._get_state_raw(self._seeded_key(name)) is None:
+            return None
+        return []
+
+    def save_collection(self, name: str, items: list[dict[str, Any]]) -> None:
+        """整表覆盖写命名集合，并打上种子标志。"""
+        model, key_field = self._collection_model(name)
+        self._save_rows(model, items, key_field)
+        self._set_state_raw(self._seeded_key(name), {"seeded": True})
+
+    def load_state(self, key: str) -> dict[str, Any] | None:
+        """加载命名状态块（无记录返回 None）。"""
+        data = self._get_state_raw(key)
+        return data if isinstance(data, dict) else None
+
+    def save_state(self, key: str, data: dict[str, Any]) -> None:
+        """保存命名状态块（单键 upsert）。"""
+        self._set_state_raw(key, data or {})
+
+    @staticmethod
+    def _collection_model(name: str) -> tuple[type, str]:
+        if name not in _COLLECTION_MODELS:
+            raise ValueError(f"Unknown collection: {name}")
+        return _COLLECTION_MODELS[name]
+
+    @staticmethod
+    def _seeded_key(name: str) -> str:
+        return f"__seeded__:{name}"
+
+    def _get_state_raw(self, key: str) -> Any:
+        session = self.Session()
+        try:
+            row = session.get(StateModel, key)
+            if row is None:
+                return None
+            try:
+                return json.loads(row.data)
+            except json.JSONDecodeError:
+                return None
+        finally:
+            session.close()
+
+    def _set_state_raw(self, key: str, value: Any) -> None:
+        session = self.Session()
+        try:
+            payload = json.dumps(value, ensure_ascii=False)
+            row = session.get(StateModel, key)
+            if row is None:
+                session.add(StateModel(key=key, data=payload))
             else:
                 row.data = payload
             session.commit()

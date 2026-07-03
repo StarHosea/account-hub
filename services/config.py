@@ -541,12 +541,19 @@ class ConfigStore:
 
 
 def load_backup_state() -> dict[str, object]:
-    return _normalize_backup_state(_read_json_object(BACKUP_STATE_FILE, name="backup_state.json"))
+    backend = config.get_storage_backend()
+    data = backend.load_state("backup_state")
+    if data is None:
+        # 后端首次启动：从旧 backup_state.json 迁移种子
+        normalized = _normalize_backup_state(_read_json_object(BACKUP_STATE_FILE, name="backup_state.json"))
+        backend.save_state("backup_state", normalized)
+        return normalized
+    return _normalize_backup_state(data)
 
 
 def save_backup_state(state: dict[str, object]) -> dict[str, object]:
     normalized = _normalize_backup_state(state)
-    BACKUP_STATE_FILE.write_text(json.dumps(normalized, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    config.get_storage_backend().save_state("backup_state", normalized)
     return normalized
 
 

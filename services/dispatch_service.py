@@ -5,7 +5,6 @@ import uuid
 from datetime import datetime, timezone
 
 from services.account_service import account_service
-from services.mailbox_service import mailbox_service
 from services.phone_service import phone_service
 
 # Plus 账号发号预占过期时间（秒）：超时自动释放，防止占用泄漏。
@@ -56,28 +55,33 @@ class DispatchService:
     def _account_card(account: dict) -> dict:
         email = str(account.get("email") or "").strip()
         token = str(account.get("access_token") or "")
+        # 发号信息只需要邮箱、密码、2FA 密钥。
         fields = [
             {"label": "邮箱", "value": email},
             {"label": "密码", "value": str(account.get("password") or "")},
             {"label": "2FA 密钥", "value": str(account.get("totp_secret") or "")},
-            {"label": "otpauth", "value": str(account.get("otpauth_url") or "")},
-            {"label": "接码地址", "value": (mailbox_service.get_fetch_url(email) or "") if email else ""},
-            {"label": "access_token", "value": token},
-            {"label": "激活时间", "value": str(account.get("plus_updated_at") or "")},
         ]
         # 仅保留有值的字段，避免卡片出现空行。
         fields = [f for f in fields if f["value"]]
         return {"kind": "account", "id": token, "title": email or token[:12], "fields": fields}
 
+    @staticmethod
+    def _is_plus(account: dict) -> bool:
+        """真实套餐是否为 Plus（按远端核验回填的 type 判定，而非激活态）。"""
+        return str(account.get("type") or "").strip().lower() == "plus"
+
     def acquire_account(self) -> dict | None:
-        """选取「激活时间最老」的已激活、未出库、存活账号并预占；无可用返回 None。"""
+        """选取「最老」的 Plus 套餐、未出库、存活账号并预占；无可用返回 None。
+
+        可发号来源 = 账号管理中「未出库的 Plus 套餐账号」（按真实 type 判定，而非激活态）。
+        """
         now = datetime.now(timezone.utc)
         with self._lock:
             self._purge_stale(now)
             candidates = [
                 a
                 for a in account_service.list_accounts()
-                if str(a.get("plus_status") or "") == "已激活"
+                if self._is_plus(a)
                 and not a.get("used")
                 and str(a.get("status") or "") not in DEAD_STATUS
                 and str(a.get("access_token") or "") not in self._account_reserved
@@ -93,14 +97,38 @@ class DispatchService:
         with self._lock:
             self._account_reserved.pop(str(token or ""), None)
 
-    def checkout_account(self, token: str) -> bool:
-        """出库：标记账号已出库，解除预占。"""
+    def checkout_account(self, token: str, meta: dict[str, str] | None = None) -> dict:
+        """出库：出库前二次实时核验账号仍是可用的 Plus，通过才标记已出库。
+
+        通过时把发号信息（客户/微信/闲鱼/套餐等 meta）随出库一并落库。
+        返回 {"ok": bool, "reason": str, "id": 最新token}。核验不通过或刷新失败时
+        不出库、不做任何标记，交由前端提示后让管理员「不可用，下一个」。
+        """
         token = str(token or "")
         if not token:
-            return False
-        account_service.mark_used([token], True)
+            return {"ok": False, "reason": "缺少账号标识", "id": token}
+
+        # 实时刷新（刷新 access_token + 拉取远端 user info，回填 type/status）；token 可能轮换。
+        try:
+            account = account_service.fetch_remote_info(token, event="dispatch_checkout")
+        except Exception as exc:  # 网络/失效等：不出库，保留预占等待人工换号。
+            return {"ok": False, "reason": f"核验失败：{exc}".strip(), "id": token}
+
+        if not account:
+            return {"ok": False, "reason": "核验失败：账号已失效", "id": token}
+
+        latest_token = str(account.get("access_token") or token)
+        if not self._is_plus(account):
+            plan = str(account.get("type") or "").strip() or "未知"
+            return {"ok": False, "reason": f"核验未通过：账号非 Plus（当前套餐 {plan}）", "id": latest_token}
+        if str(account.get("status") or "") in DEAD_STATUS:
+            return {"ok": False, "reason": f"核验未通过：账号不可用（{account.get('status')}）", "id": latest_token}
+
+        account_service.mark_used([latest_token], True, {latest_token: meta or {}})
+        # token 可能轮换，新旧都解除预占，避免占用泄漏。
         self.release_account(token)
-        return True
+        self.release_account(latest_token)
+        return {"ok": True, "reason": "", "id": latest_token}
 
     def checkout_account_with_meta(self, token: str, meta: dict[str, str] | None = None) -> bool:
         token = str(token or "")
@@ -127,7 +155,7 @@ class DispatchService:
             return sum(
                 1
                 for a in account_service.list_accounts()
-                if str(a.get("plus_status") or "") == "已激活"
+                if self._is_plus(a)
                 and not a.get("used")
                 and str(a.get("status") or "") not in DEAD_STATUS
                 and str(a.get("access_token") or "") not in self._account_reserved

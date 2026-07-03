@@ -14,6 +14,9 @@ class JSONStorageBackend(StorageBackend):
         self.file_path = file_path
         self.auth_keys_path = auth_keys_path or file_path.with_name("auth_keys.json")
         self.settings_path = settings_path or file_path.with_name("settings.json")
+        # collection / state 均落在与 accounts.json 同级的 data 目录，文件名沿用历史约定
+        # （cdks.json / mailboxes.json / phones.json / register.json / ...），保证向后兼容。
+        self._data_dir = file_path.parent
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         self.auth_keys_path.parent.mkdir(parents=True, exist_ok=True)
         self.settings_path.parent.mkdir(parents=True, exist_ok=True)
@@ -79,6 +82,49 @@ class JSONStorageBackend(StorageBackend):
         self.settings_path.parent.mkdir(parents=True, exist_ok=True)
         self.settings_path.write_text(
             json.dumps(settings or {}, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    def load_collection(self, name: str) -> list[dict[str, Any]] | None:
+        """从 data/{name}.json 加载命名集合（文件不存在返回 None，触发种子迁移）。"""
+        path = self._data_dir / f"{name}.json"
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, Exception):
+            return None
+        # 兼容 {"items": [...]} 信封与裸 list 两种历史格式
+        if isinstance(data, dict):
+            data = data.get("items")
+        return data if isinstance(data, list) else []
+
+    def save_collection(self, name: str, items: list[dict[str, Any]]) -> None:
+        """保存命名集合到 data/{name}.json（始终以 {"items": [...]} 信封写出）。"""
+        path = self._data_dir / f"{name}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"items": items}, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    def load_state(self, key: str) -> dict[str, Any] | None:
+        """从 data/{key}.json 加载命名状态块（不存在返回 None）。"""
+        path = self._data_dir / f"{key}.json"
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, Exception):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def save_state(self, key: str, data: dict[str, Any]) -> None:
+        """保存命名状态块到 data/{key}.json。"""
+        path = self._data_dir / f"{key}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(data or {}, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
 

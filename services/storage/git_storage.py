@@ -136,6 +136,44 @@ class GitStorageBackend(StorageBackend):
             print(f"[git-storage] save failed: {e}")
             raise e
 
+    def load_collection(self, name: str) -> list[dict[str, Any]] | None:
+        """从 Git 仓库 {name}.json 加载命名集合（文件不存在返回 None，触发种子迁移）。"""
+        try:
+            data = self._load_json_value(f"{name}.json")
+        except Exception as e:
+            print(f"[git-storage] load failed: {e}")
+            raise
+        if data is None:
+            return None
+        if isinstance(data, dict):
+            data = data.get("items")
+        return data if isinstance(data, list) else []
+
+    def save_collection(self, name: str, items: list[dict[str, Any]]) -> None:
+        """保存命名集合到 Git 仓库 {name}.json（{"items": [...]} 信封）。"""
+        try:
+            self._save_json_file(f"{name}.json", {"items": items}, f"Update {name} data")
+        except Exception as e:
+            print(f"[git-storage] save failed: {e}")
+            raise e
+
+    def load_state(self, key: str) -> dict[str, Any] | None:
+        """从 Git 仓库 {key}.json 加载命名状态块（不存在返回 None）。"""
+        try:
+            data = self._load_json_value(f"{key}.json")
+        except Exception as e:
+            print(f"[git-storage] load failed: {e}")
+            raise
+        return data if isinstance(data, dict) else None
+
+    def save_state(self, key: str, data: dict[str, Any]) -> None:
+        """保存命名状态块到 Git 仓库 {key}.json。"""
+        try:
+            self._save_json_file(f"{key}.json", data or {}, f"Update {key} state")
+        except Exception as e:
+            print(f"[git-storage] save failed: {e}")
+            raise e
+
     def _load_json_file(self, file_path: str) -> list[dict[str, Any]]:
         data = self._load_json_value(file_path)
         return data if isinstance(data, list) else []

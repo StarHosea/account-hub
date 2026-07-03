@@ -18,6 +18,21 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        # 启动顺序（对账必须先于续跑）：
+        # 1) 对账清中间态（账号「排队中/激活中」→「未激活」、邮箱释放、手机预占清理）
+        # 2) 续跑上次未结束的注册/激活/一键任务（各 start 内 is_alive 幂等，重复调用安全）
+        # 3) 起限流账号 watcher
+        from services.recovery import startup_recover
+        from services.register_service import register_service
+        from services.activation_service import activation_service
+        from services.run_service import run_service
+        try:
+            startup_recover()
+            register_service.resume_if_enabled()
+            activation_service.resume_if_running()
+            run_service.resume_if_running()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[startup] recover/resume failed: {exc}")
         stop_event = Event()
         thread = start_limited_account_watcher(stop_event)
         try:

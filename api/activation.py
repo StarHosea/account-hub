@@ -14,6 +14,7 @@ from services.config import config
 
 class ActivationStartRequest(BaseModel):
     tokens: list[str] | None = None
+    limit: int | None = None
 
 
 class ActivationConfigRequest(BaseModel):
@@ -48,12 +49,17 @@ def create_router() -> APIRouter:
     @router.post("/api/activation/start")
     async def start_activation(body: ActivationStartRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"activation": activation_service.start(body.tokens), "config": _safe_config()}
+        return {"activation": activation_service.start(body.tokens, body.limit), "config": _safe_config()}
 
     @router.post("/api/activation/stop")
     async def stop_activation(authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return {"activation": activation_service.stop(), "config": _safe_config()}
+
+    @router.post("/api/activation/clear-logs")
+    async def clear_activation_logs(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return {"activation": activation_service.clear_logs(), "config": _safe_config()}
 
     @router.get("/api/activation/events")
     async def activation_events(token: str = ""):

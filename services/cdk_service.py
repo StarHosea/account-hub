@@ -5,7 +5,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-from services.config import DATA_DIR
+from services.config import DATA_DIR, config
 
 CDK_FILE = DATA_DIR / "cdks.json"
 
@@ -50,19 +50,34 @@ class CdkService:
 
     def __init__(self, store_file: Path = CDK_FILE):
         self._store_file = store_file
+        self._storage = config.get_storage_backend()
         self._lock = threading.RLock()
         self._cdks: dict[str, dict] = self._load()
+        # 进行中（已领取尚未出终态）的 CDK：并发激活时防止同一 CDK 被多个账号同时领用。
+        # 仅内存态，不持久化——进程重启后一切以持久化的 status 为准。
+        self._reserved: set[str] = set()
 
     # ----------------------------- 持久化 ----------------------------- #
 
     def _load(self) -> dict[str, dict]:
+        items = self._storage.load_collection("cdks")
+        if items is None:
+            # 后端首次启动：从旧 data/cdks.json 迁移种子数据（无则以空集合打标志）。
+            items = self._read_legacy_items()
+            result = self._items_to_map(items)
+            self._storage.save_collection("cdks", list(result.values()))
+            return result
+        return self._items_to_map(items)
+
+    def _read_legacy_items(self) -> list:
         try:
             data = json.loads(self._store_file.read_text(encoding="utf-8"))
         except Exception:
-            return {}
+            return []
         items = data if isinstance(data, list) else data.get("items") if isinstance(data, dict) else None
-        if not isinstance(items, list):
-            return {}
+        return items if isinstance(items, list) else []
+
+    def _items_to_map(self, items: list) -> dict[str, dict]:
         result: dict[str, dict] = {}
         for item in items:
             normalized = self._normalize(item)
@@ -71,9 +86,7 @@ class CdkService:
         return result
 
     def _save(self) -> None:
-        self._store_file.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"items": list(self._cdks.values())}
-        self._store_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self._storage.save_collection("cdks", list(self._cdks.values()))
 
     @staticmethod
     def _normalize(item: dict) -> dict | None:
@@ -156,7 +169,9 @@ class CdkService:
     # ----------------------------- 激活引擎用 ----------------------------- #
 
     def acquire_available(self, cdk_type: str, exclude: set[str] | None = None) -> str | None:
-        """领取一个该类型的可用 CDK（失败不消耗，可被复用，故不在此置占用）。
+        """领取一个该类型的可用 CDK：原子地「选中 + 置为进行中」，避免并发激活时同一 CDK
+        被多个账号同时领用（一码多账号）。失败不消耗，需调用 release 归还；成功/无效由
+        consume/mark_invalid 转终态。
 
         exclude 用于在同一账号的多次尝试中跳过刚失败过的 CDK，避免原地打转。
         无可用返回 None。
@@ -165,13 +180,25 @@ class CdkService:
         exclude = exclude or set()
         with self._lock:
             for item in self._cdks.values():
-                if item["type"] == cdk_type and item["status"] == STATUS_AVAILABLE and item["cdk"] not in exclude:
+                if (
+                    item["type"] == cdk_type
+                    and item["status"] == STATUS_AVAILABLE
+                    and item["cdk"] not in exclude
+                    and item["cdk"] not in self._reserved
+                ):
+                    self._reserved.add(item["cdk"])
                     return item["cdk"]
         return None
+
+    def release(self, cdk: str) -> None:
+        """归还一个「进行中」但未成功消耗的 CDK，使其可被其他账号再次领用（状态仍为 available）。"""
+        with self._lock:
+            self._reserved.discard(str(cdk).strip())
 
     def consume(self, cdk: str, bound_token: str) -> None:
         """成功兑换：置 used 并记录绑定账号。"""
         with self._lock:
+            self._reserved.discard(str(cdk).strip())
             item = self._cdks.get(str(cdk).strip())
             if item is None:
                 return
@@ -183,12 +210,36 @@ class CdkService:
     def mark_invalid(self, cdk: str) -> None:
         """服务端 not_found：置 invalid（不再被领用）。"""
         with self._lock:
+            self._reserved.discard(str(cdk).strip())
             item = self._cdks.get(str(cdk).strip())
             if item is None:
                 return
             item["status"] = STATUS_INVALID
             item["used_at"] = _now()
             self._save()
+
+    def revoke_use(self, cdks: list[str]) -> int:
+        """危险操作：批量「撤销使用」——把选中的 CDK 从 used/invalid 复位为 available，
+        清除绑定账号(bound_token)与 used_at，使其可被重新领用。
+
+        仅用于**程序异常错误标记了 CDK 使用状态**时的人工纠正；不校验该 CDK 在服务端是否真的可再用。
+        返回复位数量。
+        """
+        revoked = 0
+        with self._lock:
+            for cdk in cdks or []:
+                key = str(cdk).strip()
+                self._reserved.discard(key)
+                item = self._cdks.get(key)
+                if item is None or item.get("status") == STATUS_AVAILABLE:
+                    continue
+                item["status"] = STATUS_AVAILABLE
+                item["bound_token"] = None
+                item["used_at"] = None
+                revoked += 1
+            if revoked:
+                self._save()
+        return revoked
 
 
 cdk_service = CdkService()

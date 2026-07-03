@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Header
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from api.support import require_admin
@@ -68,6 +69,8 @@ def create_router() -> APIRouter:
         kind = (body.kind or "").strip()
         act = (body.action or "").strip()
         ok = False
+        ok = False
+        message = ""
         meta = dispatch_service.build_dispatch_meta(
             customer=body.customer or "",
             wechat=body.wechat or "",
@@ -80,7 +83,10 @@ def create_router() -> APIRouter:
         )
         if kind == "account":
             if act == "checkout":
-                ok = dispatch_service.checkout_account_with_meta(body.id, meta)
+                # 出库含二次远端核验（刷新 token + 拉取信息），放线程池避免阻塞事件循环；核验通过后随出库落发号信息 meta。
+                result = await run_in_threadpool(dispatch_service.checkout_account, body.id, meta)
+                ok = bool(result.get("ok"))
+                message = str(result.get("reason") or "")
                 if ok and body.pair_checkout and body.related_phone:
                     dispatch_service.checkout_phone_with_meta(body.related_phone, meta)
             elif act == "invalid":
@@ -104,6 +110,6 @@ def create_router() -> APIRouter:
             elif act == "release":
                 dispatch_service.release_phone(body.id)
                 ok = True
-        return {"ok": ok, "summary": _summary()}
+        return {"ok": ok, "message": message, "summary": _summary()}
 
     return router

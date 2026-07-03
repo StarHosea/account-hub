@@ -14,6 +14,7 @@ const { Header, Content } = Layout;
 const { Text } = Typography;
 
 const NAV_ITEMS = [
+  { itemKey: "/workbench", text: "工作台" },
   { itemKey: "/accounts", text: "号池管理" },
   { itemKey: "/finished-accounts", text: "成品号管理" },
   { itemKey: "/dispatch", text: "发号管理" },

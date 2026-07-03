@@ -127,18 +127,45 @@ class AccountService:
 
     def _load_cumulative_total(self) -> int:
         try:
+            data = self.storage.load_state("cumulative_total")
+            if isinstance(data, dict) and data.get("value") is not None:
+                return int(data["value"])
+            # 后端无记录：尝试从旧 .cumulative_total 文件一次性迁移
             f = self._get_cumulative_file()
             if f.exists():
-                return int(f.read_text().strip())
+                n = int(f.read_text().strip())
+                self.storage.save_state("cumulative_total", {"value": n})
+                return n
         except Exception:
             pass
         return len(self._accounts)
 
     def _save_cumulative_total(self) -> None:
         try:
-            self._get_cumulative_file().write_text(str(self._cumulative_total))
+            self.storage.save_state("cumulative_total", {"value": int(self._cumulative_total)})
         except Exception:
             pass
+
+    def reconcile_stuck_activations(self) -> int:
+        """启动对账：把硬杀残留、卡在「排队中/激活中」的账号复位为「未激活」，供重启后重新激活。
+
+        清 plus_cdk/plus_task_id/plus_last_message；**保留 plus_attempts**（续着已试次数，避免无限重试）；
+        不动 plus_unavailable 及「已激活/激活失败」终态。返回复位数量。
+        """
+        reset = 0
+        for acct in self.list_accounts():
+            if acct.get("plus_status") in ("排队中", "激活中"):
+                token = acct.get("access_token")
+                if not token:
+                    continue
+                self.update_account(token, {
+                    "plus_status": "未激活",
+                    "plus_cdk": None,
+                    "plus_task_id": None,
+                    "plus_last_message": None,
+                }, quiet=True)
+                reset += 1
+        return reset
 
     @staticmethod
     def _now() -> str:
@@ -333,9 +360,14 @@ class AccountService:
         attempts = attempts if isinstance(attempts, dict) else {}
         normalized["plus_attempts"] = {"UPI": int(attempts.get("UPI") or 0), "IDEL": int(attempts.get("IDEL") or 0)}
         normalized["plus_cdk"] = normalized.get("plus_cdk") or None
+        _cdk_type = str(normalized.get("plus_cdk_type") or "").strip().upper()
+        normalized["plus_cdk_type"] = _cdk_type if _cdk_type in ("UPI", "IDEL") else None
         normalized["plus_task_id"] = normalized.get("plus_task_id") or None
         normalized["plus_last_message"] = normalized.get("plus_last_message") or None
         normalized["plus_updated_at"] = normalized.get("plus_updated_at") or None
+        # 激活不可用标记：某邮箱账号两种类型 CDK 均连续激活失败后置位，下轮激活自动跳过，
+        # 直到人工「标记可用」重置。与 plus_status 分离，保证重置后仍持久生效。
+        normalized["plus_unavailable"] = bool(normalized.get("plus_unavailable"))
         return normalized
 
     @staticmethod
@@ -1846,6 +1878,85 @@ class AccountService:
             if updated:
                 self._save_accounts()
                 log_service.add(LOG_TYPE_ACCOUNT, f"标记账号{'已用' if used else '未用'}", {"count": updated})
+        return {"updated": updated, "items": self.list_accounts()}
+
+    def set_plus_availability(self, tokens: list[str], available: bool) -> dict:
+        """批量标记账号 Plus 激活「可用/不可用」。返回 {updated, items}。
+
+        available=True（人工标记可用）：清除不可用标记，并重置激活态（未激活 + 尝试次数归零 +
+        清空进度文案），使其重新进入下一轮激活；仅对「不可用」或「激活失败」的账号生效。
+        available=False（人工标记不可用）：置不可用标记，下轮激活自动跳过。
+        """
+        target = [t for t in (tokens or []) if t]
+        if not target:
+            return {"updated": 0, "items": self.list_accounts()}
+        updated = 0
+        with self._lock:
+            for token in target:
+                resolved = self._resolve_access_token_locked(token)
+                current = self._accounts.get(resolved)
+                if current is None:
+                    continue
+                next_item = dict(current)
+                if available:
+                    # 无需变更：既非不可用、也非失败态。
+                    if not next_item.get("plus_unavailable") and next_item.get("plus_status") != "激活失败":
+                        continue
+                    next_item["plus_unavailable"] = False
+                    next_item["plus_status"] = "未激活"
+                    next_item["plus_attempts"] = {"UPI": 0, "IDEL": 0}
+                    next_item["plus_last_message"] = None
+                else:
+                    if bool(next_item.get("plus_unavailable")):
+                        continue
+                    next_item["plus_unavailable"] = True
+                account = self._normalize_account(next_item)
+                if account is None:
+                    continue
+                self._accounts[resolved] = account
+                updated += 1
+            if updated:
+                self._save_accounts()
+                log_service.add(
+                    LOG_TYPE_ACCOUNT,
+                    f"标记账号激活{'可用' if available else '不可用'}",
+                    {"count": updated},
+                )
+        return {"updated": updated, "items": self.list_accounts()}
+
+    def revoke_activation(self, tokens: list[str]) -> dict:
+        """危险操作：批量「撤销激活」——把选中账号的 Plus 激活状态整体复位为干净的「未激活」。
+
+        仅用于**程序异常错误标记了激活状态**（如 CDK 服务端「假成功」把 free 账号误标成已激活）后的人工纠正。
+        清空 plus_status/plus_cdk/plus_cdk_type/plus_task_id/plus_last_message、尝试次数归零、清除不可用标记；
+        **不改动真实档位 type**（type 由 OpenAI 刷新核实，不属于本操作职责）。返回 {updated, items}。
+        """
+        target = [t for t in (tokens or []) if t]
+        if not target:
+            return {"updated": 0, "items": self.list_accounts()}
+        updated = 0
+        with self._lock:
+            for token in target:
+                resolved = self._resolve_access_token_locked(token)
+                current = self._accounts.get(resolved)
+                if current is None:
+                    continue
+                next_item = dict(current)
+                next_item["plus_status"] = "未激活"
+                next_item["plus_unavailable"] = False
+                next_item["plus_attempts"] = {"UPI": 0, "IDEL": 0}
+                next_item["plus_cdk"] = None
+                next_item["plus_cdk_type"] = None
+                next_item["plus_task_id"] = None
+                next_item["plus_last_message"] = None
+                account = self._normalize_account(next_item)
+                if account is None:
+                    continue
+                self._accounts[resolved] = account
+                updated += 1
+            if updated:
+                self._save_accounts()
+                log_service.add(LOG_TYPE_ACCOUNT, "撤销账号激活（危险操作）", {"count": updated})
         return {"updated": updated, "items": self.list_accounts()}
 
     def update_account(self, access_token: str, updates: dict, quiet: bool = False) -> dict | None:

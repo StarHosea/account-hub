@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -30,7 +31,14 @@ class RunService:
         self._runner: threading.Thread | None = None
         self._stop = threading.Event()
         self._logs: list[dict] = []
-        self._stats: dict = self._empty_stats()
+        self._storage = config.get_storage_backend()
+        try:
+            _btype = self._storage.get_backend_info().get("type")
+        except Exception:
+            _btype = None
+        self._persist_interval = 1e9 if _btype == "git" else 4.0
+        self._last_persist_ts = 0.0
+        self._stats: dict = self._load_persisted_stats()
 
     @staticmethod
     def _empty_stats() -> dict:
@@ -41,11 +49,36 @@ class RunService:
             "failed": 0,
             "running": 0,
             "phase": "空闲",
+            "job_running": False,
+            "job_target": 0,
+            "job_replenish": True,
             "job_id": None,
             "started_at": None,
             "finished_at": None,
             "updated_at": None,
         }
+
+    def _load_persisted_stats(self) -> dict:
+        try:
+            st = self._storage.load_state("run")
+        except Exception:
+            st = None
+        base = self._empty_stats()
+        if isinstance(st, dict) and st:
+            base.update(st)
+        return base
+
+    def _persist_stats(self, force: bool = False) -> None:
+        now = time.time()
+        if not force and (now - self._last_persist_ts) < self._persist_interval:
+            return
+        self._last_persist_ts = now
+        with self._lock:
+            snapshot = dict(self._stats)
+        try:
+            self._storage.save_state("run", snapshot)
+        except Exception:
+            pass
 
     # ----------------------------- 只读 ----------------------------- #
     def _mailbox_available(self) -> int:
@@ -76,6 +109,7 @@ class RunService:
         with self._lock:
             self._stats.update(updates)
             self._stats["updated_at"] = _now()
+        self._persist_stats()
 
     # ----------------------------- 启停 ----------------------------- #
     def start(self, target: int | None = None, auto_replenish: bool | None = None) -> dict:
@@ -97,14 +131,30 @@ class RunService:
             openai_register.config.update({k: reg[k] for k in ("mail", "proxy", "total", "threads") if k in reg})
             self._stop.clear()
             self._logs = []
-            self._stats = {**self._empty_stats(), "target": target, "phase": "启动", "job_id": uuid.uuid4().hex, "started_at": _now(), "updated_at": _now()}
+            self._stats = {**self._empty_stats(), "target": target, "phase": "启动", "job_running": True,
+                           "job_target": target, "job_replenish": replenish, "job_id": uuid.uuid4().hex,
+                           "started_at": _now(), "updated_at": _now()}
             self._runner = threading.Thread(target=self._run, args=(target, replenish, cfg), daemon=True, name="one-click-run")
             self._runner.start()
             self._append_log(f"一键运行启动：目标 {target} 个，自动补注册={'开' if replenish else '关'}", "yellow")
-            return self.get()
+        self._persist_stats(force=True)
+        return self.get()
+
+    def resume_if_running(self) -> None:
+        """进程启动时由 lifespan 调用：若上次退出时一键运行处于运行态，自动续跑。"""
+        try:
+            st = self._storage.load_state("run")
+        except Exception:
+            st = None
+        if st and st.get("job_running"):
+            self._append_log("检测到上次一键运行未结束，自动续跑", "yellow")
+            self.start(target=st.get("job_target"), auto_replenish=st.get("job_replenish"))
 
     def stop(self) -> dict:
         self._stop.set()
+        with self._lock:
+            self._stats["job_running"] = False
+        self._persist_stats(force=True)
         self._append_log("已请求停止，正在等待当前任务结束", "yellow")
         return self.get()
 
@@ -171,7 +221,8 @@ class RunService:
             self._append_log(f"运行异常：{exc}", "red")
         finally:
             client.close()
-        self._bump(running=0, phase="完成", finished_at=_now())
+        self._bump(running=0, job_running=False, phase="完成", finished_at=_now())
+        self._persist_stats(force=True)
         self._append_log(f"运行结束：注册 {registered}，激活成功 {activated}", "green" if activated >= target else "yellow")
 
     def _register_batch(self, count: int) -> int:

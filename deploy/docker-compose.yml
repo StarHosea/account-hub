@@ -17,6 +17,8 @@ services:
     pull_policy: always
     ports:
       - "127.0.0.1:8090:80"
+    # CloakBrowser/Chromium 需要更大的 /dev/shm，否则渲染进程会崩溃
+    shm_size: "1gb"
     env_file:
       - .env
     volumes:

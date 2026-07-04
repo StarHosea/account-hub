@@ -10,5 +10,9 @@ __pycache__
 web/.next
 web/node_modules
 
+node_engine/node_modules
+node_engine/data
+node_engine/diag
+
 assets
 README.md

@@ -720,10 +720,11 @@ export async function secureExistingChatGPT({ page, email, loginPassword = '', e
     const partial = e._secure || {};
     e._partial = {
       email,
-      // 最终密码：忘记密码重设 > step8 新设 > 原登录密码
-      password: login.resetPassword || (partial.passwordSet ? newPassword : (loginPassword || '')),
+      // 最终密码：忘记密码重设 > step8 真正新设 > 用于登录的原密码（passwordChanged 才是"确实改了"）
+      password: login.resetPassword || (partial.passwordChanged ? newPassword : (loginPassword || '')),
       passwordSet: Boolean(login.resetPassword) || partial.passwordSet || false,
-      twoFactorSecret: partial.twoFactorSecret || '',
+      // 2FA：step8 新开用新 secret；未改则回传注入的 existingTotpSecret，避免存空覆盖库里已有密钥
+      twoFactorSecret: partial.twoFactorSecret || existingTotpSecret || '',
       twoFactorUri: partial.twoFactorUri || '',
       recoveryCodes: partial.recoveryCodes || [],
       twoFactorSet: partial.twoFactorSet || false,
@@ -737,10 +738,11 @@ export async function secureExistingChatGPT({ page, email, loginPassword = '', e
 
   return {
     email,
-    // 最终密码：忘记密码重设 > step8 新设 > 原登录密码
-    password: login.resetPassword || (secure.passwordSet ? newPassword : (loginPassword || '')),
+    // 最终密码：忘记密码重设 > step8 真正新设 > 用于登录的原密码（passwordChanged 才是"确实改了"）
+    password: login.resetPassword || (secure.passwordChanged ? newPassword : (loginPassword || '')),
     passwordSet: Boolean(login.resetPassword) || secure.passwordSet,
-    twoFactorSecret: secure.twoFactorSecret,
+    // 2FA：step8 新开用新 secret；未改则回传注入的 existingTotpSecret，避免存空覆盖库里已有密钥
+    twoFactorSecret: secure.twoFactorSecret || existingTotpSecret,
     twoFactorUri: secure.twoFactorUri,
     recoveryCodes: secure.recoveryCodes,
     twoFactorSet: secure.twoFactorSet,
@@ -1202,7 +1204,9 @@ async function disable2fa(page, oldSecret, log) {
 }
 
 async function step8_setupPasswordAnd2FA(page, { email, password, enable2fa = true, forceReset2fa = false, existingTotpSecret = '', requestCode, log }) {
-  const out = { passwordSet: false, password, twoFactorSecret: '', twoFactorUri: '', recoveryCodes: [], twoFactorSet: false, observed: {} };
+  // passwordChanged=true 仅当本次「确实设置/更改了密码」；检测到已存在而跳过时保持 false，
+  // 供 secureExistingChatGPT 判断该存"新密码"还是"沿用登录用的原密码"。
+  const out = { passwordSet: false, passwordChanged: false, password, twoFactorSecret: '', twoFactorUri: '', recoveryCodes: [], twoFactorSet: false, observed: {} };
   try {
     if (!/chatgpt\.com/.test(page.url())) {
       await page.goto('https://chatgpt.com/', { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
@@ -1268,6 +1272,7 @@ async function step8_setupPasswordAnd2FA(page, { email, password, enable2fa = tr
           await sleep(2500);
         }
         out.passwordSet = true;
+        out.passwordChanged = true; // 确实新设了密码 → 上层应存这个新密码
         log('步骤8：密码已提交');
       } else {
         throw new Error('设密码失败：未找到密码输入框');

@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 
-from fastapi import APIRouter, Header
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Header, Query
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
 from api.support import require_admin
+from services.register_abnormal_service import register_abnormal_service
 from services.register_service import register_service
 
 
@@ -20,6 +21,20 @@ class RegisterConfigRequest(BaseModel):
     regions: list[str] | None = None
     ipweb_rotate: bool | None = None
     ip_duration: int | None = None
+    ip_probe_retries: int | None = None
+    # 浏览器引擎（CloakBrowser）配置
+    headless: bool | None = None
+    register_timeout: int | None = None
+    node_bin: str | None = None
+
+
+class RegisterAbnormalDeleteRequest(BaseModel):
+    emails: list[str]
+
+
+def _paginate(seq: list[dict], page: int, page_size: int) -> list[dict]:
+    start = (page - 1) * page_size
+    return seq[start : start + page_size]
 
 
 def create_router() -> APIRouter:
@@ -69,5 +84,56 @@ def create_router() -> APIRouter:
                 await asyncio.sleep(0.5)
 
         return StreamingResponse(stream(), media_type="text/event-stream")
+
+    # ----------------------------- 注册机异常账号清单 ----------------------------- #
+
+    @router.get("/api/register/abnormal")
+    async def list_register_abnormal(
+        authorization: str | None = Header(default=None),
+        q: str | None = Query(default=None),
+        page: int = Query(default=1, ge=1),
+        page_size: int = Query(default=10, ge=1, le=200),
+    ):
+        require_admin(authorization)
+        items = register_abnormal_service.list_items()
+        stats = register_abnormal_service.stats()
+        keyword = (q or "").strip().lower()
+        if keyword:
+            items = [
+                a
+                for a in items
+                if keyword in str(a.get("email") or "").lower()
+                or keyword in str(a.get("reason") or "").lower()
+                or keyword in str(a.get("fetch_url") or "").lower()
+            ]
+        total = len(items)
+        return {
+            "items": _paginate(items, page, page_size),
+            "stats": stats,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        }
+
+    @router.delete("/api/register/abnormal")
+    async def delete_register_abnormal(body: RegisterAbnormalDeleteRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        removed = register_abnormal_service.delete(body.emails)
+        return {
+            "items": register_abnormal_service.list_items(),
+            "stats": register_abnormal_service.stats(),
+            "removed": removed,
+        }
+
+    @router.get("/api/register/abnormal/export")
+    async def export_register_abnormal(token: str = "", authorization: str | None = Header(default=None)):
+        require_admin(authorization or f"Bearer {token}")
+        text = register_abnormal_service.export_text()
+        text = text + ("\n" if text else "")
+        return Response(
+            text,
+            media_type="text/plain; charset=utf-8",
+            headers={"Content-Disposition": 'attachment; filename="register-abnormal.txt"'},
+        )
 
     return router

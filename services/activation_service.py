@@ -156,6 +156,10 @@ class ActivationService:
             if not cfg["api_key"]:
                 self._append_log("未配置 CDK API Key，无法激活（请在设置中填写）", "red")
                 return self.get()
+            # 未显式指定数量时，回退到激活器设置里持久化的「激活数量」(target)；0/None 表示不限量。
+            if limit is None:
+                configured = int(cfg.get("target") or 0)
+                limit = configured if configured > 0 else None
             targets = self._resolve_targets(tokens, limit)
             if not targets:
                 self._append_log("没有需要激活的账号", "yellow")
@@ -359,7 +363,11 @@ class ActivationService:
                         cdk_service.consume(cdk, token)
                         consumed = True
                         # 只置激活流程状态；真实档位(type)由下方刷新读 OpenAI plan_type 核实，避免写出「假 Plus」。
-                        self._set_account(token, plus_status=STATUS_ACTIVATED, plus_task_id=task_id, plus_last_message=message or "兑换成功")
+                        # plus_activated_at 仅首次激活成功时写入（get_account 已有值则沿用），作为「激活日期」。
+                        already_activated_at = (account_service.get_account(token) or {}).get("plus_activated_at")
+                        self._set_account(token, plus_status=STATUS_ACTIVATED, plus_task_id=task_id,
+                                          plus_last_message=message or "兑换成功",
+                                          plus_activated_at=already_activated_at or _now())
                         self._append_log(f"[{email}] 激活成功（{cdk_type}）", "green", log_sink)
                         self._verify_plan(token, email, log_sink)
                         return True

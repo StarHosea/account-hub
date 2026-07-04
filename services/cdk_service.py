@@ -45,6 +45,31 @@ def parse_cdk_lines(text: str) -> list[str]:
     return result
 
 
+def parse_cdk_type_lines(text: str) -> list[tuple[str, str | None]]:
+    """解析 `CDK-类型` 批量导入文本，返回 (cdk, inline_type|None)，按 CDK 去重。
+
+    行内类型可选：按**最后一个** `-` 切分，若后缀是合法类型(UPI/IDEL)则采用，否则整行视为 CDK
+    并由调用方回退到请求级类型（兼容裸 CDK 粘贴，及 CDK 本身含 `-` 的情况）。
+    """
+    seen: set[str] = set()
+    result: list[tuple[str, str | None]] = []
+    for raw in str(text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        cdk, inline_type = line, None
+        if "-" in line:
+            head, _, tail = line.rpartition("-")
+            suffix = tail.strip().upper()
+            if head.strip() and suffix in CDK_TYPES:
+                cdk, inline_type = head.strip(), suffix
+        if not cdk or cdk in seen:
+            continue
+        seen.add(cdk)
+        result.append((cdk, inline_type))
+    return result
+
+
 class CdkService:
     """Plus CDK 池服务：维护带本地类型(UPI/IDEL)的 CDK 列表。"""
 
@@ -125,33 +150,40 @@ class CdkService:
             return {"by_type": summary, "available": total_available, "total": len(self._cdks)}
 
     def export_text(self, cdk_type: str | None = None) -> str:
+        """导出为 `CDK-类型` 每行一条（类型为 UPI/IDEL），便于按 A7 约定的格式回环导入。"""
         with self._lock:
             wanted = normalize_type(cdk_type) if cdk_type else None
-            lines = [item["cdk"] for item in self._cdks.values() if wanted is None or item["type"] == wanted]
+            lines = [
+                f"{item['cdk']}-{item['type']}"
+                for item in self._cdks.values()
+                if wanted is None or item["type"] == wanted
+            ]
             return "\n".join(lines)
 
     # ----------------------------- 写操作 ----------------------------- #
 
     def import_text(self, text: str, cdk_type: str) -> dict[str, int]:
-        cdk_type = normalize_type(cdk_type)
-        parsed = parse_cdk_lines(text)
+        """批量导入 `CDK-类型`；行内类型缺省时回退到请求级 cdk_type。"""
+        default_type = normalize_type(cdk_type)
+        parsed = parse_cdk_type_lines(text)
         if len(parsed) > MAX_IMPORT_ROWS:
             raise ValueError(f"单次最多导入 {MAX_IMPORT_ROWS} 条，当前解析到 {len(parsed)} 条，请分批导入")
         added = 0
         updated = 0
         skipped = 0
         with self._lock:
-            for cdk in parsed:
+            for cdk, inline_type in parsed:
+                resolved_type = normalize_type(inline_type) if inline_type else default_type
                 existing = self._cdks.get(cdk)
                 if existing:
-                    if existing["type"] != cdk_type:
-                        existing["type"] = cdk_type
+                    if existing["type"] != resolved_type:
+                        existing["type"] = resolved_type
                         updated += 1
                     else:
                         # 完全重复（类型也相同）：跳过，计入 skipped。
                         skipped += 1
                 else:
-                    self._cdks[cdk] = self._normalize({"cdk": cdk, "type": cdk_type, "imported_at": _now()})
+                    self._cdks[cdk] = self._normalize({"cdk": cdk, "type": resolved_type, "imported_at": _now()})
                     added += 1
             self._save()
         return {"added": added, "updated": updated, "skipped": skipped, "total": len(self._cdks)}

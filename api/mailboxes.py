@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Header, Query
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 from api.support import require_admin
@@ -85,5 +86,21 @@ def create_router() -> APIRouter:
         require_admin(authorization)
         changed = mailbox_service.mark_used(body.emails, body.used)
         return {**_payload(), "changed": changed}
+
+    @router.get("/api/mailboxes/export")
+    async def export_mailboxes(
+        only_unused: bool = Query(default=False),
+        token: str = "",
+        authorization: str | None = Header(default=None),
+    ):
+        """导出邮箱池：每行 `邮箱---收件地址`。"""
+        require_admin(authorization or f"Bearer {token}")
+        text = mailbox_service.export_text(only_unused=only_unused)
+        text = text + ("\n" if text else "")
+        return Response(
+            text,
+            media_type="text/plain; charset=utf-8",
+            headers={"Content-Disposition": 'attachment; filename="mailboxes.txt"'},
+        )
 
     return router

@@ -41,6 +41,13 @@ def _default_config() -> dict:
         "regions": ["US"],
         "ipweb_rotate": False,
         "ip_duration": 120,
+        # 出口 IP 探活重试次数（换 SID 后经代理探活，最多试这么多次；0=关闭探活）
+        "ip_probe_retries": 6,
+        # 浏览器引擎（CloakBrowser）相关：注册内核已完全替换为浏览器引擎
+        "engine": "browser",
+        "headless": False,
+        "register_timeout": 300,
+        "node_bin": "node",
         "stats": {
             "success": 0,
             "fail": 0,
@@ -104,6 +111,14 @@ def _normalize(raw: dict) -> dict:
     cfg["regions"] = [r for r in raw_regions if r in valid_regions] or ["US"]
     cfg["ipweb_rotate"] = bool(raw.get("ipweb_rotate"))
     cfg["ip_duration"] = min(2880, max(1, int(raw.get("ip_duration") or 120)))
+    # 出口 IP 探活重试：0 关闭探活（旧行为），上限 20 次避免死循环空转
+    cfg["ip_probe_retries"] = min(20, max(0, int(raw.get("ip_probe_retries", cfg["ip_probe_retries"]))))
+    # 浏览器引擎配置：engine 固定 browser；headless 默认有头（Linux 上配 Xvfb）；
+    # register_timeout 每账号整轮超时（秒）；node_bin 为 node 可执行文件。
+    cfg["engine"] = "browser"
+    cfg["headless"] = bool(raw.get("headless"))
+    cfg["register_timeout"] = min(1800, max(60, int(raw.get("register_timeout") or 300)))
+    cfg["node_bin"] = str(raw.get("node_bin") or "node").strip() or "node"
     base_stats = _default_config()["stats"]
     raw_stats = raw.get("stats") if isinstance(raw.get("stats"), dict) else {}
     cfg["stats"] = {**base_stats, **{k: raw_stats[k] for k in base_stats if k in raw_stats}, "threads": cfg["threads"]}
@@ -160,7 +175,7 @@ class RegisterService:
         return base
 
     def _push_to_worker(self) -> None:
-        openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads", "enable_2fa", "regions", "ipweb_rotate", "ip_duration")})
+        openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads", "enable_2fa", "regions", "ipweb_rotate", "ip_duration", "ip_probe_retries", "engine", "headless", "register_timeout", "node_bin")})
 
     def update(self, updates: dict) -> dict:
         with self._lock:
@@ -194,8 +209,13 @@ class RegisterService:
             self._config["enabled"] = False
             self._config["stats"]["updated_at"] = _now()
             self._save()
-            self._append_log("已请求停止注册任务，正在等待当前运行任务结束", "yellow")
-            return self.get()
+            self._append_log("已请求停止注册任务，正在终止在途浏览器并等待当前任务结束", "yellow")
+        # 终止所有在途 Node/CloakBrowser 子进程（在锁外调用，避免阻塞其它请求）
+        try:
+            openai_register.request_stop()
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"终止在途浏览器进程时出错：{exc}", "red")
+        return self.get()
 
     def reset(self) -> dict:
         with self._lock:

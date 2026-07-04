@@ -321,6 +321,31 @@ class ConfigStore:
         return self.cdk_activation
 
     @property
+    def trial_check(self) -> dict:
+        """注册成功后「试用资格」（资格号）检测配置。API Key 仅存后端，优先取环境变量。
+
+        由 services/register/trial_check.py 调用外部 /api/v1/check 接口判定资格；
+        enabled=False 或 base_url 为空 → 视为不校验（全部成功入池）。
+        """
+        raw = self.data.get("trial_check")
+        raw = raw if isinstance(raw, dict) else {}
+        return {
+            "enabled": bool(raw.get("enabled")),
+            "base_url": str(os.getenv("TRIAL_CHECK_BASE_URL") or raw.get("base_url") or "").strip().rstrip("/"),
+            "api_key": str(os.getenv("TRIAL_CHECK_API_KEY") or raw.get("api_key") or "").strip(),
+        }
+
+    def update_trial_check(self, updates: dict) -> dict:
+        current = self.data.get("trial_check")
+        current = dict(current) if isinstance(current, dict) else {}
+        for key in ("enabled", "base_url", "api_key"):
+            if key in updates and updates[key] is not None:
+                current[key] = updates[key]
+        self.data["trial_check"] = current
+        self._save()
+        return self.trial_check
+
+    @property
     def accounts_file(self) -> Path:
         return DATA_DIR / "accounts.json"
 
@@ -501,6 +526,11 @@ class ConfigStore:
         data["image_storage"] = self.get_image_storage_settings()
         data["chat_completion_cache"] = self.get_chat_completion_cache_settings()
         data.pop("auth-key", None)
+        # 敏感密钥不随通用设置返回前端：这两块各有专用端点（/api/activation/config、/api/trial-check）
+        # 以 has_api_key 形式回传状态。此处剥离 api_key，避免 GET /api/settings 泄漏。
+        for section in ("cdk_activation", "trial_check"):
+            if isinstance(data.get(section), dict) and "api_key" in data[section]:
+                data[section] = {k: v for k, v in data[section].items() if k != "api_key"}
         return data
 
     def get_proxy_settings(self) -> str:

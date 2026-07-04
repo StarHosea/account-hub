@@ -4,6 +4,7 @@ import { IconSave } from "@douyinfe/semi-icons";
 
 import { useSettingsStore } from "@/store/settings";
 import { useIsMobile } from "@/lib/use-is-mobile";
+import { fetchTrialCheckConfig, updateTrialCheckConfig, type TrialCheckConfig } from "@/lib/api";
 import RegisterConfigCard from "@/components/RegisterConfigCard";
 
 const { Title, Text } = Typography;
@@ -23,24 +24,33 @@ export default function SettingsPage() {
   const activation = useSettingsStore((s) => s.activationConfig);
   const loadConfig = useSettingsStore((s) => s.loadConfig);
   const loadActivation = useSettingsStore((s) => s.loadActivationConfig);
+  const loadRegister = useSettingsStore((s) => s.loadRegister);
   const saveConfig = useSettingsStore((s) => s.saveConfig);
   const setProxy = useSettingsStore((s) => s.setProxy);
   const setRefreshInterval = useSettingsStore((s) => s.setRefreshAccountIntervalMinute);
   const setAutoRelogin = useSettingsStore((s) => s.setAutoReloginAfterRefresh);
   const setActField = useSettingsStore((s) => s.setActivationConfigField);
-  const setActAuto = useSettingsStore((s) => s.setActivationAutoActivate);
   const saveActivation = useSettingsStore((s) => s.saveActivationConfig);
 
   const [savingBase, setSavingBase] = useState(false);
   const [savingAct, setSavingAct] = useState(false);
   const didLoad = useRef(false);
 
+  // 试用资格检测配置（独立端点，api_key 不回传，仅 has_api_key）。
+  const [trial, setTrial] = useState<TrialCheckConfig | null>(null);
+  const [trialKey, setTrialKey] = useState("");
+  const [savingTrial, setSavingTrial] = useState(false);
+
   useEffect(() => {
     if (didLoad.current) return;
     didLoad.current = true;
     void loadConfig();
     void loadActivation();
-  }, [loadConfig, loadActivation]);
+    void loadRegister(true);
+    void fetchTrialCheckConfig()
+      .then((d) => setTrial(d.config))
+      .catch(() => {});
+  }, [loadConfig, loadActivation, loadRegister]);
 
   const handleSaveBase = async () => {
     setSavingBase(true);
@@ -58,11 +68,30 @@ export default function SettingsPage() {
     setSavingAct(true);
     try {
       await saveActivation();
-      Toast.success("激活配置已保存");
+      Toast.success("激活凭据已保存");
     } catch (e) {
       Toast.error(e instanceof Error ? e.message : "保存失败");
     } finally {
       setSavingAct(false);
+    }
+  };
+
+  const handleSaveTrial = async () => {
+    if (!trial) return;
+    setSavingTrial(true);
+    try {
+      const d = await updateTrialCheckConfig({
+        enabled: trial.enabled,
+        base_url: trial.base_url,
+        ...(trialKey ? { api_key: trialKey } : {}),
+      });
+      setTrial(d.config);
+      setTrialKey("");
+      Toast.success("试用资格检测配置已保存");
+    } catch (e) {
+      Toast.error(e instanceof Error ? e.message : "保存失败");
+    } finally {
+      setSavingTrial(false);
     }
   };
 
@@ -105,9 +134,13 @@ export default function SettingsPage() {
         )}
       </Card>
 
-      {/* 激活配置 */}
+      {/* 注册配置（注册参数 + 区域 + 代理 + 2FA + 邮箱配置）——从注册机页移入 */}
+      <RegisterConfigCard />
+
+      {/* Plus 激活凭据（并发数/激活数量/自动激活 已移至「激活器」页） */}
       <Card
-        title="Plus 激活配置"
+        title="Plus 激活凭据"
+        style={{ marginBottom: 16 }}
         headerExtraContent={
           <Button icon={<IconSave />} theme="solid" type="primary" size="small" onClick={() => void handleSaveAct()} loading={savingAct} disabled={!activation}>
             保存
@@ -129,21 +162,47 @@ export default function SettingsPage() {
             <Row label="CDK API 地址">
               <Input value={activation.base_url ?? ""} onChange={(v) => setActField("base_url", v)} />
             </Row>
-            <Row label="激活并发数">
-              <InputNumber min={1} max={10} value={activation.concurrency} onChange={(v) => setActField("concurrency", String(v ?? 1))} style={{ width: isMobile ? "100%" : 200 }} />
-            </Row>
-            <Space>
-              <Switch size="small" checked={!!activation.auto_activate_after_register} onChange={setActAuto} />
-              <Text>注册成功后自动激活</Text>
-            </Space>
+            <Text type="tertiary" size="small">
+              并发数、激活数量、注册成功后自动激活等运行参数请在「激活器」页设置。
+            </Text>
           </>
         )}
       </Card>
 
-      {/* 注册机配置（注册参数 + 区域 + 代理 + 号一号一 IP + 2FA + 邮箱） */}
-      <div style={{ marginTop: 16 }}>
-        <RegisterConfigCard />
-      </div>
+      {/* 试用资格检测（注册成功后分流，Phase B 注册内核迁移后生效） */}
+      <Card
+        title="试用资格检测"
+        headerExtraContent={
+          <Button icon={<IconSave />} theme="solid" type="primary" size="small" onClick={() => void handleSaveTrial()} loading={savingTrial} disabled={!trial}>
+            保存
+          </Button>
+        }
+      >
+        {!trial ? (
+          <Spin />
+        ) : (
+          <>
+            <Space style={{ marginBottom: 14 }}>
+              <Switch size="small" checked={trial.enabled} onChange={(v) => setTrial({ ...trial, enabled: v })} />
+              <Text>开启注册成功后试用资格校验（关闭时所有注册成功账号直接进入账号管理）</Text>
+            </Space>
+            <Row label={`检测 API Key${trial.has_api_key ? "（已配置，可留空不改）" : ""}`}>
+              <Input
+                mode="password"
+                value={trialKey}
+                onChange={setTrialKey}
+                placeholder={trial.has_api_key ? "••••••（已配置）" : "填写试用资格检测 API Key"}
+              />
+            </Row>
+            <Row label="检测 API 地址">
+              <Input value={trial.base_url ?? ""} onChange={(v) => setTrial({ ...trial, base_url: v })} placeholder="例：https://trial.example.com" />
+            </Row>
+            <Text type="tertiary" size="small">
+              无试用资格或注册异常的账号会进入「注册机 → 异常清单」，不进入账号管理。（该分流将在注册内核迁移后生效）
+            </Text>
+          </>
+        )}
+      </Card>
     </div>
   );
 }

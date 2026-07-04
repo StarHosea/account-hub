@@ -5,12 +5,22 @@ services:
     restart: unless-stopped
     ports:
       - "3000:80"
+    # CloakBrowser/Chromium 默认 /dev/shm 仅 64MB 会导致崩溃；提升到 1GB。
+    # （引擎启动参数也带了 --disable-dev-shm-usage 双保险。）
+    shm_size: "1gb"
     volumes:
       - ./data:/app/data
       - ./config.json:/app/config.json
     environment:
       # 存储后端配置 (可选值: json, sqlite, postgres, git)
        - STORAGE_BACKEND=json
+
+      # CloakBrowser 浏览器注册引擎
+      # - CLOAKBROWSER_LICENSE_KEY=your_cloakbrowser_pro_license   # 可选（Pro 授权）
+
+      # 试用资格（资格号）检测外部 API（可选）
+      # - TRIAL_CHECK_BASE_URL=https://your-trial-check-api
+      # - TRIAL_CHECK_API_KEY=your_trial_check_key
       
       # 数据库配置 (当 STORAGE_BACKEND=sqlite/postgres 时使用)
       # - DATABASE_URL=postgresql://user:password@host:5432/dbname

@@ -15,10 +15,10 @@ import {
   Checkbox,
   Pagination,
 } from "@douyinfe/semi-ui-19";
-import { IconRefresh, IconUpload, IconDelete, IconCopy, IconSearch, IconLink, IconTick, IconClose } from "@douyinfe/semi-icons";
+import { IconRefresh, IconUpload, IconDownload, IconDelete, IconCopy, IconSearch, IconLink, IconTick, IconClose } from "@douyinfe/semi-icons";
 import type { ColumnProps } from "@douyinfe/semi-ui-19/lib/es/table";
 
-import { fetchMailboxes, importMailboxes, deleteMailboxes, markMailboxes, type Mailbox, type MailboxStats, type MailboxListParams } from "@/lib/api";
+import { fetchMailboxes, importMailboxes, deleteMailboxes, markMailboxes, fetchMailboxesExportText, type Mailbox, type MailboxStats, type MailboxListParams } from "@/lib/api";
 import { copyToClipboard as copy } from "@/lib/clipboard";
 import { useDebouncedValue } from "@/lib/use-debounced-value";
 import { useIsMobile } from "@/lib/use-is-mobile";
@@ -32,9 +32,9 @@ const PAGE_SIZE = 10;
 const EMPTY_STATS: MailboxStats = { total: 0, used: 0, unused: 0, in_use: 0 };
 
 function statusTag(m: Mailbox) {
-  if (m.in_use) return <Tag color="blue" type="light">占用中</Tag>;
-  if (m.used) return <Tag color="grey" type="light">已用</Tag>;
-  return <Tag color="green" type="light">可用</Tag>;
+  if (m.used) return <Tag color="grey" type="light">已注册</Tag>;
+  if (m.in_use) return <Tag color="blue" type="light">注册中</Tag>;
+  return <Tag color="green" type="light">待注册</Tag>;
 }
 
 function fmtTime(v: string | null) {
@@ -135,9 +135,34 @@ export default function MailboxesPage() {
     try {
       const data = await markMailboxes(emails, used);
       await load(true);
-      Toast.success(`已标记 ${data.changed} 个为${used ? "已用" : "未用"}`);
+      Toast.success(`已标记 ${data.changed} 个为${used ? "已注册" : "待注册"}`);
     } catch (e) {
       Toast.error(e instanceof Error ? e.message : "标记失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // 导出邮箱池：每行 `邮箱---收件地址`。
+  const handleExport = async () => {
+    setBusy(true);
+    try {
+      const text = await fetchMailboxesExportText();
+      if (!text.trim()) {
+        Toast.warning("没有可导出的邮箱");
+        return;
+      }
+      const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `mailboxes-${Date.now()}.txt`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      Toast.error(e instanceof Error ? e.message : "导出失败");
     } finally {
       setBusy(false);
     }
@@ -210,9 +235,9 @@ export default function MailboxesPage() {
 
   const cards = [
     { label: "邮箱总数", value: stats.total },
-    { label: "可用", value: stats.unused, color: "var(--semi-color-success)" },
-    { label: "已用", value: stats.used },
-    { label: "占用中", value: stats.in_use, color: "var(--semi-color-primary)" },
+    { label: "待注册", value: stats.unused, color: "var(--semi-color-success)" },
+    { label: "已注册", value: stats.used },
+    { label: "注册中", value: stats.in_use, color: "var(--semi-color-primary)" },
   ];
 
   const filterControls = (
@@ -237,9 +262,9 @@ export default function MailboxesPage() {
         style={{ width: isMobile ? "100%" : 130 }}
         optionList={[
           { label: "全部状态", value: "" },
-          { label: "可用", value: "unused" },
-          { label: "已用", value: "used" },
-          { label: "占用中", value: "in_use" },
+          { label: "待注册", value: "unused" },
+          { label: "已注册", value: "used" },
+          { label: "注册中", value: "in_use" },
         ]}
       />
     </>
@@ -268,6 +293,9 @@ export default function MailboxesPage() {
           <Button icon={<IconUpload />} theme="solid" type="primary" onClick={() => setImportOpen(true)}>
             导入
           </Button>
+          <Button icon={<IconDownload />} onClick={() => void handleExport()} loading={busy}>
+            导出
+          </Button>
         </Space>
       </div>
 
@@ -284,10 +312,10 @@ export default function MailboxesPage() {
           <Space style={{ flexWrap: "wrap" }}>
             <Text type="tertiary">已选 {selected.length} 项</Text>
             <Button size="small" icon={<IconTick />} onClick={() => void handleMark(selected, true)} loading={busy}>
-              标记已用
+              标记已注册
             </Button>
             <Button size="small" icon={<IconClose />} onClick={() => void handleMark(selected, false)} loading={busy}>
-              标记未用
+              标记待注册
             </Button>
             <Popconfirm title={`删除选中的 ${selected.length} 个？`} onConfirm={() => void handleDelete(selected)}>
               <Button size="small" type="danger" icon={<IconDelete />}>
@@ -337,7 +365,7 @@ export default function MailboxesPage() {
         maskClosable={false}
         fullScreen={isMobile}
       >
-        <Text type="tertiary">按邮箱池约定格式粘贴，一行一个 <Text code>邮箱----接码地址</Text>。</Text>
+        <Text type="tertiary">按邮箱池约定格式粘贴，一行一个 <Text code>邮箱---收件地址</Text>（兼容旧 <Text code>----</Text> 分隔）。</Text>
         <TextArea value={importText} onChange={setImportText} rows={isMobile ? 12 : 10} style={{ marginTop: 8, fontFamily: "monospace" }} placeholder={"一行一个邮箱..."} />
       </Modal>
     </div>
@@ -444,7 +472,7 @@ function MobileList({
                   style={{ flex: 1 }}
                   onClick={() => onMark(m.email, !m.used)}
                 >
-                  {m.used ? "标记未用" : "标记已用"}
+                  {m.used ? "标记待注册" : "标记已注册"}
                 </Button>
                 <Popconfirm title="删除该邮箱？" onConfirm={() => onDelete(m.email)}>
                   <Button size="small" type="danger" theme="borderless" icon={<IconDelete />} />

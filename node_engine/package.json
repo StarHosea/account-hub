@@ -1,0 +1,26 @@
+{
+  "name": "account-hub-node-engine",
+  "version": "0.1.0",
+  "private": true,
+  "description": "CloakBrowser 浏览器注册引擎（单账号 CLI worker，供 account-hub Python 编排器通过子进程 + NDJSON 驱动）",
+  "type": "module",
+  "main": "worker.js",
+  "scripts": {
+    "install-binary": "node scripts/install-binary.js",
+    "run-one": "node scripts/run-one.mjs",
+    "secure-one": "node scripts/run-secure-one.mjs",
+    "login-step8": "node scripts/login-step8.mjs",
+    "recon": "node scripts/recon-settings.mjs",
+    "diag-password": "node scripts/diag-password-form.mjs",
+    "verify-2fa": "node scripts/verify-2fa-login.mjs"
+  },
+  "dependencies": {
+    "cloakbrowser": "^0.4.7",
+    "mmdb-lib": "^2.1.1",
+    "otpauth": "^9.5.1",
+    "playwright-core": "^1.53.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

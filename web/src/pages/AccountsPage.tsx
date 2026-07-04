@@ -45,6 +45,7 @@ import {
   disable2FA,
   fetch2FAProgress,
   exportAccounts,
+  exportAccountPool,
   markAccountsUsed,
   markPlusAvailable,
   revokeActivation,
@@ -70,17 +71,11 @@ const EMPTY_SUMMARY: AccountSummary = { total: 0, alive: 0, dead: 0, activated: 
 
 // 真实订阅档位（OpenAI 返回的 type），与「状态」的激活流程区分开。供表格与卡片共用。
 function tierTag(type: string | null | undefined) {
-  const t = String(type ?? "").trim();
-  const k = t.toLowerCase();
-  let color = "grey";
-  let label = t || "未知";
-  if (k === "plus") [color, label] = ["amber", "Plus"];
-  else if (k === "pro") [color, label] = ["violet", "Pro"];
-  else if (k === "team" || k === "enterprise") [color, label] = ["blue", t];
-  else if (k === "free") [color, label] = ["grey", "Free"];
+  // 需求口径：账号已激活成功 Plus → 显示 Plus，否则一律 Free。
+  const isPlus = String(type ?? "").trim().toLowerCase() === "plus";
   return (
-    <Tag color={color as never} type="light">
-      {label}
+    <Tag color={(isPlus ? "amber" : "grey") as never} type="light">
+      {isPlus ? "Plus" : "Free"}
     </Tag>
   );
 }
@@ -97,35 +92,6 @@ function accountStatusInfo(a: Account, pending: TwoFAAction | undefined, isRefre
   else if (a.status === "异常" || a.status === "禁用") [text, color] = ["失效", "red"];
   else if (a.plus_unavailable) [text, color] = ["不可用", "red"];
   return { text, color, spin };
-}
-
-// 号池列表的「激活」列：只展示粗粒度激活流程状态（激活中/激活失败/激活成功/待激活）+ CDK 类型标识
-// （UPI/IDEL），不展示具体 CDK 码与进度文案。若 plus_status=已激活 但真实档位仍非 Plus，标记「需人工核查」。
-function renderActivation(a: Account) {
-  const st = a.plus_status ?? "未激活";
-  let text = "待激活";
-  let color = "grey";
-  if (st === "已激活") [text, color] = ["激活成功", "green"];
-  else if (st === "排队中" || st === "激活中") [text, color] = ["激活中", "blue"];
-  else if (st === "激活失败") [text, color] = ["激活失败", "red"];
-  const mismatch = st === "已激活" && String(a.type ?? "").trim().toLowerCase() !== "plus";
-  return (
-    <Space spacing={4} wrap>
-      <Tag color={color as never} type="light">
-        {text}
-      </Tag>
-      {a.plus_cdk_type ? (
-        <Tag color="violet" type="light">
-          {a.plus_cdk_type}
-        </Tag>
-      ) : null}
-      {mismatch ? (
-        <Tag color="orange" type="light">
-          需人工核查
-        </Tag>
-      ) : null}
-    </Space>
-  );
 }
 
 // 敏感字段（密码 / 2FA）只露图标标识是否设置；悬浮看真实值，点击复制。
@@ -187,10 +153,8 @@ export default function AccountsPage() {
   const debouncedQuery = useDebouncedValue(query, 300);
   const [statusFilter, setStatusFilter] = useState<"" | "valid" | "dead" | "unavailable">("valid");
   const [planFilter, setPlanFilter] = useState<"" | "free" | "plus">("");
-  // 激活流程筛选：默认显示「已激活」。review = 档位与 plus_status 不一致，需人工核查。
-  const [activationFilter, setActivationFilter] = useState<
-    "" | "pending" | "activated" | "activating" | "failed" | "review"
-  >("activated");
+  // 激活态筛选：默认「全部」，展示注册/导入入库的所有账号；可切到「已激活」等仅看对应状态。
+  const [activationFilter, setActivationFilter] = useState<"" | "activated" | "pending" | "activating" | "failed" | "review">("");
   const [usedFilter, setUsedFilter] = useState<"" | "used" | "unused">("");
 
   const [editTarget, setEditTarget] = useState<Account | null>(null);
@@ -226,6 +190,7 @@ export default function AccountsPage() {
     avail:
       statusFilter === "valid" ? "available" : statusFilter === "unavailable" ? "unavailable" : undefined,
     plan: planFilter || undefined,
+    // 激活态由筛选控制，默认「全部」：注册/导入入库的账号（含未激活）都会展示，与统计卡口径一致。
     activation: activationFilter || undefined,
     used: usedFilter ? usedFilter === "used" : undefined,
     page,
@@ -263,7 +228,7 @@ export default function AccountsPage() {
     }, 5000);
     return () => clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [debouncedQuery, statusFilter, planFilter, activationFilter, usedFilter, page, busy]);
+  }, [debouncedQuery, statusFilter, planFilter, usedFilter, page, busy]);
 
   const setRefreshFlag = (token: string, on: boolean) =>
     setRefreshing((prev) => {
@@ -473,6 +438,25 @@ export default function AccountsPage() {
         `已导出迁移文件${selectedKeys.length ? `（选中 ${selectedKeys.length} 个）` : "（全部）"}`,
       );
     } catch (e) {
+      Toast.error(e instanceof Error ? e.message : "导出失败");    } finally {
+      setBusy(false);
+    }
+  };
+
+  // 账号池导出：每行 `邮箱---密码---2FA--Accesstoken`（与导入互为逆操作）。
+  const handleExportPool = async () => {
+    setBusy(true);
+    try {
+      const text = await exportAccountPool(selectedKeys);
+      if (!text.trim()) {
+        Toast.warning("没有可导出的账号");
+        return;
+      }
+      downloadText(text, `accounts-pool-${Date.now()}.txt`);
+      Toast.success(
+        `已导出账号（邮箱格式）${selectedKeys.length ? `（选中 ${selectedKeys.length} 个）` : "（全部）"}`,
+      );
+    } catch (e) {
       Toast.error(e instanceof Error ? e.message : "导出失败");
     } finally {
       setBusy(false);
@@ -511,7 +495,9 @@ export default function AccountsPage() {
     }
     let tokens: string[] = [];
     let accounts: AccountImportPayload[] = [];
-    // 迁移 JSON（[...] 或 {...}）整包导入，携带 proxy/country 等字段；否则按纯 access_token 逐行导入。
+    let importBlobText = "";
+    // 迁移 JSON（[...] 或 {...}）整包导入，携带 proxy/country 等字段；
+    // 含 `---` 的按账号池格式 `邮箱---密码---2FA--Accesstoken` 交后端解析；否则按纯 access_token 逐行导入。
     if (raw.startsWith("[") || raw.startsWith("{")) {
       let parsed: unknown;
       try {
@@ -533,6 +519,9 @@ export default function AccountsPage() {
         Toast.warning("JSON 里没有找到带 access_token 的账号");
         return;
       }
+    } else if (raw.includes("---")) {
+      // 账号池格式：整块交给后端 parse_import_blob 解析（邮箱/密码/2FA/AccessToken）。
+      importBlobText = raw;
     } else {
       tokens = raw
         .split(/[\n,]/)
@@ -545,7 +534,7 @@ export default function AccountsPage() {
     }
     setBusy(true);
     try {
-      const data = await createAccounts(tokens, accounts);
+      const data = await createAccounts(tokens, accounts, importBlobText);
       setImportOpen(false);
       setImportText("");
       setImportFileName("");
@@ -627,11 +616,6 @@ export default function AccountsPage() {
       render: (_: unknown, a: Account) => tierTag(a.type),
     },
     {
-      title: "激活",
-      width: 160,
-      render: (_: unknown, a: Account) => renderActivation(a),
-    },
-    {
       title: "状态",
       width: 130,
       render: (_: unknown, a: Account) => {
@@ -663,7 +647,7 @@ export default function AccountsPage() {
         renderSecret(a.totp_secret, a.totp_secret || "", "2FA 密钥", <IconShield />),
     },
     {
-      title: "出库状态",
+      title: "出库信息",
       dataIndex: "used",
       width: 100,
       render: (used: boolean) =>
@@ -675,6 +659,51 @@ export default function AccountsPage() {
           <Tag color="cyan" type="light">
             未出库
           </Tag>
+        ),
+    },
+    {
+      title: "取件地址",
+      dataIndex: "mail_link",
+      width: 200,
+      render: (v: string | null) =>
+        v ? (
+          <Text ellipsis={{ showTooltip: true }} size="small" style={{ maxWidth: 190 }}>
+            {v}
+          </Text>
+        ) : (
+          <Text type="tertiary" size="small">-</Text>
+        ),
+    },
+    {
+      title: "错误信息",
+      width: 200,
+      render: (_: unknown, a: Account) => {
+        const parts = [
+          a.plus_status === "激活失败" ? a.plus_last_message : "",
+          a.last_refresh_error,
+          a.last_token_refresh_error,
+        ].filter(Boolean);
+        const msg = parts.join("；");
+        return msg ? (
+          <Text type="danger" size="small" ellipsis={{ showTooltip: true }} style={{ maxWidth: 190 }}>
+            {msg}
+          </Text>
+        ) : (
+          <Text type="tertiary" size="small">-</Text>
+        );
+      },
+    },
+    {
+      title: "指纹Seed",
+      dataIndex: "fingerprint_seed",
+      width: 130,
+      render: (v: string | number | null) =>
+        v ? (
+          <Text type="tertiary" size="small" ellipsis={{ showTooltip: true }} style={{ maxWidth: 120, fontFamily: "monospace" }}>
+            {String(v)}
+          </Text>
+        ) : (
+          <Text type="tertiary" size="small">-</Text>
         ),
     },
     {
@@ -701,10 +730,16 @@ export default function AccountsPage() {
       ),
     },
     {
-      title: "创建时间",
+      title: "注册日期",
       dataIndex: "created_at",
       width: 140,
       render: (v: string | null) => <Text type="tertiary" size="small">{formatDateTime(v)}</Text>,
+    },
+    {
+      title: "激活日期",
+      dataIndex: "plus_activated_at",
+      width: 140,
+      render: (v: string | null) => <Text type="tertiary" size="small">{v ? formatDateTime(v) : "-"}</Text>,
     },
     {
       title: "更新时间",
@@ -803,7 +838,6 @@ export default function AccountsPage() {
     { label: "账户总数", value: summary.total },
     { label: "存活", value: summary.alive, color: "var(--semi-color-success)" },
     { label: "失效", value: summary.dead, color: "var(--semi-color-danger)" },
-    { label: "待激活", value: summary.pending, color: "var(--semi-color-primary)" },
     { label: "已激活", value: summary.activated, color: "var(--semi-color-success)" },
     ...(summary.needs_review
       ? [{ label: "需核查", value: summary.needs_review, color: "var(--semi-color-warning)" }]
@@ -854,17 +888,17 @@ export default function AccountsPage() {
       <Select
         value={activationFilter}
         onChange={(v) => {
-          setActivationFilter((v as typeof activationFilter) ?? "");
+          setActivationFilter((v as "" | "activated" | "pending" | "activating" | "failed" | "review") ?? "");
           setPage(1);
         }}
-        style={{ width: isMobile ? "100%" : 140 }}
+        style={{ width: isMobile ? "100%" : 130 }}
         optionList={[
-          { label: "全部激活态", value: "" },
-          { label: "已激活", value: "activated" },
+          { label: "全部激活", value: "" },
           { label: "待激活", value: "pending" },
+          { label: "已激活", value: "activated" },
           { label: "激活中", value: "activating" },
           { label: "激活失败", value: "failed" },
-          { label: "需人工核查", value: "review" },
+          { label: "需核查", value: "review" },
         ]}
       />
       <Select
@@ -898,7 +932,7 @@ export default function AccountsPage() {
         }}
       >
         <Title heading={isMobile ? 4 : 3} style={{ margin: 0 }}>
-          号池管理
+          账号管理
         </Title>
       </div>
 
@@ -949,7 +983,7 @@ export default function AccountsPage() {
           <Button icon={<IconRefresh />} onClick={() => void load()} loading={loading}>
             刷新
           </Button>
-          {/* 同步：导入 / 导出共用同一份迁移 JSON 格式，往返一致。 */}
+          {/* 同步：迁移 JSON（完整字段）与账号池文本（邮箱---密码---2FA--Accesstoken）两套格式。 */}
           <Dropdown
             trigger="click"
             render={
@@ -957,8 +991,11 @@ export default function AccountsPage() {
                 <Dropdown.Item icon={<IconUpload />} onClick={() => setImportOpen(true)}>
                   导入
                 </Dropdown.Item>
+                <Dropdown.Item icon={<IconDownload />} onClick={() => void handleExportPool()}>
+                  导出账号（邮箱格式）{selectedKeys.length ? `（选中 ${selectedKeys.length}）` : "（全部）"}
+                </Dropdown.Item>
                 <Dropdown.Item icon={<IconDownload />} onClick={() => void handleExportMigration()}>
-                  导出{selectedKeys.length ? `（选中 ${selectedKeys.length}）` : "（全部）"}
+                  导出迁移 JSON{selectedKeys.length ? `（选中 ${selectedKeys.length}）` : "（全部）"}
                 </Dropdown.Item>
               </Dropdown.Menu>
             }
@@ -1067,7 +1104,7 @@ export default function AccountsPage() {
         fullScreen={isMobile}
       >
         <Text type="tertiary">
-          选择「导出」下载的迁移 JSON 文件导入；也可直接粘贴文件内容或每行一个 access_token。
+          支持三种格式：迁移 JSON（含完整字段）、账号池文本每行 `邮箱---密码---2FA--Accesstoken`、或每行一个 access_token。
         </Text>
         <input
           type="file"

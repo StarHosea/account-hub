@@ -40,6 +40,7 @@ export type Account = {
   default_model_slug?: string | null;
   restore_at?: string | null;
   last_refresh_error?: string | null;
+  last_token_refresh_error?: string | null;
   success: number;
   fail: number;
   image_inflight?: number;
@@ -78,6 +79,10 @@ export type Account = {
   plus_updated_at?: string | null;
   // 激活不可用标记：两种类型 CDK 均连续激活失败后置位，下轮激活自动跳过，直到人工标记可用。
   plus_unavailable?: boolean;
+  // 首次激活成功（plus_status→已激活）时间，用于账号管理「激活日期」列。
+  plus_activated_at?: string | null;
+  // 指纹 Seed（注册内核迁移后写入专用种子；当前回退注册时的 oai-device-id）。
+  fingerprint_seed?: string | number | null;
 };
 
 export type AccountImportPayload = {
@@ -356,6 +361,8 @@ export type ActivationConfig = {
   api_key: string;
   has_api_key: boolean;
   auto_activate_after_register: boolean;
+  // 激活数量（本轮目标激活数）；启动激活时作为 limit 缺省值。0 表示不限量。
+  target: number;
 };
 
 export type ActivationState = {
@@ -562,6 +569,20 @@ export async function exportCredentials(
   return response.data;
 }
 
+// 账号管理导出：每行 `邮箱---密码---2FA--Accesstoken`（与导入格式一致，可回环）。传空数组导出全部。
+export async function exportAccountPool(
+  accessTokens: string[],
+  opts: { onlyUnused?: boolean; markUsed?: boolean } = {},
+) {
+  const response = await request.request<string>({
+    url: "/api/accounts/export-pool",
+    method: "POST",
+    data: { access_tokens: accessTokens, only_unused: !!opts.onlyUnused, mark_used: !!opts.markUsed },
+    responseType: "text",
+  });
+  return response.data;
+}
+
 // 迁移导出：完整 JSON（含 access/refresh/id token + proxy/country/exit_ip + 密码/2FA），用于在两套系统间搬账号。
 export async function exportAccounts(
   accessTokens: string[],
@@ -635,6 +656,15 @@ export async function markMailboxes(emails: string[], used: boolean) {
     method: "POST",
     body: { emails, used },
   });
+}
+
+/** 拉取导出文本（`邮箱---收件地址`）。only_unused=true 仅导出待注册。 */
+export async function fetchMailboxesExportText(onlyUnused = false): Promise<string> {
+  const params = new URLSearchParams();
+  if (onlyUnused) params.set("only_unused", "true");
+  const path = `/api/mailboxes/export${params.toString() ? `?${params.toString()}` : ""}`;
+  const response = await request.get<string>(path, { responseType: "text" });
+  return String(response.data ?? "");
 }
 
 // ── CDKs ───────────────────────────────────────────────────────────
@@ -831,6 +861,7 @@ export async function updateActivationConfig(updates: Partial<{
   poll_timeout: number;
   max_attempts_per_type: number;
   auto_activate_after_register: boolean;
+  target: number;
 }>) {
   return httpRequest<{ config: ActivationConfig }>("/api/activation/config", {
     method: "POST",
@@ -922,6 +953,68 @@ export async function resetRegister() {
 
 export async function clearRegisterLogs() {
   return httpRequest<{ register: RegisterConfig }>("/api/register/clear-logs", { method: "POST" });
+}
+
+// ── Register abnormal accounts（注册机异常账号清单）──────────────────
+
+export type RegisterAbnormal = {
+  email: string;
+  fetch_url: string;
+  reason: string;
+  access_token: string | null;
+  password: string | null;
+  eligible: boolean | null;
+  created_at: string;
+};
+
+export type RegisterAbnormalStats = {
+  total: number;
+  no_trial: number;
+  other: number;
+};
+
+export type RegisterAbnormalListParams = PageParams & { q?: string };
+
+export async function fetchRegisterAbnormal(params: RegisterAbnormalListParams = {}) {
+  return httpRequest<{
+    items: RegisterAbnormal[];
+    stats: RegisterAbnormalStats;
+    total: number;
+    page: number;
+    page_size: number;
+  }>(`/api/register/abnormal${buildQuery(params)}`);
+}
+
+export async function deleteRegisterAbnormal(emails: string[]) {
+  return httpRequest<{ items: RegisterAbnormal[]; stats: RegisterAbnormalStats; removed: number }>(
+    "/api/register/abnormal",
+    { method: "DELETE", body: { emails } },
+  );
+}
+
+// 导出异常清单文本（`邮箱---取件地址---原因`）。
+export async function fetchRegisterAbnormalExportText(): Promise<string> {
+  const response = await request.get<string>("/api/register/abnormal/export", { responseType: "text" });
+  return String(response.data ?? "");
+}
+
+// ── Trial check config（试用资格检测，Phase B 生效）────────────────────
+
+export type TrialCheckConfig = {
+  enabled: boolean;
+  base_url: string;
+  has_api_key: boolean;
+};
+
+export async function fetchTrialCheckConfig() {
+  return httpRequest<{ config: TrialCheckConfig }>("/api/trial-check");
+}
+
+export async function updateTrialCheckConfig(updates: Partial<{ enabled: boolean; base_url: string; api_key: string }>) {
+  return httpRequest<{ config: TrialCheckConfig }>("/api/trial-check", {
+    method: "POST",
+    body: updates,
+  });
 }
 
 // ── Upstream proxy ─────────────────────────────────────────────────

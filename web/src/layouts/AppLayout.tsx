@@ -14,13 +14,13 @@ const { Header, Content } = Layout;
 const { Text } = Typography;
 
 const NAV_ITEMS = [
-  { itemKey: "/workbench", text: "工作台" },
-  { itemKey: "/accounts", text: "号池管理" },
-  { itemKey: "/finished-accounts", text: "成品号管理" },
-  { itemKey: "/dispatch", text: "发号管理" },
+  { itemKey: "/register", text: "注册机" },
+  { itemKey: "/activator", text: "激活器" },
+  { itemKey: "/accounts", text: "账号管理" },
   { itemKey: "/mailboxes", text: "邮箱管理" },
+  { itemKey: "/cdks", text: "CDK管理" },
   { itemKey: "/phones", text: "手机号管理" },
-  { itemKey: "/cdks", text: "CDK 管理" },
+  { itemKey: "/dispatch", text: "出库管理" },
   { itemKey: "/settings", text: "设置" },
 ];
 
@@ -45,7 +45,7 @@ export default function AppLayout() {
   }
 
   // 命中当前路由的导航项（含子路径）
-  const selected = NAV_ITEMS.find((item) => location.pathname.startsWith(item.itemKey))?.itemKey ?? "/accounts";
+  const selected = NAV_ITEMS.find((item) => location.pathname.startsWith(item.itemKey))?.itemKey ?? "/register";
   const currentTitle = NAV_ITEMS.find((item) => item.itemKey === selected)?.text ?? "";
 
   const handleLogout = async () => {

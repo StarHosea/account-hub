@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -25,7 +26,7 @@ def _norm_email(email: str) -> str:
 
 
 def parse_mailbox_lines(text: str) -> list[dict[str, str]]:
-    """解析批量导入文本，每行格式 `邮箱----取件地址URL`。
+    """解析批量导入文本，每行格式 `邮箱---收件地址`（兼容旧 `----` 分隔）。
 
     忽略空行与 `#` 注释行；按邮箱去重（后者覆盖前者）。
     """
@@ -34,7 +35,8 @@ def parse_mailbox_lines(text: str) -> list[dict[str, str]]:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        parts = line.split("----", 1)
+        # 分隔符统一按「3 个及以上连字符」切分，同时兼容新格式 `---` 与旧格式 `----`。
+        parts = re.split(r"-{3,}", line, maxsplit=1)
         if len(parts) != 2:
             continue
         email = parts[0].strip()
@@ -51,9 +53,11 @@ class MailboxService:
     used=True 表示该邮箱已注册过账号（或被人工标记不再使用），注册机会跳过它。
     """
 
-    def __init__(self, store_file: Path = MAILBOX_FILE):
+    def __init__(self, store_file: Path = MAILBOX_FILE, storage=None):
+        # storage 可注入（测试隔离用）；默认取全局单例后端。store_file 仅用于旧
+        # data/mailboxes.json 的一次性迁移读取。
         self._store_file = store_file
-        self._storage = config.get_storage_backend()
+        self._storage = storage if storage is not None else config.get_storage_backend()
         self._lock = threading.RLock()
         self._mailboxes: dict[str, dict] = self._load()
 
@@ -151,6 +155,16 @@ class MailboxService:
         with self._lock:
             item = self._mailboxes.get(_norm_email(email))
             return item["fetch_url"] if item else None
+
+    def export_text(self, only_unused: bool = False) -> str:
+        """导出为 `邮箱---收件地址` 每行一条（与导入格式一致，可回环）。"""
+        with self._lock:
+            lines = [
+                f"{item['email']}---{item['fetch_url']}"
+                for item in self._mailboxes.values()
+                if not (only_unused and (item.get("used") or item.get("in_use")))
+            ]
+            return "\n".join(lines)
 
     def stats(self) -> dict[str, int]:
         with self._lock:

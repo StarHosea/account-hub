@@ -43,8 +43,8 @@ const { Title, Text } = Typography;
 const PAGE_SIZE = 10;
 
 const STATUS_TAG: Record<CdkStatus, { text: string; color: string }> = {
-  available: { text: "可用", color: "green" },
-  used: { text: "已用", color: "grey" },
+  available: { text: "激活中", color: "blue" },
+  used: { text: "已激活", color: "green" },
   invalid: { text: "无效", color: "red" },
 };
 
@@ -211,7 +211,7 @@ export default function CdksPage() {
         ),
     },
     {
-      title: "导入时间",
+      title: "创建时间",
       dataIndex: "imported_at",
       width: 150,
       render: (v: string | null) => (
@@ -268,8 +268,8 @@ export default function CdksPage() {
         style={{ width: isMobile ? "100%" : 130 }}
         optionList={[
           { label: "全部状态", value: "" },
-          { label: "可用", value: "available" },
-          { label: "已用", value: "used" },
+          { label: "激活中", value: "available" },
+          { label: "已激活", value: "used" },
           { label: "无效", value: "invalid" },
         ]}
       />
@@ -303,14 +303,14 @@ export default function CdksPage() {
         }}
       >
         <Title heading={isMobile ? 4 : 3} style={{ margin: 0 }}>
-          CDK 管理
+          CDK管理
         </Title>
         <Space spacing={8} style={{ flexWrap: "wrap" }}>
           <Button icon={<IconRefresh />} onClick={() => void load()} loading={loading}>
             刷新
           </Button>
           <Button icon={<IconUpload />} theme="solid" type="primary" onClick={() => setImportOpen(true)}>
-            导入
+            批量创建
           </Button>
           <Dropdown
             trigger="click"
@@ -394,11 +394,11 @@ export default function CdksPage() {
         />
       )}
 
-      {/* 导入弹窗 */}
-      <Modal title="导入 CDK" visible={importOpen} onCancel={() => setImportOpen(false)} onOk={() => void handleImport()} okText="导入" confirmLoading={busy} maskClosable={false} fullScreen={isMobile}>
+      {/* 批量创建（导入）弹窗 */}
+      <Modal title="批量创建 CDK" visible={importOpen} onCancel={() => setImportOpen(false)} onOk={() => void handleImport()} okText="批量创建" confirmLoading={busy} maskClosable={false} fullScreen={isMobile}>
         <div style={{ display: "flex", flexDirection: "column", gap: 12, paddingTop: 8 }}>
           <div>
-            <Text style={{ display: "block", marginBottom: 6 }}>类型</Text>
+            <Text style={{ display: "block", marginBottom: 6 }}>默认类型（行内未指定时使用）</Text>
             <Select
               value={importType}
               onChange={(v) => setImportType(v as CdkType)}
@@ -410,8 +410,8 @@ export default function CdksPage() {
             />
           </div>
           <div>
-            <Text style={{ display: "block", marginBottom: 6 }}>CDK 列表（一行一个）</Text>
-            <TextArea value={importText} onChange={setImportText} rows={10} style={{ fontFamily: "monospace" }} placeholder={"一行一个 CDK..."} />
+            <Text style={{ display: "block", marginBottom: 6 }}>CDK 列表（一行一个，可用 `CDK-类型` 指定类型）</Text>
+            <TextArea value={importText} onChange={setImportText} rows={10} style={{ fontFamily: "monospace" }} placeholder={"一行一个 CDK，例如：\nABCD1234\nEFGH5678-IDEL"} />
           </div>
         </div>
       </Modal>

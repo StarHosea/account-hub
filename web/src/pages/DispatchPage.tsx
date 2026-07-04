@@ -158,7 +158,7 @@ export default function DispatchPage() {
         }}
       >
         <Title heading={isMobile ? 4 : 3} style={{ margin: 0 }}>
-          发号管理
+          出库管理
         </Title>
         <Button icon={<IconRefresh />} onClick={() => void refreshSummary()}>
           刷新可用

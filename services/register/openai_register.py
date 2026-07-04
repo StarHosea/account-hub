@@ -1,33 +1,34 @@
 from __future__ import annotations
 
-import base64
-import hashlib
 import json
+import os
 import random
-import secrets
-import string
+import subprocess
 import threading
 import time
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import quote, unquote
 
-from curl_cffi import requests
+from curl_cffi import requests as curl_requests
 
 from services.account_service import account_service
 from services.register import mail_provider
 from services.register import fingerprint
+from services.register import trial_check
 from services.register.fingerprint import (
     build_identity,
-    common_headers_for,
-    navigate_headers_for,
     normalize_proxy,
+    parse_proxy,
     rotate_ipweb_proxy,
 )
+from services.register_abnormal_service import register_abnormal_service
 
 base_dir = Path(__file__).resolve().parent
+# 仓库根 / node_engine：CloakBrowser 浏览器引擎（单账号 CLI worker）
+NODE_ENGINE_DIR = base_dir.parents[1] / "node_engine"
+NODE_WORKER = NODE_ENGINE_DIR / "worker.js"
+
 config = {
     "mail": {
         "request_timeout": 30,
@@ -42,41 +43,42 @@ config = {
     "regions": ["US"],
     "ipweb_rotate": False,
     "ip_duration": 120,
+    # 出口 IP 探活重试次数：换 SID 后经代理探活，最多试这么多次直到拿到活 IP（0=关闭探活）
+    "ip_probe_retries": 6,
+    # 浏览器引擎相关（由 register_service._push_to_worker 下发）
+    "engine": "browser",
+    "headless": False,
+    "register_timeout": 300,
+    "node_bin": "node",
+    "cloakbrowser_license": "",
 }
 register_config_file = base_dir.parents[1] / "data" / "register.json"
 try:
     saved_config = json.loads(register_config_file.read_text(encoding="utf-8"))
-    config.update({key: saved_config[key] for key in ("mail", "proxy", "total", "threads", "regions", "ipweb_rotate", "ip_duration") if key in saved_config})
+    config.update({
+        key: saved_config[key]
+        for key in ("mail", "proxy", "total", "threads", "regions", "ipweb_rotate", "ip_duration",
+                    "enable_2fa", "headless", "register_timeout", "node_bin", "ip_probe_retries")
+        if key in saved_config
+    })
 except Exception:
     pass
 
-auth_base = "https://auth.openai.com"
-platform_base = "https://platform.openai.com"
-chatgpt_base = "https://chatgpt.com"
-platform_oauth_client_id = "app_2SKx67EdpoN0G6j64rFvigXD"
-platform_oauth_redirect_uri = f"{platform_base}/auth/callback"
-platform_oauth_audience = "https://api.openai.com/v1"
-# ChatGPT 网页端 OAuth：开启 2FA 的 mfa/enroll 接口要求 chatgpt client 签发的 token，
-# 与上面 platform client 不通用（client_id 抓包逆向自 chatgpt.com 网页端）。
-chatgpt_oauth_client_id = "app_X8zY6vW2pQ9tR3dE7nK1jL5gH"
-chatgpt_oauth_redirect_uri = f"{chatgpt_base}/api/auth/callback/openai"
-chatgpt_oauth_scope = "openid email profile offline_access model.request model.read organization.read organization.write"
-platform_auth0_client = "eyJuYW1lIjoiYXV0aDAtc3BhLWpzIiwidmVyc2lvbiI6IjEuMjEuMCJ9"
-user_agent = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/145.0.0.0 Safari/537.36"
-)
-sec_ch_ua = '"Google Chrome";v="145", "Not?A_Brand";v="8", "Chromium";v="145"'
-sec_ch_ua_full_version_list = '"Chromium";v="145.0.0.0", "Not:A-Brand";v="99.0.0.0", "Google Chrome";v="145.0.0.0"'
-default_timeout = 30
+chatgpt_url = "https://chatgpt.com/"
+
+# 出口 IP 探活端点：经账号代理 GET 它，返回出口公网 IP 即认为该线路可用。
+_EXIT_IP_PROBE_URL = "https://api.ipify.org?format=json"
+
 print_lock = threading.Lock()
 stats_lock = threading.Lock()
 stats = {"done": 0, "success": 0, "fail": 0, "start_time": 0.0}
 register_log_sink = None
 
+# 正在运行的 Node 子进程集合：用于停止任务时优雅终止在途浏览器。
+_active_lock = threading.Lock()
+_active_procs: set[subprocess.Popen] = set()
+
 # 正在注册的每个任务的实时进度（按任务号）：供工作台「正在注册账号」表展示。
-# 结构：{index: {"index", "email", "step", "level", "status": running|success|fail, "updated_at"}}
 progress_lock = threading.Lock()
 progress: dict[int, dict] = {}
 
@@ -114,55 +116,6 @@ def _remove_progress(index: int) -> None:
     with progress_lock:
         progress.pop(index, None)
 
-common_headers = {
-    "accept": "application/json",
-    "accept-encoding": "gzip, deflate, br",
-    "accept-language": "en-US,en;q=0.9",
-    "cache-control": "no-cache",
-    "connection": "keep-alive",
-    "content-type": "application/json",
-    "dnt": "1",
-    "origin": auth_base,
-    "priority": "u=1, i",
-    "sec-gpc": "1",
-    "sec-ch-ua": sec_ch_ua,
-    "sec-ch-ua-arch": '"x86_64"',
-    "sec-ch-ua-bitness": '"64"',
-    "sec-ch-ua-full-version-list": sec_ch_ua_full_version_list,
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-model": '""',
-    "sec-ch-ua-platform": '"Windows"',
-    "sec-ch-ua-platform-version": '"10.0.0"',
-    "sec-fetch-dest": "empty",
-    "sec-fetch-mode": "cors",
-    "sec-fetch-site": "same-origin",
-    "user-agent": user_agent,
-}
-
-navigate_headers = {
-    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "accept-encoding": "gzip, deflate, br",
-    "accept-language": "en-US,en;q=0.9",
-    "cache-control": "max-age=0",
-    "connection": "keep-alive",
-    "dnt": "1",
-    "sec-gpc": "1",
-    "sec-ch-ua": sec_ch_ua,
-    "sec-ch-ua-arch": '"x86_64"',
-    "sec-ch-ua-bitness": '"64"',
-    "sec-ch-ua-full-version-list": sec_ch_ua_full_version_list,
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-model": '""',
-    "sec-ch-ua-platform": '"Windows"',
-    "sec-ch-ua-platform-version": '"10.0.0"',
-    "sec-fetch-dest": "document",
-    "sec-fetch-mode": "navigate",
-    "sec-fetch-site": "same-origin",
-    "sec-fetch-user": "?1",
-    "upgrade-insecure-requests": "1",
-    "user-agent": user_agent,
-}
-
 
 def log(text: str, color: str = "") -> None:
     colors = {"red": "\033[31m", "green": "\033[32m", "yellow": "\033[33m"}
@@ -182,89 +135,6 @@ def step(index: int, text: str, color: str = "") -> None:
     log(f"[任务{index}] {text}", color)
 
 
-def _jitter_sleep(lo: float = 0.4, hi: float = 1.8) -> None:
-    """步间随机停顿，弱化机械时序。"""
-    time.sleep(random.uniform(lo, hi))
-
-
-def _make_trace_headers() -> dict[str, str]:
-    trace_id = str(random.getrandbits(64))
-    parent_id = str(random.getrandbits(64))
-    return {
-        "traceparent": f"00-{uuid.uuid4().hex}-{format(int(parent_id), '016x')}-01",
-        "tracestate": "dd=s:1;o:rum",
-        "x-datadog-origin": "rum",
-        "x-datadog-parent-id": parent_id,
-        "x-datadog-sampling-priority": "1",
-        "x-datadog-trace-id": trace_id,
-    }
-
-
-from utils.pkce import generate_pkce as _generate_pkce  # noqa: F401
-
-
-def _random_password(length: int = 16) -> str:
-    chars = string.ascii_letters + string.digits + "!@#$%"
-    value = list(
-        secrets.choice(string.ascii_uppercase)
-        + secrets.choice(string.ascii_lowercase)
-        + secrets.choice(string.digits)
-        + secrets.choice("!@#$%")
-        + "".join(secrets.choice(chars) for _ in range(max(0, length - 4)))
-    )
-    random.shuffle(value)
-    return "".join(value)
-
-
-def _random_name(identity=None) -> tuple[str, str]:
-    return fingerprint.random_name(identity)
-
-
-def _random_birthdate() -> str:
-    # 年龄 20–50 岁（2026 年 → 出生 1976–2006）
-    return f"{random.randint(1976, 2006):04d}-{random.randint(1, 12):02d}-{random.randint(1, 28):02d}"
-
-
-def _response_json(resp) -> dict:
-    try:
-        data = resp.json()
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-def _response_debug_detail(resp, limit: int = 800) -> str:
-    if resp is None:
-        return ""
-    data = _response_json(resp)
-    parts = [
-        f"url={str(getattr(resp, 'url', '') or '')[:300]}",
-        f"content_type={str(getattr(resp, 'headers', {}).get('content-type') or '')}",
-    ]
-    for key in ("cf-ray", "x-request-id", "openai-processing-ms"):
-        value = str(getattr(resp, "headers", {}).get(key) or "").strip()
-        if value:
-            parts.append(f"{key}={value}")
-    if data:
-        parts.append(f"json={json.dumps(data, ensure_ascii=False)[:limit]}")
-    else:
-        parts.append(f"body={str(getattr(resp, 'text', '') or '')[:limit]}")
-    return ", ".join(parts)
-
-
-def _is_cloudflare_challenge(resp) -> bool:
-    if resp is None:
-        return False
-    text = str(getattr(resp, "text", "") or "").lower()
-    headers = getattr(resp, "headers", {}) or {}
-    server = str(headers.get("server") or "").lower()
-    return (
-        "cloudflare" in server
-        or "challenges.cloudflare.com" in text
-        or "<title>just a moment" in text
-    )
-
-
 def _mail_config() -> dict:
     return {**config["mail"], "proxy": config["proxy"]}
 
@@ -278,27 +148,6 @@ def _mailbox_verb() -> str:
     return "获取"
 
 
-def _authorize_landed_page(resp) -> str:
-    """诊断用：粗判 authorize 之后落在哪个页面。返回 signup / login / "" 仅供日志。
-
-    注意：email-verification / email_otp_verification 在注册和登录流程里都会出现，
-    无法据此可靠区分，所以这里只用于打日志，绝不据此中断注册流程。
-    """
-    if resp is None:
-        return ""
-    final_url = str(getattr(resp, "url", "") or "").lower()
-    data = _response_json(resp)
-    page_type = ""
-    page = data.get("page") if isinstance(data, dict) else None
-    if isinstance(page, dict):
-        page_type = str(page.get("type") or "").lower()
-    if "create-account" in final_url or "signup" in final_url or "create_account" in page_type:
-        return "signup"
-    if "/log-in" in final_url or "/login" in final_url or page_type in {"login", "password_verification"}:
-        return "login"
-    return ""
-
-
 def create_mailbox(username: str | None = None) -> dict:
     return mail_provider.create_mailbox(_mail_config(), username)
 
@@ -307,381 +156,35 @@ def wait_for_code(mailbox: dict) -> str | None:
     return mail_provider.wait_for_code(_mail_config(), mailbox)
 
 
-from utils.sentinel import SentinelTokenGenerator, build_sentinel_token as _build_sentinel_token_tuple  # noqa: F401
+def _probe_exit_ip(account_proxy: str, timeout: float = 12.0) -> str | None:
+    """经账号专属代理 GET ipify，拿到出口公网 IP 即认为该线路可用；失败返回 None。
 
-
-def build_sentinel_token(session: requests.Session, device_id: str, flow: str, identity=None) -> str:
-    """请求 sentinel token，返回 sentinel header 字符串。
-
-    传入 identity 时，sentinel 的 UA / 语言 / 时区 / 分辨率 / 并发数与请求头、地区保持一致；
-    未传时回退模块默认常量（向后兼容）。
+    走 curl_cffi（与 mail_provider 一致，支持带认证 socks5h），不复用收件会话——
+    收件永不走代理，这里必须走代理才能验证「这条出口线路是否真的活着」。
     """
-    if identity is not None:
-        sentinel_val, _ = _build_sentinel_token_tuple(
-            session, device_id, flow,
-            user_agent=identity.user_agent,
-            sec_ch_ua=identity.sec_ch_ua,
-            screen=identity.screen,
-            hardware_concurrency=identity.hardware_concurrency,
-            language=identity.sentinel_language,
-            gmt_offset=identity.gmt_offset,
-            tz_label=identity.tz_label,
-            sec_ch_ua_platform=identity.profile.platform,
-        )
-        return sentinel_val
-    sentinel_val, _oai_sc_val = _build_sentinel_token_tuple(session, device_id, flow, user_agent=user_agent, sec_ch_ua=sec_ch_ua)
-    return sentinel_val
-
-
-def create_session(proxy: str = "", impersonate: str = "chrome") -> Any:
-    kwargs = {"impersonate": impersonate, "verify": False}
-    if proxy:
-        kwargs["proxy"] = proxy
-    return requests.Session(**kwargs)
-
-
-def request_with_local_retry(session: requests.Session, method: str, url: str, retry_attempts: int = 3, **kwargs):
-    last_error = ""
-    for attempt in range(max(1, retry_attempts)):
-        try:
-            return session.request(method.upper(), url, timeout=default_timeout, **kwargs), ""
-        except Exception as error:
-            last_error = str(error)
-            time.sleep(random.uniform(0.5, 1.5) * (attempt + 1))
-    return None, last_error
-
-
-def validate_otp(session: requests.Session, device_id: str, code: str, identity=None):
-    headers = common_headers_for(identity) if identity is not None else dict(common_headers)
-    headers["referer"] = f"{auth_base}/email-verification"
-    headers["oai-device-id"] = device_id
-    headers.update(_make_trace_headers())
-    resp, error = request_with_local_retry(session, "post", f"{auth_base}/api/accounts/email-otp/validate", json={"code": code}, headers=headers, verify=False)
-    if resp is not None and resp.status_code == 200:
-        return resp, ""
-    headers["openai-sentinel-token"] = build_sentinel_token(session, device_id, "authorize_continue", identity)
-    resp, error = request_with_local_retry(session, "post", f"{auth_base}/api/accounts/email-otp/validate", json={"code": code}, headers=headers, verify=False)
-    return resp, error
-
-
-def extract_oauth_callback_params_from_url(url: str) -> dict[str, str] | None:
-    if not url:
+    proxy = (account_proxy or "").strip()
+    if not proxy:
         return None
     try:
-        params = parse_qs(urlparse(url).query)
+        resp = curl_requests.get(
+            _EXIT_IP_PROBE_URL,
+            proxies={"http": proxy, "https": proxy},
+            timeout=timeout,
+            impersonate="chrome",
+            verify=False,
+        )
+        if resp.status_code != 200:
+            return None
+        ip = str((resp.json() or {}).get("ip") or "").strip()
+        return ip or None
     except Exception:
         return None
-    code = str((params.get("code") or [""])[0]).strip()
-    if not code:
-        return None
-    return {"code": code, "state": str((params.get("state") or [""])[0]).strip(), "scope": str((params.get("scope") or [""])[0]).strip()}
-
-
-def request_platform_oauth_token(
-    session: requests.Session,
-    code: str,
-    code_verifier: str,
-    client_id: str = platform_oauth_client_id,
-    redirect_uri: str = platform_oauth_redirect_uri,
-    identity=None,
-) -> dict | None:
-    headers = {
-        "accept": "*/*",
-        "accept-language": identity.accept_language if identity is not None else "en-US,en;q=0.9",
-        "auth0-client": platform_auth0_client,
-        "cache-control": "no-cache",
-        "content-type": "application/json",
-        "origin": platform_base,
-        "pragma": "no-cache",
-        "priority": "u=1, i",
-        "referer": f"{platform_base}/",
-        "sec-ch-ua": identity.sec_ch_ua if identity is not None else sec_ch_ua,
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": identity.profile.platform if identity is not None else '"Windows"',
-        "sec-fetch-dest": "empty",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-site",
-        "user-agent": identity.user_agent if identity is not None else user_agent,
-    }
-    resp = session.post(
-        f"{auth_base}/api/accounts/oauth/token",
-        headers=headers,
-        json={
-            "client_id": client_id,
-            "code_verifier": code_verifier,
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": redirect_uri,
-        },
-        verify=False,
-        timeout=60,
-    )
-    if resp.status_code != 200:
-        print(resp.text)
-        return None
-    return _response_json(resp)
-
-
-class PlatformRegistrar:
-    def __init__(self, proxy: str = "", identity=None) -> None:
-        self.identity = identity or build_identity("US")
-        self.proxy = proxy
-        self.exit_ip = ""
-        self.session = create_session(proxy, impersonate=self.identity.impersonate)
-        self.device_id = str(uuid.uuid4())
-        self.code_verifier = ""
-        self.platform_auth_code = ""
-
-    def close(self) -> None:
-        self.session.close()
-
-    def _capture_exit_ip(self, index: int) -> None:
-        """注册会话建立后，经代理探一次出口 IP（非 GPT 官方接口，失败不影响注册）。
-
-        住宅代理偶发抖动，故多端点 + 重试，尽量拿到 IP；最终拿不到也只是不展示。
-        """
-        endpoints = [
-            ("https://ipinfo.io/json", True),
-            ("https://api.ipify.org?format=json", True),
-            ("https://ipinfo.io/ip", False),
-            ("https://api.ip.sb/ip", False),
-        ]
-        for url, is_json in endpoints:
-            try:
-                resp, _ = request_with_local_retry(self.session, "get", url, retry_attempts=2, verify=False)
-                if resp is None or getattr(resp, "status_code", 0) != 200:
-                    continue
-                if is_json:
-                    data = _response_json(resp)
-                    ip = str(data.get("ip") or "").strip()
-                    country = str(data.get("country") or "").strip()
-                else:
-                    ip = str(getattr(resp, "text", "") or "").strip()
-                    country = ""
-                if ip:
-                    self.exit_ip = ip
-                    step(index, f"出口 IP: {ip}{(' / ' + country) if country else ''}")
-                    return
-            except Exception:
-                continue
-        step(index, "出口 IP 探测失败（不影响注册）", "yellow")
-
-    def _navigate_headers(self, referer: str = "") -> dict[str, str]:
-        headers = navigate_headers_for(self.identity)
-        if referer:
-            headers["referer"] = referer
-        return headers
-
-    def _json_headers(self, referer: str) -> dict[str, str]:
-        headers = common_headers_for(self.identity)
-        headers["referer"] = referer
-        headers["oai-device-id"] = self.device_id
-        headers.update(_make_trace_headers())
-        return headers
-
-    def _platform_authorize(self, email: str, index: int) -> None:
-        step(index, "开始 platform authorize")
-        self.session.cookies.set("oai-did", self.device_id, domain=".auth.openai.com")
-        self.session.cookies.set("oai-did", self.device_id, domain="auth.openai.com")
-        self.code_verifier, code_challenge = _generate_pkce()
-        params = {
-            "issuer": auth_base,
-            "client_id": platform_oauth_client_id,
-            "audience": platform_oauth_audience,
-            "redirect_uri": platform_oauth_redirect_uri,
-            "device_id": self.device_id,
-            # 注册流程显式声明 signup：throwaway 域名 OpenAI 会自动当新账号走注册，
-            # 但 @outlook.com/@hotmail.com 这类真实消费邮箱会被 login_or_signup 路由到登录分支，
-            # 后续 user/register 落在错误的 auth step 上报 invalid_auth_step。
-            "screen_hint": "signup",
-            "max_age": "0",
-            "login_hint": email,
-            "scope": "openid profile email offline_access",
-            "response_type": "code",
-            "response_mode": "query",
-            "state": secrets.token_urlsafe(32),
-            "nonce": secrets.token_urlsafe(32),
-            "code_challenge": code_challenge,
-            "code_challenge_method": "S256",
-            "auth0Client": platform_auth0_client,
-        }
-        resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/authorize?{urlencode(params)}", headers=self._navigate_headers(f"{platform_base}/"), allow_redirects=True, verify=False)
-        if resp is None or resp.status_code != 200:
-            err = _response_json(resp).get("error", {}) if resp is not None else {}
-            detail = f": {err.get('code', '')} - {err.get('message', '')}".strip(" -") if err else ""
-            if _is_cloudflare_challenge(resp):
-                raise RuntimeError("被 Cloudflare 拦截，请更换 IP 重试")
-            debug = _response_debug_detail(resp)
-            status = getattr(resp, "status_code", "unknown")
-            raise RuntimeError(error or f"platform_authorize_http_{status}{detail}, {debug}")
-        landed = _authorize_landed_page(resp)
-        # 仅打日志，不据此中断：authorize 落地页无法可靠区分注册/登录，
-        # 真正的判定交给 user/register（失败会 dump 完整响应）。
-        step(index, f"platform authorize 完成[{landed or '?'}] url={str(getattr(resp, 'url', '') or '')[:160]}")
-
-    def _register_user(self, email: str, password: str, index: int) -> None:
-        step(index, "开始提交注册密码")
-        headers = self._json_headers(f"{auth_base}/create-account/password")
-        headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "username_password_create", self.identity)
-        resp, error = request_with_local_retry(self.session, "post", f"{auth_base}/api/accounts/user/register", json={"username": email, "password": password}, headers=headers, verify=False)
-        if resp is None or resp.status_code != 200:
-            data = _response_json(resp) if resp is not None else {}
-            if data.get("message") == "Failed to create account. Please try again.":
-                step(index, "注册失败提示: 邮箱域名很可能因滥用被封禁，请更换邮箱域名", "yellow")
-            detail = f", detail={json.dumps(data, ensure_ascii=False)}" if data else ""
-            raise RuntimeError(error or f"user_register_http_{getattr(resp, 'status_code', 'unknown')}{detail}")
-        step(index, "提交注册密码完成")
-
-    def _send_otp(self, index: int) -> None:
-        step(index, "开始发送验证码")
-        resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/email-otp/send", headers=self._navigate_headers(f"{auth_base}/create-account/password"), allow_redirects=True, verify=False)
-        if resp is None or resp.status_code not in (200, 302):
-            raise RuntimeError(error or f"send_otp_http_{getattr(resp, 'status_code', 'unknown')}")
-        step(index, "发送验证码完成")
-
-    def _validate_otp(self, code: str, index: int) -> None:
-        step(index, f"开始校验验证码 {code}")
-        resp, error = validate_otp(self.session, self.device_id, code, self.identity)
-        if resp is None or resp.status_code != 200:
-            body = ""
-            try:
-                body = (resp.text or "")[:500] if resp is not None else ""
-            except Exception:
-                pass
-            raise RuntimeError(error or f"validate_otp_http_{getattr(resp, 'status_code', 'unknown')}_body={body}")
-        step(index, "验证码校验完成")
-
-    def _create_account(self, name: str, birthdate: str, index: int) -> None:
-        step(index, "开始创建账号资料")
-        headers = self._json_headers(f"{auth_base}/about-you")
-        headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "oauth_create_account", self.identity)
-        resp, error = request_with_local_retry(self.session, "post", f"{auth_base}/api/accounts/create_account", json={"name": name, "birthdate": birthdate}, headers=headers, verify=False)
-        if resp is None or resp.status_code not in (200, 302):
-            data = _response_json(resp) if resp is not None else {}
-            if data.get("message") == "Failed to create account. Please try again.":
-                step(index, "创建账号失败提示: 邮箱域名很可能因滥用被封禁，请更换邮箱域名", "yellow")
-            detail = f", detail={json.dumps(data, ensure_ascii=False)}" if data else ""
-            raise RuntimeError(error or f"create_account_http_{getattr(resp, 'status_code', 'unknown')}{detail}")
-        data = _response_json(resp)
-        callback_params = extract_oauth_callback_params_from_url(str(data.get("continue_url") or "").strip())
-        self.platform_auth_code = str((callback_params or {}).get("code") or "").strip()
-        step(index, "创建账号资料完成")
-
-    def _exchange_registered_tokens(self, index: int) -> dict:
-        step(index, "开始换 token")
-        tokens = request_platform_oauth_token(self.session, self.platform_auth_code, self.code_verifier, identity=self.identity)
-        if not tokens:
-            raise RuntimeError("token换取失败")
-        step(index, "token 换取完成")
-        return tokens
-
-    def _chatgpt_authorize(self, email: str, index: int) -> str:
-        """[已弃用] 早期尝试换 ChatGPT 网页端 client token；实测该 client 为机密客户端，
-        公开 PKCE 无法换 token。现注册流程直接用 platform token 调 mfa/enroll，不再需要本方法。
-        保留占位以防外部引用。"""
-        raise RuntimeError("deprecated: use platform access_token for mfa/enroll directly")
-
-    def _enroll_totp(self, chatgpt_token: str, email: str, index: int) -> dict:
-        """用 chatgpt token 开启 TOTP 2FA：enroll → 算码 → activate，返回 {totp_secret, otpauth_url}。"""
-        from utils.totp import build_otpauth_url, generate_totp
-
-        headers = {
-            "accept": "application/json",
-            "authorization": f"Bearer {chatgpt_token}",
-            "content-type": "application/json",
-            "oai-device-id": self.device_id,
-            "oai-language": self.identity.oai_language,
-            "origin": chatgpt_base,
-            "referer": f"{chatgpt_base}/",
-            "user-agent": self.identity.user_agent,
-        }
-        step(index, "开始申请 2FA 密钥")
-        resp, error = request_with_local_retry(self.session, "post", f"{chatgpt_base}/backend-api/accounts/mfa/enroll", json={"factor_type": "totp"}, headers=headers, verify=False)
-        data = _response_json(resp)
-        secret = str(data.get("secret") or "").strip()
-        session_id = str(data.get("session_id") or "").strip()
-        if resp is None or resp.status_code != 200 or not secret or not session_id:
-            raise RuntimeError(error or f"mfa_enroll_failed_{getattr(resp, 'status_code', 'unknown')}")
-        code = generate_totp(secret)
-        step(index, "提交 2FA 验证码")
-        resp2, error2 = request_with_local_retry(self.session, "post", f"{chatgpt_base}/backend-api/accounts/mfa/user/activate_enrollment", json={"code": code, "factor_type": "totp", "session_id": session_id}, headers=headers, verify=False)
-        data2 = _response_json(resp2)
-        if resp2 is None or resp2.status_code != 200 or not data2.get("success"):
-            raise RuntimeError(error2 or f"mfa_activate_failed_{getattr(resp2, 'status_code', 'unknown')}")
-        step(index, "2FA 开启完成")
-        return {"totp_secret": secret, "otpauth_url": build_otpauth_url(secret, email)}
-
-    def register(self, index: int) -> dict:
-        verb = _mailbox_verb()
-        step(index, f"开始{verb}邮箱")
-        mailbox = create_mailbox()
-        email = str(mailbox.get("address") or "").strip()
-        if not email:
-            mail_provider.release_mailbox(mailbox)
-            raise RuntimeError("邮箱服务未返回 address")
-        label = str(mailbox.get("label") or "")
-        set_progress_email(index, email)
-        step(index, f"邮箱{verb}完成[{label}]: {email}")
-        try:
-            self._capture_exit_ip(index)
-            password = _random_password()
-            first_name, last_name = _random_name(self.identity)
-            self._platform_authorize(email, index)
-            _jitter_sleep()
-            self._register_user(email, password, index)
-            _jitter_sleep()
-            self._send_otp(index)
-            step(index, "开始等待注册验证码")
-            code = wait_for_code(mailbox)
-            if not code:
-                raise RuntimeError("等待注册验证码超时")
-            step(index, f"收到注册验证码: {code}")
-            self._validate_otp(code, index)
-            _jitter_sleep()
-            self._create_account(f"{first_name} {last_name}", _random_birthdate(), index)
-            _jitter_sleep()
-            tokens = self._exchange_registered_tokens(index)
-            totp_info: dict = {}
-            if config.get("enable_2fa"):
-                try:
-                    # 注册刚拿到的 platform token pwd_auth_time 新鲜，直接可调 mfa/enroll。
-                    # 仅做小幅抖动（受 token 新鲜度限制，不能挪远）。
-                    time.sleep(random.uniform(2.0, 8.0))
-                    totp_info = self._enroll_totp(str(tokens.get("access_token") or ""), email, index)
-                except Exception as twofa_error:  # noqa: BLE001
-                    step(index, f"2FA 开启失败（不影响注册）：{twofa_error}", "yellow")
-        except Exception as error:
-            mail_provider.mark_mailbox_result(mailbox, success=False, error=error)
-            raise
-        mailbox["access_token"] = str(tokens.get("access_token") or "").strip()
-        mail_provider.mark_mailbox_result(mailbox, success=True)
-        prof = self.identity.profile
-        return {
-            "email": email,
-            "password": password,
-            "access_token": str(tokens.get("access_token") or "").strip(),
-            "refresh_token": str(tokens.get("refresh_token") or "").strip(),
-            "id_token": str(tokens.get("id_token") or "").strip(),
-            "source_type": "web",
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            # 号一号一 IP：把专属代理与地区/出口 IP 持久化到账号，后续官方接口复用同一出口
-            "proxy": self.proxy,
-            "country": self.identity.region.code,
-            "exit_ip": self.exit_ip,
-            # 指纹持久化（与 openai_backend_api._build_fp 字段对齐），后续对话/relogin 复用同一指纹
-            "impersonate": self.identity.impersonate,
-            "user-agent": self.identity.user_agent,
-            "oai-device-id": self.device_id,
-            "sec-ch-ua": self.identity.sec_ch_ua,
-            "sec-ch-ua-mobile": prof.sec_ch_ua_mobile,
-            "sec-ch-ua-platform": prof.platform,
-            **totp_info,
-        }
 
 
 def _resolve_account_proxy(identity) -> str:
-    """按账号解析专属出口代理：ipweb 开启则换国家段 + 全新 SID（号一号一 IP），否则归一化沿用。
+    """按账号解析专属出口代理（不探活，仅归一化 / 换段换 SID）。
 
+    ipweb 开启则换国家段 + 全新 SID（号一号一 IP），否则归一化沿用。
     duration 取 config["ip_duration"]（分钟），延长同 IP 粘性，覆盖注册全程及后续单次操作。
     """
     base = config.get("proxy") or ""
@@ -692,40 +195,347 @@ def _resolve_account_proxy(identity) -> str:
         rotated, sid = rotate_ipweb_proxy(base, identity.region.ipweb_country, duration=dur)
         if sid is not None:
             return rotated
-        # 非 ipweb 代理：无法做号一号一 IP，归一化后沿用
         return normalize_proxy(base)
     return normalize_proxy(base)
+
+
+def _acquire_working_proxy(identity, index: int) -> tuple[str, str]:
+    """拿到一条「探活通过」的账号专属出口代理，返回 (account_proxy, exit_ip)。
+
+    - 未配代理 → 直连 ("","")。
+    - 关闭探活（ip_probe_retries<=0）→ 只解析一次、不探活，行为同旧逻辑（exit_ip 空）。
+    - ipweb 轮换开启 → 最多试 ip_probe_retries 次，每次换全新 SID 后探活，命中即返回；
+      全失败 → 记 warning 并回退「最后一次解析到的代理」（不比旧逻辑差，仍带出口代理）。
+    - 非 ipweb（固定代理）→ 探活一次；不活也照用（用户固定代理，换 SID 无意义）。
+    """
+    base = config.get("proxy") or ""
+    if not base:
+        return "", ""
+
+    retries = int(config.get("ip_probe_retries") or 0)
+    rotate = bool(config.get("ipweb_rotate"))
+
+    # 关闭探活：保持旧行为（解析一次直接用）
+    if retries <= 0:
+        return _resolve_account_proxy(identity), ""
+
+    last_proxy = ""
+    attempts = max(1, retries) if rotate else 1
+    for attempt in range(1, attempts + 1):
+        acct_proxy = _resolve_account_proxy(identity)  # ipweb 时每轮换新 SID
+        last_proxy = acct_proxy
+        exit_ip = _probe_exit_ip(acct_proxy)
+        if exit_ip:
+            if attempt > 1:
+                step(index, f"出口 IP 探活通过（第 {attempt} 次换线）：{exit_ip}")
+            return acct_proxy, exit_ip
+        if rotate:
+            step(index, f"出口 IP 探活失败（第 {attempt}/{attempts} 次），换 SID 重试", "yellow")
+
+    if rotate:
+        step(index, "多次换 SID 仍未探到活 IP，回退沿用最后一条代理继续", "yellow")
+    # 非 ipweb 固定代理：探活失败也照用（换 SID 无意义）
+    return last_proxy, ""
+
+
+
+def _browser_proxy_url(raw: str, index: int) -> str:
+    """把账号代理转成 Chromium 可用的 http(s):// URL。
+
+    Chromium/Playwright 无法做「带认证的 SOCKS5」，而 account-hub 代理默认归一化为 socks5h。
+    这里统一强制成 http，凭据做 URL 编码；无法解析则直连（返回空串）。
+    """
+    if not raw:
+        return ""
+    parsed = parse_proxy(raw, default_scheme="http")
+    if parsed is None:
+        step(index, f"代理无法解析，浏览器将直连：{raw}", "yellow")
+        return ""
+    scheme = (parsed.scheme or "http").lower()
+    if scheme.startswith("socks"):
+        if parsed.user:
+            step(index, "检测到带认证的 SOCKS5 代理，Chromium 不支持，已改用 http 方案（若网关不支持 http 可能失败）", "yellow")
+        scheme = "http"
+    elif scheme not in ("http", "https"):
+        scheme = "http"
+    # 先 unquote 再 quote，避免对已编码的凭据二次编码（p%40ss → p@ss → p%40ss）
+    user = quote(unquote(parsed.user), safe="") if parsed.user else ""
+    pwd = quote(unquote(parsed.password), safe="") if parsed.password else ""
+    auth = f"{user}:{pwd}@" if user else ""
+    return f"{scheme}://{auth}{parsed.host}:{parsed.port}"
+
+
+def _level_color(level: object) -> str:
+    text = str(level or "").lower()
+    if text == "error":
+        return "red"
+    if text in ("warn", "warning", "yellow"):
+        return "yellow"
+    return ""
+
+
+def _send_line(proc: subprocess.Popen, obj: dict) -> None:
+    try:
+        if proc.stdin and not proc.stdin.closed:
+            proc.stdin.write(json.dumps(obj, ensure_ascii=False) + "\n")
+            proc.stdin.flush()
+    except Exception:
+        pass
+
+
+def _terminate(proc: subprocess.Popen) -> None:
+    try:
+        if proc.poll() is None:
+            _send_line(proc, {"type": "stop"})
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+    except Exception:
+        pass
+
+
+def request_stop() -> None:
+    """停止注册任务时调用：向所有在途 Node 子进程发 stop 并终止，释放浏览器内存。"""
+    with _active_lock:
+        procs = list(_active_procs)
+    for proc in procs:
+        _terminate(proc)
+
+
+def _build_account(data: dict, email: str, acct_proxy: str, identity, exit_ip: str = "") -> dict:
+    prof = identity.profile
+    token = str(data.get("accessToken") or "").strip()
+    return {
+        "email": str(data.get("email") or email).strip(),
+        "password": str(data.get("password") or ""),
+        "access_token": token,
+        "source_type": "web",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        # 号一号一 IP：把专属代理与地区持久化到账号，后续官方接口复用同一出口
+        "proxy": acct_proxy,
+        "country": identity.region.code,
+        # 注册时探到的出口公网 IP（探活通过才有值），便于排查与展示
+        "exit_ip": str(exit_ip or ""),
+        # 指纹持久化（与 openai_backend_api._build_fp 字段对齐）
+        "impersonate": identity.impersonate,
+        "user-agent": identity.user_agent,
+        "sec-ch-ua": identity.sec_ch_ua,
+        "sec-ch-ua-mobile": prof.sec_ch_ua_mobile,
+        "sec-ch-ua-platform": prof.platform,
+        # 浏览器会话拿到的 2FA / 指纹种子（token 过期后靠 password+totp 重登）
+        "totp_secret": str(data.get("twoFactorSecret") or ""),
+        "otpauth_url": str(data.get("twoFactorUri") or ""),
+        "fingerprint_seed": data.get("fingerprintSeed"),
+    }
+
+
+def _spawn_worker(job: dict) -> subprocess.Popen:
+    env = {**os.environ}
+    license_key = str(config.get("cloakbrowser_license") or "").strip() or os.getenv("CLOAKBROWSER_LICENSE_KEY", "")
+    if license_key:
+        env["CLOAKBROWSER_LICENSE_KEY"] = license_key
+    node_bin = str(config.get("node_bin") or "node")
+    return subprocess.Popen(
+        [node_bin, str(NODE_WORKER), json.dumps(job, ensure_ascii=False)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        cwd=str(NODE_ENGINE_DIR),
+        env=env,
+    )
+
+
+def _run_browser_job(index: int, email: str, mailbox: dict, browser_proxy: str, identity) -> tuple[dict | None, str | None, dict]:
+    """启动 Node 子进程跑浏览器流程，泵 NDJSON，返回 (result_data, error_msg, partial)。"""
+    timeout_s = int(config.get("register_timeout") or 300)
+    job = {
+        "email": email,
+        "proxyUrl": browser_proxy,
+        "fingerprintSeed": None,
+        "enable2fa": bool(config.get("enable_2fa")),
+        "headless": bool(config.get("headless")),
+        "chatgptUrl": chatgpt_url,
+        "timeoutMs": timeout_s * 1000,
+        "locale": (str(identity.accept_language).split(",")[0] or "en-US"),
+    }
+    baseline = mail_provider.peek_received_at(_mail_config(), mailbox)
+
+    proc = _spawn_worker(job)
+    with _active_lock:
+        _active_procs.add(proc)
+
+    # 硬超时看门狗：Node 侧自身有 Promise.race，这里再兜一层，防止无输出挂死。
+    watchdog = threading.Timer(timeout_s + 60, lambda: _terminate(proc))
+    watchdog.daemon = True
+    watchdog.start()
+
+    stderr_tail: list[str] = []
+
+    def _drain_stderr() -> None:
+        try:
+            for line in proc.stderr:  # type: ignore[union-attr]
+                stderr_tail.append(line)
+                if len(stderr_tail) > 200:
+                    del stderr_tail[0]
+        except Exception:
+            pass
+
+    threading.Thread(target=_drain_stderr, daemon=True).start()
+
+    data: dict | None = None
+    err_msg: str | None = None
+    partial: dict = {}
+    try:
+        for raw_line in proc.stdout:  # type: ignore[union-attr]
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                evt = json.loads(line)
+            except Exception:
+                continue
+            etype = evt.get("type")
+            if etype == "log":
+                step(index, str(evt.get("message") or ""), _level_color(evt.get("level")))
+            elif etype == "need_code":
+                code = mail_provider.wait_for_code(_mail_config(), mailbox, after_received_at=baseline)
+                newb = mail_provider.peek_received_at(_mail_config(), mailbox)
+                if isinstance(newb, datetime):
+                    baseline = newb
+                _send_line(proc, {"type": "code", "code": code})
+                if code:
+                    step(index, f"已向浏览器回传验证码 {code}")
+                else:
+                    step(index, "取码超时，已回传空验证码", "yellow")
+            elif etype == "result":
+                data = evt.get("data") or {}
+                break
+            elif etype == "error":
+                err_msg = str(evt.get("message") or "注册失败")
+                partial = evt.get("partial") or {}
+                break
+    except Exception as exc:  # noqa: BLE001
+        err_msg = err_msg or f"读取引擎输出异常：{exc}"
+    finally:
+        watchdog.cancel()
+        _terminate(proc)
+        with _active_lock:
+            _active_procs.discard(proc)
+
+    if data is None and err_msg is None:
+        err_msg = "浏览器引擎未返回结果（进程可能被终止或超时）"
+        if stderr_tail:
+            log(f"任务{index} 引擎 stderr 末尾：{''.join(stderr_tail[-5:]).strip()}", "yellow")
+    return data, err_msg, partial
 
 
 def worker(index: int) -> dict:
     start = time.time()
     _progress_update(index, status="running", step="任务启动", email="")
     identity = build_identity(enabled_regions=config.get("regions") or ["US"])
-    acct_proxy = _resolve_account_proxy(identity)
-    registrar = PlatformRegistrar(acct_proxy, identity=identity)
+    acct_proxy, exit_ip = _acquire_working_proxy(identity, index)
+    browser_proxy = _browser_proxy_url(acct_proxy, index)
+
+    verb = _mailbox_verb()
+    step(index, f"任务启动，开始{verb}邮箱")
     try:
-        step(index, "任务启动")
-        result = registrar.register(index)
-        cost = time.time() - start
-        access_token = str(result["access_token"])
-        account_service.add_account_items([result])
-        refresh_result = account_service.refresh_accounts([access_token])
-        if refresh_result.get("errors"):
-            step(index, f"账号已保存，刷新状态暂未成功，稍后可重试: {refresh_result['errors']}", "yellow")
+        mailbox = mail_provider.create_mailbox(_mail_config())
+    except Exception as exc:  # noqa: BLE001
         with stats_lock:
             stats["done"] += 1
-            stats["success"] += 1
-            avg = (time.time() - stats["start_time"]) / stats["success"]
-        log(f'{result["email"]} 注册成功，本次耗时{cost:.1f}s，全局平均每个号注册耗时{avg:.1f}s', "green")
-        return {"ok": True, "index": index, "result": result}
-    except Exception as e:
+            stats["fail"] += 1
+        log(f"任务{index} 取邮箱失败：{exc}", "red")
+        _remove_progress(index)
+        return {"ok": False, "index": index, "error": str(exc)}
+
+    email = str(mailbox.get("address") or "").strip()
+    if not email:
+        mail_provider.release_mailbox(mailbox)
+        with stats_lock:
+            stats["done"] += 1
+            stats["fail"] += 1
+        _remove_progress(index)
+        return {"ok": False, "index": index, "error": "邮箱服务未返回 address"}
+
+    label = str(mailbox.get("label") or "")
+    fetch_url = str(mailbox.get("fetch_url") or "")
+    set_progress_email(index, email)
+    step(index, f"邮箱{verb}完成[{label}]: {email}")
+
+    try:
+        data, err_msg, partial = _run_browser_job(index, email, mailbox, browser_proxy, identity)
+
+        # —— 成功：拿到 token —— #
+        if data and str(data.get("accessToken") or "").strip():
+            token = str(data.get("accessToken")).strip()
+            elig = trial_check.check_eligibility(token, email)
+            if elig.get("eligible") is False:
+                # 注册成功但无试用资格：入异常清单，不进号池、不自动激活
+                register_abnormal_service.add(
+                    email, fetch_url=fetch_url, reason=str(elig.get("reason") or "no_trial"),
+                    access_token=token, password=data.get("password"), eligible=False,
+                )
+                mailbox["access_token"] = token
+                mail_provider.mark_mailbox_result(mailbox, success=True)
+                cost = time.time() - start
+                with stats_lock:
+                    stats["done"] += 1
+                    stats["fail"] += 1
+                log(f"{email} 注册成功但无试用资格（{elig.get('reason')}），已入异常清单，不入号池，本次耗时{cost:.1f}s", "yellow")
+                return {"ok": False, "index": index, "error": "no_trial"}
+
+            # 合格（或未启用检测/检测异常按 fail-open 视为合格）→ 入号池
+            acct = _build_account(data, email, acct_proxy, identity, exit_ip)
+            mailbox["access_token"] = token
+            account_service.add_account_items([acct])
+            refresh_result = account_service.refresh_accounts([token])
+            if refresh_result.get("errors"):
+                step(index, f"账号已保存，刷新状态暂未成功，稍后可重试: {refresh_result['errors']}", "yellow")
+            mail_provider.mark_mailbox_result(mailbox, success=True)
+            cost = time.time() - start
+            with stats_lock:
+                stats["done"] += 1
+                stats["success"] += 1
+                avg = (time.time() - stats["start_time"]) / max(1, stats["success"])
+            mode = str(data.get("mode") or "register")
+            log(f'{email} {"注册" if mode == "register" else "老账号加固"}成功，本次耗时{cost:.1f}s，全局平均每个号耗时{avg:.1f}s', "green")
+            return {"ok": True, "index": index, "result": acct}
+
+        # —— 失败：可能带 partial token（step8 失败但已拿 token）—— #
+        token = str((partial or {}).get("accessToken") or "").strip()
+        if token:
+            elig = trial_check.check_eligibility(token, email)
+            register_abnormal_service.add(
+                email, fetch_url=fetch_url, reason=str(err_msg or "register_error"),
+                access_token=token, password=(partial or {}).get("password"),
+                eligible=elig.get("eligible"),
+            )
+            mailbox["access_token"] = token
+            mail_provider.mark_mailbox_result(mailbox, success=True)
+            log(f"{email} 注册部分成功（{err_msg}），token 已存入异常清单", "yellow")
+        else:
+            mail_provider.mark_mailbox_result(mailbox, success=False, error=err_msg)
+
         cost = time.time() - start
         with stats_lock:
             stats["done"] += 1
             stats["fail"] += 1
-        log(f"任务{index} 注册失败，本次耗时{cost:.1f}s，原因: {e}", "red")
+        log(f"任务{index} 注册失败，本次耗时{cost:.1f}s，原因: {err_msg}", "red")
+        return {"ok": False, "index": index, "error": err_msg or "注册失败"}
+    except Exception as e:  # noqa: BLE001
+        try:
+            mail_provider.mark_mailbox_result(mailbox, success=False, error=e)
+        except Exception:
+            pass
+        cost = time.time() - start
+        with stats_lock:
+            stats["done"] += 1
+            stats["fail"] += 1
+        log(f"任务{index} 注册异常，本次耗时{cost:.1f}s，原因: {e}", "red")
         return {"ok": False, "index": index, "error": str(e)}
     finally:
-        # 任务结束即从「正在注册」表移除（成功/失败都不再是进行中）。
         _remove_progress(index)
-        registrar.close()

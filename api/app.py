@@ -22,12 +22,15 @@ def create_app() -> FastAPI:
         # 1) 对账清中间态（账号「排队中/激活中」→「未激活」、邮箱释放、手机预占清理）
         # 2) 续跑上次未结束的注册/激活/一键任务（各 start 内 is_alive 幂等，重复调用安全）
         # 3) 起限流账号 watcher
-        from services.recovery import startup_recover
+        from services.recovery import startup_recover, start_resource_reaper, reap_expired
         from services.register_service import register_service
         from services.activation_service import activation_service
         from services.run_service import run_service
+        reaper_stop = Event()
+        reaper_thread = None
         try:
             startup_recover()
+            reaper_thread = start_resource_reaper(reaper_stop)
             register_service.resume_if_enabled()
             activation_service.resume_if_running()
             run_service.resume_if_running()
@@ -38,6 +41,21 @@ def create_app() -> FastAPI:
         try:
             yield
         finally:
+            # 优雅关闭（SIGTERM / Ctrl+C / docker stop 会触发 lifespan shutdown）。
+            # 先停后台 reaper 避免与收尾并发；再终止在途浏览器子进程并释放其占用的资源。
+            # 注意：**不**翻动 register/activation/run 的 enabled/running，保留「下次重启自动续跑」意图。
+            reaper_stop.set()
+            if reaper_thread is not None:
+                reaper_thread.join(timeout=2)
+            try:
+                from services.register import openai_register
+                openai_register.request_stop()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[shutdown] request_stop failed: {exc}")
+            try:
+                reap_expired(None)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[shutdown] reap failed: {exc}")
             stop_event.set()
             thread.join(timeout=1)
 

@@ -146,25 +146,37 @@ class AccountService:
         except Exception:
             pass
 
-    def reconcile_stuck_activations(self) -> int:
-        """启动对账：把硬杀残留、卡在「排队中/激活中」的账号复位为「未激活」，供重启后重新激活。
+    def reconcile_stuck_activations(self, max_age: float | None = None) -> int:
+        """对账把卡在「排队中/激活中」的账号复位为「未激活」，供重新激活。
 
         清 plus_cdk/plus_task_id/plus_last_message；**保留 plus_attempts**（续着已试次数，避免无限重试）；
-        不动 plus_unavailable 及「已激活/激活失败」终态。返回复位数量。
+        不动 plus_unavailable 及「已激活/激活失败」终态。
+
+        max_age 为 None/<=0：复位所有中间态（启动对账语义，硬杀残留即时释放）。
+        max_age>0：只复位 plus_updated_at 距今超过该秒数的账号（供后台 reaper 周期回收）。
+        激活每推进一步都会经 _set_account 刷新 plus_updated_at，等于持续「续租」，故正常进行中的
+        激活不会被误伤，只有线程已死、时间戳不再刷新的僵尸态才会被回收。时间戳缺失/非法一律回收。
+        返回复位数量。
         """
         reset = 0
+        now = datetime.now(timezone.utc)
         for acct in self.list_accounts():
-            if acct.get("plus_status") in ("排队中", "激活中"):
-                token = acct.get("access_token")
-                if not token:
+            if acct.get("plus_status") not in ("排队中", "激活中"):
+                continue
+            token = acct.get("access_token")
+            if not token:
+                continue
+            if max_age is not None and max_age > 0:
+                dt = self._parse_time(acct.get("plus_updated_at"))
+                if dt is not None and (now - dt).total_seconds() < max_age:
                     continue
-                self.update_account(token, {
-                    "plus_status": "未激活",
-                    "plus_cdk": None,
-                    "plus_task_id": None,
-                    "plus_last_message": None,
-                }, quiet=True)
-                reset += 1
+            self.update_account(token, {
+                "plus_status": "未激活",
+                "plus_cdk": None,
+                "plus_task_id": None,
+                "plus_last_message": None,
+            }, quiet=True)
+            reset += 1
         return reset
 
     @staticmethod

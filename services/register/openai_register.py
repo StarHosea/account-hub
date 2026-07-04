@@ -349,9 +349,32 @@ def _spawn_worker(job: dict) -> subprocess.Popen:
     )
 
 
+def _existing_credentials(email: str) -> dict:
+    """按邮箱在号池里查已拥有账号的登录密码 + TOTP secret，供老账号加固时登录用。
+
+    邮箱已注册（重复跑 / 外部购号）走登录流程时：若该账号已开 2FA，登录会被要求验证器码；
+    有存量 secret 才能生成 TOTP 应答；有存量密码则可走密码登录（否则退回 OTP / 忘记密码）。
+    找不到返回空串（worker 侧退回 OTP + 忘记密码兜底）。
+    """
+    target = str(email or "").strip().lower()
+    if not target:
+        return {"loginPassword": "", "existingTotpSecret": ""}
+    try:
+        for acct in account_service.list_accounts():
+            if str(acct.get("email") or "").strip().lower() == target:
+                return {
+                    "loginPassword": str(acct.get("password") or ""),
+                    "existingTotpSecret": str(acct.get("totp_secret") or ""),
+                }
+    except Exception:
+        pass
+    return {"loginPassword": "", "existingTotpSecret": ""}
+
+
 def _run_browser_job(index: int, email: str, mailbox: dict, browser_proxy: str, identity) -> tuple[dict | None, str | None, dict]:
     """启动 Node 子进程跑浏览器流程，泵 NDJSON，返回 (result_data, error_msg, partial)。"""
     timeout_s = int(config.get("register_timeout") or 300)
+    creds = _existing_credentials(email)
     job = {
         "email": email,
         "proxyUrl": browser_proxy,
@@ -361,6 +384,9 @@ def _run_browser_job(index: int, email: str, mailbox: dict, browser_proxy: str, 
         "chatgptUrl": chatgpt_url,
         "timeoutMs": timeout_s * 1000,
         "locale": (str(identity.accept_language).split(",")[0] or "en-US"),
+        # 邮箱已注册时走老账号登录/加固：带上已存的登录密码 + 2FA secret（有则用，无则空）。
+        "loginPassword": creds["loginPassword"],
+        "existingTotpSecret": creds["existingTotpSecret"],
     }
     baseline = mail_provider.peek_received_at(_mail_config(), mailbox)
 
@@ -466,6 +492,16 @@ def worker(index: int) -> dict:
     set_progress_email(index, email)
     step(index, f"邮箱{verb}完成[{label}]: {email}")
 
+    # 邮箱归还状态跟踪：任何终态分支都经 _settle 记账；异常/中断等漏网路径由 finally 兜底释放，
+    # 避免中断后邮箱卡在 in_use 直到 1 小时超时或下次重启对账才回收。
+    settled = False
+
+    def _settle(*args, **kwargs):
+        nonlocal settled
+        result = mail_provider.mark_mailbox_result(*args, **kwargs)
+        settled = True
+        return result
+
     try:
         data, err_msg, partial = _run_browser_job(index, email, mailbox, browser_proxy, identity)
 
@@ -480,7 +516,7 @@ def worker(index: int) -> dict:
                     access_token=token, password=data.get("password"), eligible=False,
                 )
                 mailbox["access_token"] = token
-                mail_provider.mark_mailbox_result(mailbox, success=True)
+                _settle(mailbox, success=True)
                 cost = time.time() - start
                 with stats_lock:
                     stats["done"] += 1
@@ -495,7 +531,7 @@ def worker(index: int) -> dict:
             refresh_result = account_service.refresh_accounts([token])
             if refresh_result.get("errors"):
                 step(index, f"账号已保存，刷新状态暂未成功，稍后可重试: {refresh_result['errors']}", "yellow")
-            mail_provider.mark_mailbox_result(mailbox, success=True)
+            _settle(mailbox, success=True)
             cost = time.time() - start
             with stats_lock:
                 stats["done"] += 1
@@ -515,10 +551,10 @@ def worker(index: int) -> dict:
                 eligible=elig.get("eligible"),
             )
             mailbox["access_token"] = token
-            mail_provider.mark_mailbox_result(mailbox, success=True)
+            _settle(mailbox, success=True)
             log(f"{email} 注册部分成功（{err_msg}），token 已存入异常清单", "yellow")
         else:
-            mail_provider.mark_mailbox_result(mailbox, success=False, error=err_msg)
+            _settle(mailbox, success=False, error=err_msg)
 
         cost = time.time() - start
         with stats_lock:
@@ -528,7 +564,7 @@ def worker(index: int) -> dict:
         return {"ok": False, "index": index, "error": err_msg or "注册失败"}
     except Exception as e:  # noqa: BLE001
         try:
-            mail_provider.mark_mailbox_result(mailbox, success=False, error=e)
+            _settle(mailbox, success=False, error=e)
         except Exception:
             pass
         cost = time.time() - start
@@ -538,4 +574,11 @@ def worker(index: int) -> dict:
         log(f"任务{index} 注册异常，本次耗时{cost:.1f}s，原因: {e}", "red")
         return {"ok": False, "index": index, "error": str(e)}
     finally:
+        # 兜底：若没有任何分支给邮箱记终态（如进入/退出 try 的窄窗口异常、或非 Exception 中断），
+        # 释放邮箱占用防泄漏。释放语义由 mark_mailbox_result 内部按 success=False 处理（release+冷却）。
+        if not settled:
+            try:
+                mail_provider.mark_mailbox_result(mailbox, success=False)
+            except Exception:
+                pass
         _remove_progress(index)

@@ -169,7 +169,10 @@ class DatabaseStorageBackend(StorageBackend):
 
     def save_collection(self, name: str, items: list[dict[str, Any]]) -> None:
         """整表覆盖写命名集合，并打上种子标志。"""
-        model, key_field = self._collection_model(name)
+        try:
+            model, key_field = self._collection_model(name)
+        except ValueError:
+            return  # 未注册 collection：暂不持久化，避免崩溃
         self._save_rows(model, items, key_field)
         self._set_state_raw(self._seeded_key(name), {"seeded": True})
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -79,8 +80,9 @@ class CdkService:
         self._lock = threading.RLock()
         self._cdks: dict[str, dict] = self._load()
         # 进行中（已领取尚未出终态）的 CDK：并发激活时防止同一 CDK 被多个账号同时领用。
+        # 值为领取时刻（epoch 秒），供后台 reaper 按龄回收「进程存活期间」卡死的占用。
         # 仅内存态，不持久化——进程重启后一切以持久化的 status 为准。
-        self._reserved: set[str] = set()
+        self._reserved: dict[str, float] = {}
 
     # ----------------------------- 持久化 ----------------------------- #
 
@@ -218,19 +220,38 @@ class CdkService:
                     and item["cdk"] not in exclude
                     and item["cdk"] not in self._reserved
                 ):
-                    self._reserved.add(item["cdk"])
+                    self._reserved[item["cdk"]] = time.time()
                     return item["cdk"]
         return None
 
     def release(self, cdk: str) -> None:
         """归还一个「进行中」但未成功消耗的 CDK，使其可被其他账号再次领用（状态仍为 available）。"""
         with self._lock:
-            self._reserved.discard(str(cdk).strip())
+            self._reserved.pop(str(cdk).strip(), None)
+
+    def reconcile_reserved(self, max_age: float | None = None) -> int:
+        """回收「进行中」但已卡死的 CDK 预占（进程存活期间的兜底，不改持久化 status）。
+
+        max_age 为 None 或 <=0 时清空所有预占（启动对账语义）；否则只清领取时间超过 max_age 秒
+        的项，避免误伤仍在正常激活中的 CDK。返回回收数量。
+        """
+        with self._lock:
+            if not self._reserved:
+                return 0
+            if max_age is None or max_age <= 0:
+                count = len(self._reserved)
+                self._reserved.clear()
+                return count
+            now = time.time()
+            stale = [c for c, ts in self._reserved.items() if (now - ts) >= max_age]
+            for c in stale:
+                self._reserved.pop(c, None)
+            return len(stale)
 
     def consume(self, cdk: str, bound_token: str) -> None:
         """成功兑换：置 used 并记录绑定账号。"""
         with self._lock:
-            self._reserved.discard(str(cdk).strip())
+            self._reserved.pop(str(cdk).strip(), None)
             item = self._cdks.get(str(cdk).strip())
             if item is None:
                 return
@@ -242,7 +263,7 @@ class CdkService:
     def mark_invalid(self, cdk: str) -> None:
         """服务端 not_found：置 invalid（不再被领用）。"""
         with self._lock:
-            self._reserved.discard(str(cdk).strip())
+            self._reserved.pop(str(cdk).strip(), None)
             item = self._cdks.get(str(cdk).strip())
             if item is None:
                 return
@@ -261,7 +282,7 @@ class CdkService:
         with self._lock:
             for cdk in cdks or []:
                 key = str(cdk).strip()
-                self._reserved.discard(key)
+                self._reserved.pop(key, None)
                 item = self._cdks.get(key)
                 if item is None or item.get("status") == STATUS_AVAILABLE:
                     continue

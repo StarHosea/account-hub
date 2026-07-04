@@ -91,21 +91,40 @@ class MailboxService:
     def _save(self) -> None:
         self._storage.save_collection("mailboxes", list(self._mailboxes.values()))
 
-    def reconcile_in_use(self) -> int:
-        """启动对账：把硬杀残留、in_use=True 且 used=False 的邮箱立即复位 in_use=False、清 in_use_at。
+    def reconcile_in_use(self, max_age: float | None = None) -> int:
+        """对账回收 in_use=True 且 used=False 的邮箱：复位 in_use=False、清 in_use_at。
 
-        比 IN_USE_STALE_SECONDS(1 小时) 超时回收更快，启动即释放。不动 cooldown_until。返回复位数。
+        max_age 为 None/<=0：无条件复位（启动对账语义，硬杀残留即时释放）。
+        max_age>0：只复位 in_use_at 距今超过该秒数的占用，避免误伤仍在正常注册中的邮箱
+        （供后台 reaper 周期回收用）。占用中但时间戳缺失/非法者一律回收——否则 _is_available
+        永远判其占用而永久卡死。不动 cooldown_until。返回复位数。
         """
         with self._lock:
             n = 0
             for m in self._mailboxes.values():
-                if m.get("in_use") and not m.get("used"):
-                    m["in_use"] = False
-                    m["in_use_at"] = None
-                    n += 1
+                if not (m.get("in_use") and not m.get("used")):
+                    continue
+                if max_age is not None and max_age > 0 and not self._in_use_older_than(m, max_age):
+                    continue
+                m["in_use"] = False
+                m["in_use_at"] = None
+                n += 1
             if n:
                 self._save()
             return n
+
+    @staticmethod
+    def _in_use_older_than(item: dict, max_age: float) -> bool:
+        """in_use_at 距今是否已达 max_age 秒。时间戳缺失/非法一律视为已超期（保守回收）。"""
+        raw = str(item.get("in_use_at") or "")
+        if not raw:
+            return True
+        try:
+            ts = datetime.fromisoformat(raw)
+            ts = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+            return (datetime.now(timezone.utc) - ts).total_seconds() >= max_age
+        except Exception:
+            return True
 
     @staticmethod
     def _normalize(item: dict) -> dict | None:

@@ -525,11 +525,16 @@ export async function loginChatGPT({ page, email, chatgptUrl = 'https://chatgpt.
     }
   }
 
+  // 登录4a：先处理 2FA 验证器（TOTP）页——密码/邮箱码提交后若账号已开 2FA 会弹此页，
+  // 它也有验证码输入框，必须在「邮箱收码块」之前处理，否则会被误当邮箱码而空等取码超时。
+  const did2fa = await handleLoginTotpPrompt(page, totpSecret, log);
+
   // 收码页 → 取码填码（裸 auth 页可能需 resend 重试，最多 3 轮）。
-  // 若忘记密码已完成 / 已登录，则跳过，避免空等。
-  const codeReady = (resetPassword || isLoggedInUrl(page.url()))
+  // 若忘记密码已完成 / 已处理 2FA / 已登录，则跳过，避免空等。
+  const alreadyResolved = did2fa || Boolean(resetPassword) || isLoggedInUrl(page.url());
+  const codeReady = alreadyResolved
     ? null
-    : await firstVisible(page, `${S.CODE_INPUT}, ${S.CODE_INPUT_SEGMENTED}`, { timeout: 60000 });
+    : await firstVisible(page, `${S.CODE_INPUT}, ${S.CODE_INPUT_SEGMENTED}`, { timeout: 30000 });
   if (codeReady) {
     log('登录4：收码页就绪，取码填码');
     const code = await requestCode('login');
@@ -545,12 +550,11 @@ export async function loginChatGPT({ page, email, chatgptUrl = 'https://chatgpt.
       await submitCodeForm(page, log);
       await sleep(4000);
     }
+    // 邮箱码提交后可能再要 2FA（先邮箱验证再验证器）
+    await handleLoginTotpPrompt(page, totpSecret, log);
   } else {
-    log('登录4：未见收码页（可能凭密码已直接登录）');
+    log(did2fa ? '登录4：已处理 2FA 验证器，跳过邮箱收码' : '登录4：未见收码页（可能凭密码已直接登录）');
   }
-
-  // 登录5：若账号已开 2FA，会要求输入验证器（TOTP）码。用 totpSecret 生成并填入。
-  await handleLoginTotpPrompt(page, totpSecret, log);
 
   await waitForSuccess(page, log, 90000);
   let t = await readAccessToken(page);
@@ -606,13 +610,13 @@ export async function secureExistingChatGPT({ page, email, loginPassword = '', e
     const partial = e._secure || {};
     e._partial = {
       email,
-      // 最终密码：忘记密码重设 > step8 新设 > 原登录密码
-      password: login.resetPassword || (partial.passwordSet ? newPassword : (loginPassword || '')),
+      // 最终密码：忘记密码重设 > step8 真正新设 > 原登录密码（跳过设密码时不覆盖存量密码）
+      password: login.resetPassword || (partial.passwordNewlySet ? newPassword : (loginPassword || '')),
       passwordSet: Boolean(login.resetPassword) || partial.passwordSet || false,
-      twoFactorSecret: partial.twoFactorSecret || '',
+      twoFactorSecret: partial.twoFactorSecret || existingTotpSecret || '',
       twoFactorUri: partial.twoFactorUri || '',
       recoveryCodes: partial.recoveryCodes || [],
-      twoFactorSet: partial.twoFactorSet || false,
+      twoFactorSet: partial.twoFactorSet || Boolean(existingTotpSecret) || false,
       accessToken: login.accessToken,
       user: login.user,
       expires: login.expires,
@@ -623,10 +627,11 @@ export async function secureExistingChatGPT({ page, email, loginPassword = '', e
 
   return {
     email,
-    // 最终密码：忘记密码重设 > step8 新设 > 原登录密码
-    password: login.resetPassword || (secure.passwordSet ? newPassword : (loginPassword || '')),
+    // 最终密码：忘记密码重设 > step8 真正新设 > 原登录密码（跳过设密码时不覆盖存量密码）
+    password: login.resetPassword || (secure.passwordNewlySet ? newPassword : (loginPassword || '')),
     passwordSet: Boolean(login.resetPassword) || secure.passwordSet,
-    twoFactorSecret: secure.twoFactorSecret,
+    // 保留存量 secret：跳过开 2FA（已开且不强制重设）时 secure.twoFactorSecret 为空，别把存量抹掉
+    twoFactorSecret: secure.twoFactorSecret || existingTotpSecret || '',
     twoFactorUri: secure.twoFactorUri,
     recoveryCodes: secure.recoveryCodes,
     twoFactorSet: secure.twoFactorSet,
@@ -682,6 +687,22 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
 
   // 步骤3：密码（仅当跳转到密码页时才填；很多流程 email 后直接发码、无密码页）
   if (landing === 'password') {
+    // 老账号识别：已注册邮箱常被 OpenAI 直接送到「登录-密码」页（无"已存在"横幅）。
+    // 特征：URL 含 /log-in/ 或存在 current-password 字段 / "忘记密码"链接。此时若在注册流里
+    // 填入随机生成的新密码必然登录失败并卡死，故返回 emailExists 让 worker 走老账号加固流程
+    // （loginChatGPT：OTP 登录 / 忘记密码兜底）。
+    const looksLikeLogin = await page.evaluate(() => {
+      const url = location.href;
+      if (/\/log-in\//i.test(url)) return true;
+      const vis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
+      if (vis(document.querySelector('input[name="current-password"], input[autocomplete="current-password"]'))) return true;
+      const t = document.body?.innerText || '';
+      return /忘记了密码|忘记密码|forgot password|forgot your password/i.test(t);
+    }).catch(() => false);
+    if (looksLikeLogin) {
+      log('步骤3：密码页为「登录」形态（邮箱已注册），转入老账号（登录/加固）流程');
+      return { emailExists: true };
+    }
     log('步骤3：已进入密码页，填写密码');
     const pwdInput = await firstVisible(page, S.PASSWORD_INPUT, { timeout: 15000 });
     if (pwdInput) {
@@ -1072,7 +1093,7 @@ async function disable2fa(page, oldSecret, log) {
 }
 
 async function step8_setupPasswordAnd2FA(page, { email, password, enable2fa = true, forceReset2fa = false, existingTotpSecret = '', requestCode, log }) {
-  const out = { passwordSet: false, password, twoFactorSecret: '', twoFactorUri: '', recoveryCodes: [], twoFactorSet: false, observed: {} };
+  const out = { passwordSet: false, passwordNewlySet: false, password, twoFactorSecret: '', twoFactorUri: '', recoveryCodes: [], twoFactorSet: false, observed: {} };
   try {
     if (!/chatgpt\.com/.test(page.url())) {
       await page.goto('https://chatgpt.com/', { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
@@ -1138,6 +1159,7 @@ async function step8_setupPasswordAnd2FA(page, { email, password, enable2fa = tr
           await sleep(2500);
         }
         out.passwordSet = true;
+        out.passwordNewlySet = true;
         log('步骤8：密码已提交');
       } else {
         throw new Error('设密码失败：未找到密码输入框');

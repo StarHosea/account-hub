@@ -141,17 +141,26 @@ class PhoneService:
     def _save(self) -> None:
         self._storage.save_collection("phones", list(self._phones.values()))
 
-    def reconcile_reserved(self) -> int:
-        """启动对账：清理所有 reserved_at（发号预占是瞬时态，重启即失效）。
+    def reconcile_reserved(self, max_age: float | None = None) -> int:
+        """对账清理 reserved_at 发号预占。
 
+        max_age 为 None/<=0：清理所有预占（启动对账语义，瞬时态重启即失效）。
+        max_age>0：只清 reserved_at 距今超过该秒数的预占，避免误伤正在正常出库流程中的号
+        （供后台 reaper 周期回收用）。预占时间缺失/非法一律清理。
         不动 cooldown_until/used_count 等正常消耗态。返回清理数。
         """
+        now = datetime.now(timezone.utc)
         with self._lock:
             n = 0
             for p in self._phones.values():
-                if p.get("reserved_at"):
-                    p["reserved_at"] = None
-                    n += 1
+                if not p.get("reserved_at"):
+                    continue
+                if max_age is not None and max_age > 0:
+                    dt = _parse_dt(p.get("reserved_at"))
+                    if dt is not None and (now - dt).total_seconds() < max_age:
+                        continue
+                p["reserved_at"] = None
+                n += 1
             if n:
                 self._save()
             return n

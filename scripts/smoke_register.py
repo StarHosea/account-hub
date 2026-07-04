@@ -59,32 +59,37 @@ def main() -> int:
     stats = mailbox_service.import_text(mailbox_line)
     print(f"[smoke] 邮箱导入：{stats}，当前池：{mailbox_service.stats()}")
 
-    # 1b) 可选：指定目标邮箱，把池里其它「可用」邮箱临时标记为 used，
-    #     确保 acquire_unused 一定领到目标（避免历史遗留的测试邮箱如 a@x.com 抢先被领）。
-    target = os.getenv("SMOKE_TARGET", "").strip().lower()
-    if target:
+    # 1b) 可选：指定目标邮箱（单个 SMOKE_TARGET 或批量 SMOKE_TARGETS 逗号分隔），
+    #     把这批置回可用、其它「可用」邮箱临时置 used，确保注册机只领这批（并发测试可控）。
+    targets = [t.strip().lower() for t in os.getenv("SMOKE_TARGETS", "").split(",") if t.strip()]
+    single = os.getenv("SMOKE_TARGET", "").strip().lower()
+    if single and single not in targets:
+        targets.append(single)
+    if targets:
         mailbox_service.reconcile_in_use()
-        # 可选：目标邮箱之前已 used（跑过一轮），置回可用以便重测（走老账号加固路径）。
+        # 目标批次置回可用（清 used/token/in_use），以便重复测试（已注册的走老账号加固路径）。
         if _env_bool("SMOKE_RELEASE_TARGET", False):
-            mailbox_service.mark_used([target], False)
+            mailbox_service.mark_used(targets, False)
         others = []
         for m in mailbox_service.list_mailboxes():
             email = str(m.get("email") or "").lower()
             avail = (not m.get("used")) and (not m.get("in_use"))
-            if avail and email != target:
+            if avail and email not in targets:
                 others.append(m.get("email"))
         if others:
             mailbox_service.mark_used(others, True)
-        # 目标本身释放为可用（清 cooldown / in_use）
-        mailbox_service.release(target)
-        print(f"[smoke] 目标邮箱={target}；其它可用邮箱临时置 used {len(others)} 个，当前池：{mailbox_service.stats()}")
+        for t in targets:
+            mailbox_service.release(t)  # 清 cooldown / in_use
+        print(f"[smoke] 目标批次={len(targets)} 个：{targets}；其它可用邮箱临时置 used {len(others)} 个，当前池：{mailbox_service.stats()}")
 
-    # 2) 配置注册机：只跑 1 号、单线程、用你的代理
+    # 2) 配置注册机：total/threads 支持并发测试
     regions = [r.strip() for r in os.getenv("SMOKE_REGIONS", "US").split(",") if r.strip()] or ["US"]
+    total = max(1, int(os.getenv("SMOKE_TOTAL", "1")))
+    threads = max(1, int(os.getenv("SMOKE_THREADS", "1")))
     updates = {
         "proxy": proxy,
-        "total": 1,
-        "threads": 1,
+        "total": total,
+        "threads": threads,
         "regions": regions,
         "enable_2fa": _env_bool("SMOKE_ENABLE_2FA", True),
         "ipweb_rotate": _env_bool("SMOKE_IPWEB_ROTATE", True),
@@ -92,7 +97,7 @@ def main() -> int:
         "register_timeout": int(os.getenv("SMOKE_TIMEOUT", "360")),
     }
     register_service.update(updates)
-    print(f"[smoke] 注册机配置：total=1 threads=1 regions={regions} ipweb_rotate={updates['ipweb_rotate']} "
+    print(f"[smoke] 注册机配置：total={total} threads={threads} regions={regions} ipweb_rotate={updates['ipweb_rotate']} "
           f"headless={updates['headless']} enable_2fa={updates['enable_2fa']} 代理={'有' if proxy else '无'}")
 
     # 3) 启动并跟日志/进度直到结束

@@ -444,6 +444,61 @@ async function forgotPasswordFlow({ page, email, requestCode, log }) {
   if (page.url() === beforeSet) await clickButtonRobust(page, /继续|保存|重置|确认|continue|save|reset|confirm/i, { timeout: 8000 });
   await sleep(3500);
   await snapshot(page, 'forgot-04-after-set', log);
+
+  // 5) 重设成功页（/reset-password/success）不会自动登录：需点"登录"回登录页，再用新密码登录。
+  //    每次跳转后先 waitForAuthReady 等页面 hydrate 完成再操作（避免点击/输入落空）。
+  await waitForAuthReady(page);
+  const onResetDone = /reset-password\/success/i.test(page.url())
+    || await page.evaluate(() => /重置.*成功|密码.*(已|修改|重置).*成功|password.*(reset|changed|updated)/i.test(document.body?.innerText || '')).catch(() => false);
+  if (onResetDone || /reset-password/i.test(page.url())) {
+    log(`忘记密码4：密码已重设（${page.url()}），点"登录"回到登录页`);
+    const movedLogin = await clickButtonRobust(page, /^登录$|登 ?录|log ?in|sign ?in/i, { timeout: 8000, tries: 3 });
+    if (!movedLogin || !/\/log-in/i.test(page.url())) {
+      // 兜底：直接点 href 指向 /log-in 的链接
+      await page.evaluate(() => {
+        const a = [...document.querySelectorAll('a')].find((x) => /\/log-in/i.test(x.getAttribute('href') || ''));
+        if (a) a.click();
+      }).catch(() => {});
+      await page.waitForFunction(() => /\/log-in/i.test(location.href), { timeout: 8000 }).catch(() => {});
+    }
+    await waitForAuthReady(page);
+  }
+
+  // 6) 登录页用刚设的新密码登录（session 记得邮箱，通常直达 /log-in/password）。
+  //    2FA / 最终成功由 loginChatGPT 后续 handleLoginTotpPrompt + waitForSuccess 接管。
+  if (/\/log-in\/password/i.test(page.url())) {
+    const pwd = await firstVisible(page, S.PASSWORD_INPUT, { timeout: 12000 });
+    if (pwd) {
+      log('忘记密码5：登录页用新密码登录');
+      await humanType(pwd, newPassword);
+      const beforeLogin = page.url();
+      await pwd.press('Enter').catch(() => {});
+      await page.waitForFunction((u) => location.href !== u, beforeLogin, { timeout: 8000 }).catch(() => {});
+      if (page.url() === beforeLogin) {
+        await humanClickByText(page, ['继续', 'continue', '登录', 'log in', 'sign in'], { timeout: 6000, exclude: OAUTH_EXCLUDE }).catch(() => {});
+        await page.waitForFunction((u) => location.href !== u, beforeLogin, { timeout: 8000 }).catch(() => {});
+      }
+      await sleep(2500);
+    }
+  } else if (/\/log-in(\/|$|\?)/i.test(page.url())) {
+    // 兜底：落到邮箱输入页 → 重填邮箱再进密码页登录
+    const emailInput = await firstVisible(page, S.EMAIL_INPUT, { timeout: 8000 });
+    if (emailInput) {
+      await humanType(emailInput, email);
+      await humanClickByText(page, S.CONTINUE_TEXTS, { timeout: 8000, exclude: OAUTH_EXCLUDE }).catch(() => {});
+      await waitForAuthReady(page);
+      const pwd2 = await firstVisible(page, S.PASSWORD_INPUT, { timeout: 12000 });
+      if (pwd2) {
+        log('忘记密码5b：重填邮箱后用新密码登录');
+        await humanType(pwd2, newPassword);
+        const b2 = page.url();
+        await pwd2.press('Enter').catch(() => {});
+        await page.waitForFunction((u) => location.href !== u, b2, { timeout: 8000 }).catch(() => {});
+        await sleep(2500);
+      }
+    }
+  }
+  await snapshot(page, 'forgot-06-after-relogin', log);
   return newPassword;
 }
 
@@ -455,6 +510,7 @@ export async function loginChatGPT({ page, email, chatgptUrl = 'https://chatgpt.
   // 快路径：若调用前页面已停在 auth 登录密码页（注册流程检测到"邮箱已注册"后直接转来），
   // 跳过重开官网 / 重点登录 / 重填邮箱，直接在当前密码页登录，节省一整轮邮箱输入。
   if (/auth\.openai\.com\/log-in\/password/i.test(page.url())) {
+    await waitForAuthReady(page); // 等页面 hydrate 完成再判定/操作，稳定性
     const pwdReady = await firstVisible(page, S.PASSWORD_INPUT, { timeout: 3000 });
     if (pwdReady) {
       log('登录1：已在登录密码页（承接注册流程），跳过重开官网/重填邮箱，直接填密码');

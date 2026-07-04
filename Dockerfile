@@ -30,7 +30,8 @@ WORKDIR /app
 # - git: Git 存储后端需要
 # - libpq-dev: PostgreSQL 客户端库
 # - gcc: 编译 psycopg2-binary 需要
-# - xvfb + Chromium 运行库/字体: CloakBrowser 浏览器注册引擎在 Linux 上以「Xvfb 有头」运行
+# - xvfb + xdotool + Chromium 运行库/多语言字体: CloakBrowser 浏览器注册引擎在 Linux 上以「Xvfb 有头」运行
+#   （系统库/字体对齐 CloakBrowser 官方 Dockerfile，避免有头 Chromium 缺库/缺字体导致启动失败或指纹异常）
 # - nodejs 20 (NodeSource): 运行 node_engine（playwright-core >=1.53 需较新 Node）
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
@@ -40,11 +41,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     gnupg \
-    xvfb \
-    libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
-    libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 \
-    libasound2 libpangocairo-1.0-0 libpango-1.0-0 libcairo2 libatspi2.0-0 \
-    libxshmfence1 fonts-liberation fonts-noto-color-emoji \
+    xvfb xdotool \
+    libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdbus-1-3 libdrm2 \
+    libxkbcommon0 libatspi2.0-0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 \
+    libpango-1.0-0 libpangocairo-1.0-0 libcairo2 libcairo-gobject2 libasound2 \
+    libx11-6 libx11-xcb1 libxcb1 libxext6 libxshmfence1 libfontconfig1 \
+    libglib2.0-0 libgtk-3-0 libgdk-pixbuf-2.0-0 libxss1 libxtst6 \
+    fonts-liberation fonts-noto-color-emoji fonts-unifont fonts-freefont-ttf \
+    fonts-ipafont-gothic fonts-wqy-zenhei fonts-tlwg-loma-otf \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*

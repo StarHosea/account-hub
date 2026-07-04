@@ -1164,6 +1164,70 @@ async function openSettings(page, log) {
   return clicked;
 }
 
+// 检测安全tab是否已成功打开（密码设置相关元素是否可见）
+async function waitForSecurityTabReady(page, { timeout = 20000 } = {}) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    const ready = await page.evaluate(() => {
+      const vis = (el) => {
+        if (!el) return false;
+        const r = el.getBoundingClientRect();
+        const s = getComputedStyle(el);
+        return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+      };
+      // 检测密码相关行或Authenticator相关行是否可见
+      const rows = [...document.querySelectorAll('div, li, section')].filter(vis);
+      const hasPasswordRow = rows.some((el) => {
+        const txt = (el.innerText || '').trim();
+        return txt.length < 200 && /密码|password/i.test(txt) && !/设置密码|create password|set password/i.test(txt);
+      });
+      const hasAuthRow = rows.some((el) => {
+        const txt = (el.innerText || '').trim();
+        return txt.length < 200 && /authenticator|验证器应用|身份验证器/i.test(txt);
+      });
+      return hasPasswordRow || hasAuthRow;
+    }).catch(() => false);
+
+    if (ready) return true;
+    await sleep(500);
+  }
+  return false;
+}
+
+// 打开设置并进入安全tab，带重试逻辑
+async function openSecurityTab(page, log, { maxRetries = 3 } = {}) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    log(`步骤8：尝试打开安全tab（第 ${attempt}/${maxRetries} 次）`);
+
+    // 打开设置
+    await openSettings(page, log);
+
+    // 点击安全tab
+    const secTab = await humanClickByText(page, ['账户安全与登录', '帐户安全与登录', 'security', 'account security'], { timeout: 6000 }).catch(() => null);
+    log(`步骤8：点击安全tab「${secTab || '未命中'}」`);
+    await sleep(1800);
+
+    // 检测是否真正切换成功
+    const ready = await waitForSecurityTabReady(page, { timeout: 20000 });
+    if (ready) {
+      log(`步骤8：安全tab已成功打开（第 ${attempt} 次尝试）`);
+      return true;
+    }
+
+    log(`步骤8：安全tab未正确显示（第 ${attempt} 次），密码设置元素未出现`);
+
+    // 如果不是最后一次尝试，则刷新页面重试
+    if (attempt < maxRetries) {
+      log('步骤8：刷新页面准备重试');
+      await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+      await sleep(3000);
+      await dismissWelcomeOverlays(page, log);
+    }
+  }
+
+  throw new Error(`打开安全tab失败：尝试 ${maxRetries} 次后仍无法显示密码设置元素`);
+}
+
 // 停用已启用的 Authenticator 2FA（强制重设时先调用）。
 async function disable2fa(page, oldSecret, log) {
   let hit = await clickMarked(page, findRowSwitch, { kw: 'authenticator|验证器应用|身份验证器' });
@@ -1216,13 +1280,8 @@ async function step8_setupPasswordAnd2FA(page, { email, password, enable2fa = tr
 
     await dismissWelcomeOverlays(page, log);
 
-    log('步骤8：打开设置');
-    await openSettings(page, log);
-    await dumpUi(page, '01-settings', log);
-
-    const secTab = await humanClickByText(page, ['账户安全与登录', '帐户安全与登录', 'security', 'account security'], { timeout: 6000 }).catch(() => null);
-    log(`步骤8：进入安全 tab「${secTab || '未命中'}」`);
-    await sleep(1800);
+    log('步骤8：打开设置并进入安全tab');
+    await openSecurityTab(page, log);
     await dumpUi(page, '02-security', log);
 
     // —— 设密码 ——（幂等：已设过则跳过）
@@ -1308,10 +1367,7 @@ async function step8_setupPasswordAnd2FA(page, { email, password, enable2fa = tr
         await sleep(2500);
       }
       await dismissWelcomeOverlays(page, log);
-      await openSettings(page, log);
-      const secTab2 = await humanClickByText(page, ['账户安全与登录', '帐户安全与登录', 'security', 'account security'], { timeout: 6000 }).catch(() => null);
-      log(`步骤8：重进安全 tab「${secTab2 || '未命中'}」`);
-      await sleep(1800);
+      await openSecurityTab(page, log);
     }
     await dumpUi(page, '04b-security-again', log);
 

@@ -153,6 +153,8 @@ export default function AccountsPage() {
   const debouncedQuery = useDebouncedValue(query, 300);
   const [statusFilter, setStatusFilter] = useState<"" | "valid" | "dead" | "unavailable">("valid");
   const [planFilter, setPlanFilter] = useState<"" | "free" | "plus">("");
+  // 激活态筛选：默认「全部」，展示注册/导入入库的所有账号；可切到「已激活」等仅看对应状态。
+  const [activationFilter, setActivationFilter] = useState<"" | "activated" | "pending" | "activating" | "failed" | "review">("");
   const [usedFilter, setUsedFilter] = useState<"" | "used" | "unused">("");
 
   const [editTarget, setEditTarget] = useState<Account | null>(null);
@@ -188,8 +190,8 @@ export default function AccountsPage() {
     avail:
       statusFilter === "valid" ? "available" : statusFilter === "unavailable" ? "unavailable" : undefined,
     plan: planFilter || undefined,
-    // 账号管理只承载「激活成功」账号：列表恒按已激活过滤（待激活/激活中/失败账号由激活器处理，不在此页展示）。
-    activation: "activated",
+    // 激活态由筛选控制，默认「全部」：注册/导入入库的账号（含未激活）都会展示，与统计卡口径一致。
+    activation: activationFilter || undefined,
     used: usedFilter ? usedFilter === "used" : undefined,
     page,
     page_size: PAGE_SIZE,
@@ -215,7 +217,7 @@ export default function AccountsPage() {
   useEffect(() => {
     void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [debouncedQuery, statusFilter, planFilter, usedFilter, page]);
+  }, [debouncedQuery, statusFilter, planFilter, activationFilter, usedFilter, page]);
 
   // 激活 / 一键运行进行中时，号池要能实时看到每个账号的激活进度：页面可见且无进行中操作时轻量轮询。
   useEffect(() => {
@@ -884,6 +886,22 @@ export default function AccountsPage() {
         ]}
       />
       <Select
+        value={activationFilter}
+        onChange={(v) => {
+          setActivationFilter((v as "" | "activated" | "pending" | "activating" | "failed" | "review") ?? "");
+          setPage(1);
+        }}
+        style={{ width: isMobile ? "100%" : 130 }}
+        optionList={[
+          { label: "全部激活", value: "" },
+          { label: "待激活", value: "pending" },
+          { label: "已激活", value: "activated" },
+          { label: "激活中", value: "activating" },
+          { label: "激活失败", value: "failed" },
+          { label: "需核查", value: "review" },
+        ]}
+      />
+      <Select
         value={usedFilter}
         onChange={(v) => {
           setUsedFilter((v as "" | "used" | "unused") ?? "");
@@ -899,7 +917,7 @@ export default function AccountsPage() {
     </>
   );
   const activeFilterCount =
-    (query.trim() ? 1 : 0) + (statusFilter ? 1 : 0) + (planFilter ? 1 : 0) + (usedFilter ? 1 : 0);
+    (query.trim() ? 1 : 0) + (statusFilter ? 1 : 0) + (planFilter ? 1 : 0) + (activationFilter ? 1 : 0) + (usedFilter ? 1 : 0);
 
   return (
     <div>

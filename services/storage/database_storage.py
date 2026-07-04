@@ -158,7 +158,10 @@ class DatabaseStorageBackend(StorageBackend):
 
     def load_collection(self, name: str) -> list[dict[str, Any]] | None:
         """加载命名集合。空表且未打过种子标志 → 返回 None（触发种子迁移）；否则返回列表。"""
-        model, _ = self._collection_model(name)
+        try:
+            model, _ = self._collection_model(name)
+        except ValueError:
+            return None  # 未注册 collection：视为暂无此表，触发初始化而非崩溃
         rows = self._load_rows(model)
         if rows:
             return rows
@@ -169,7 +172,10 @@ class DatabaseStorageBackend(StorageBackend):
 
     def save_collection(self, name: str, items: list[dict[str, Any]]) -> None:
         """整表覆盖写命名集合，并打上种子标志。"""
-        model, key_field = self._collection_model(name)
+        try:
+            model, key_field = self._collection_model(name)
+        except ValueError:
+            return  # 未注册 collection：暂不持久化
         self._save_rows(model, items, key_field)
         self._set_state_raw(self._seeded_key(name), {"seeded": True})
 

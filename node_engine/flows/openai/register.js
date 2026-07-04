@@ -450,32 +450,46 @@ async function forgotPasswordFlow({ page, email, requestCode, log }) {
 // 老账号登录（OTP 收码登录）。验证码通过 requestCode('login') 向 Python 请求。
 // totpSecret：若账号已开 2FA，登录后会要求验证器码，传入 secret 则自动生成 TOTP 填入。
 export async function loginChatGPT({ page, email, chatgptUrl = 'https://chatgpt.com/', password = '', totpSecret = '', requestCode, log }) {
-  log('登录1：打开 ChatGPT 官网');
-  await openWithRetry(page, chatgptUrl, log);
-  await sleep(2500);
+  let landing = null;
 
-  if (isLoggedInUrl(page.url())) {
-    const t0 = await readAccessToken(page);
-    if (t0.accessToken) { log('登录：已是登录态'); return { accessToken: t0.accessToken, user: t0.user, expires: t0.expires }; }
-  }
-
-  log('登录2：进入登录入口');
-  let emailInput = await firstVisible(page, S.EMAIL_INPUT, { timeout: 2500 });
-  for (let attempt = 1; attempt <= 3 && !emailInput; attempt += 1) {
-    const clicked = await humanClickByText(page, ['登录', 'log in', 'login', 'sign in', 'ログイン'], { timeout: 15000, exclude: OAUTH_EXCLUDE });
-    log(`登录2：点击登录入口「${clicked || '未命中'}」（第 ${attempt} 次），等待邮箱框…`);
-    emailInput = await firstVisible(page, S.EMAIL_INPUT, { timeout: 20000 });
-    if (!emailInput) {
-      await humanClickByText(page, ['continue with email', 'use email', '使用邮箱', 'メールで続ける'], { timeout: 6000, exclude: OAUTH_EXCLUDE });
-      emailInput = await firstVisible(page, S.EMAIL_INPUT, { timeout: 10000 });
+  // 快路径：若调用前页面已停在 auth 登录密码页（注册流程检测到"邮箱已注册"后直接转来），
+  // 跳过重开官网 / 重点登录 / 重填邮箱，直接在当前密码页登录，节省一整轮邮箱输入。
+  if (/auth\.openai\.com\/log-in\/password/i.test(page.url())) {
+    const pwdReady = await firstVisible(page, S.PASSWORD_INPUT, { timeout: 3000 });
+    if (pwdReady) {
+      log('登录1：已在登录密码页（承接注册流程），跳过重开官网/重填邮箱，直接填密码');
+      landing = 'password';
     }
   }
-  if (!emailInput) { await snapshot(page, 'login-no-email', log); throw new Error('登录：未找到邮箱输入框'); }
 
-  await humanType(emailInput, email);
-  log(`登录2：已填邮箱 ${email}，点继续`);
-  await humanClickByText(page, S.CONTINUE_TEXTS, { timeout: 12000, exclude: OAUTH_EXCLUDE });
-  const landing = await waitForPostEmailLanding(page, log, { timeoutMs: 120000 });
+  if (landing === null) {
+    log('登录1：打开 ChatGPT 官网');
+    await openWithRetry(page, chatgptUrl, log);
+    await sleep(2500);
+
+    if (isLoggedInUrl(page.url())) {
+      const t0 = await readAccessToken(page);
+      if (t0.accessToken) { log('登录：已是登录态'); return { accessToken: t0.accessToken, user: t0.user, expires: t0.expires }; }
+    }
+
+    log('登录2：进入登录入口');
+    let emailInput = await firstVisible(page, S.EMAIL_INPUT, { timeout: 2500 });
+    for (let attempt = 1; attempt <= 3 && !emailInput; attempt += 1) {
+      const clicked = await humanClickByText(page, ['登录', 'log in', 'login', 'sign in', 'ログイン'], { timeout: 15000, exclude: OAUTH_EXCLUDE });
+      log(`登录2：点击登录入口「${clicked || '未命中'}」（第 ${attempt} 次），等待邮箱框…`);
+      emailInput = await firstVisible(page, S.EMAIL_INPUT, { timeout: 20000 });
+      if (!emailInput) {
+        await humanClickByText(page, ['continue with email', 'use email', '使用邮箱', 'メールで続ける'], { timeout: 6000, exclude: OAUTH_EXCLUDE });
+        emailInput = await firstVisible(page, S.EMAIL_INPUT, { timeout: 10000 });
+      }
+    }
+    if (!emailInput) { await snapshot(page, 'login-no-email', log); throw new Error('登录：未找到邮箱输入框'); }
+
+    await humanType(emailInput, email);
+    log(`登录2：已填邮箱 ${email}，点继续`);
+    await humanClickByText(page, S.CONTINUE_TEXTS, { timeout: 12000, exclude: OAUTH_EXCLUDE });
+    landing = await waitForPostEmailLanding(page, log, { timeoutMs: 120000 });
+  }
 
   // 老账号可能有密码页：有密码就登录；密码错/无密码/提交卡住 →
   // 先尝试"改用验证码"(OTP)，仍不行则走"忘记密码"重设兜底（绕开不响应的 Remix 密码表单）。
@@ -525,9 +539,14 @@ export async function loginChatGPT({ page, email, chatgptUrl = 'https://chatgpt.
     }
   }
 
+  // 登录4a：先处理 2FA 验证器（TOTP）页——密码提交后若账号已开 2FA 会弹此页（URL /mfa-challenge/），
+  // 它也有验证码输入框，必须在"邮箱收码块"之前处理，否则会被误当邮箱码而去等永远不来的邮件（空等超时）。
+  const did2fa = await handleLoginTotpPrompt(page, totpSecret, log);
+
   // 收码页 → 取码填码（裸 auth 页可能需 resend 重试，最多 3 轮）。
-  // 若忘记密码已完成 / 已登录，则跳过，避免空等。
-  const codeReady = (resetPassword || isLoggedInUrl(page.url()))
+  // 若已处理 2FA / 已登录 / 忘记密码已完成，则跳过，避免空等。
+  const alreadyResolved = did2fa || isLoggedInUrl(page.url()) || Boolean(resetPassword);
+  const codeReady = alreadyResolved
     ? null
     : await firstVisible(page, `${S.CODE_INPUT}, ${S.CODE_INPUT_SEGMENTED}`, { timeout: 60000 });
   if (codeReady) {
@@ -545,12 +564,11 @@ export async function loginChatGPT({ page, email, chatgptUrl = 'https://chatgpt.
       await submitCodeForm(page, log);
       await sleep(4000);
     }
+    // 邮箱码之后可能再要 2FA（部分账号先邮箱验证再验证器）
+    await handleLoginTotpPrompt(page, totpSecret, log);
   } else {
-    log('登录4：未见收码页（可能凭密码已直接登录）');
+    log('登录4：未见邮箱收码页（已登录/已处理2FA/密码直登）');
   }
-
-  // 登录5：若账号已开 2FA，会要求输入验证器（TOTP）码。用 totpSecret 生成并填入。
-  await handleLoginTotpPrompt(page, totpSecret, log);
 
   await waitForSuccess(page, log, 90000);
   let t = await readAccessToken(page);
@@ -561,31 +579,71 @@ export async function loginChatGPT({ page, email, chatgptUrl = 'https://chatgpt.
 }
 
 // 登录时若弹出"输入验证器验证码"(2FA TOTP)页，用 secret 生成 6 位码填入。
+// 判定以 URL path /mfa-challenge/ 为主，辅以 #totp_otp / 验证器·一次性密码 文案。
+// - 确在 2FA 页但无 secret → 明确抛错（无法自动通过，快速失败而非去空等永不到来的邮箱码）。
+// - 填码后仍停在 2FA 页 → 抛"2FA 密钥不正确"（存储 secret 与账号不匹配）。
+// 返回 true=已处理并通过 2FA；false=当前不是 2FA 页（无需处理）。
 async function handleLoginTotpPrompt(page, totpSecret, log) {
-  if (!totpSecret) return false;
   try {
     let isTotp = false;
     for (let i = 0; i < 8; i += 1) {
       isTotp = await page.evaluate(() => {
         const vis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
+        // 2FA 验证器登录页 URL 为 /mfa-challenge/...（path 为最确定信号）
+        if (/\/mfa-challenge\//i.test(location.href)) return true;
         if (vis(document.querySelector('#totp_otp, input[name="totp_otp"]'))) return true;
         const t = document.body?.innerText || '';
-        return /验证器应用|输入验证器|authenticator app|two-factor|双重验证|输入.*一次性/i.test(t) && vis(document.querySelector('input'));
+        // "验证你的身份 / 一次性验证码 / 一次性密码程序 / 验证器应用 / authenticator"
+        return /验证器应用|输入验证器|authenticator|two-factor|双重验证|验证你的身份|一次性验证码|一次性密码/i.test(t) && vis(document.querySelector('input'));
       }).catch(() => false);
       if (isTotp) break;
-      if (isLoggedInUrl(page.url())) return false;
+      if (isLoggedInUrl(page.url())) return false; // 已登录，无需 2FA
       await sleep(800);
     }
     if (!isTotp) return false;
+
+    // 确在 2FA 页：无 secret 无法自动通过 → 快速明确失败（不再去空等邮箱码）
+    if (!totpSecret) {
+      throw new Error('账号已开启 2FA，但本地没有该账号的 2FA 密钥(totp_secret)，无法自动通过验证器登录');
+    }
+
+    await snapshot(page, 'login-2fa-page', log);
     const code = generateTotpNow(totpSecret);
-    log(`登录5：检测到 2FA 验证器页，用 secret 生成 TOTP=${code} 填入`);
-    const totpInput = await firstVisible(page, '#totp_otp, input[name="totp_otp"]', { timeout: 3000 });
-    if (totpInput) await humanType(totpInput, code);
+    log(`登录5：检测到 2FA 验证器页，用 secret 生成 TOTP 填入`);
+    const before = page.url();
+    // 2FA 页输入框：#totp_otp 或 name=code（inputmode=numeric），优先具体选择器
+    const totpInput = await firstVisible(page, '#totp_otp, input[name="totp_otp"], input[name="code"][inputmode="numeric"], input[name="code"]', { timeout: 3000 });
+    if (totpInput) { await humanType(totpInput, code); await totpInput.press('Enter').catch(() => {}); }
     else await fillCode(page, code, log);
-    await humanClickByText(page, ['继续', 'confirm', 'verify', '确认', '验证', 'continue', 'next', '下一步'], { timeout: 5000, exclude: OAUTH_EXCLUDE });
-    await sleep(3500);
+    await page.waitForFunction((u) => location.href !== u, before, { timeout: 5000 }).catch(() => {});
+    if (page.url() === before) {
+      await humanClickByText(page, ['继续', 'confirm', 'verify', '确认', '验证', 'continue', 'next', '下一步'], { timeout: 5000, exclude: OAUTH_EXCLUDE }).catch(() => {});
+      await page.waitForFunction((u) => location.href !== u, before, { timeout: 6000 }).catch(() => {});
+    }
+    if (page.url() === before) {
+      await page.evaluate(() => { const f = document.querySelector('input')?.closest('form'); if (f) (f.requestSubmit ? f.requestSubmit() : f.submit()); }).catch(() => {});
+    }
+    await sleep(2000);
+
+    // 校验 TOTP 是否被接受：轮询几秒等跳转；仍停在 2FA 页 → 密钥不匹配，明确报错
+    let stillOn2fa = true;
+    for (let i = 0; i < 6; i += 1) {
+      if (isLoggedInUrl(page.url())) { stillOn2fa = false; break; }
+      stillOn2fa = await page.evaluate(() => {
+        const vis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
+        if (/\/mfa-challenge\//i.test(location.href)) return true;
+        return vis(document.querySelector('#totp_otp, input[name="totp_otp"]'));
+      }).catch(() => false);
+      if (!stillOn2fa) break;
+      await sleep(1000);
+    }
+    if (stillOn2fa) {
+      throw new Error('2FA 密钥不正确：用存储的 2FA 密钥(totp_secret)生成的验证码被拒，密钥与账号不匹配');
+    }
     return true;
   } catch (e) {
+    // 明确的 2FA 失败（无密钥 / 密钥不正确）往上抛，让整轮以清晰原因失败；其余异常按原逻辑吞掉
+    if (/2FA|totp_secret|验证器|密钥/i.test(String(e && e.message))) throw e;
     log(`登录5：2FA 处理异常：${e.message}`);
     return false;
   }
@@ -676,8 +734,24 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
   // 邮箱已存在检测：不再抛错，返回标记让 worker 走"老账号"分流
   const afterEmailText = await pageText(page);
   if (S.EMAIL_EXISTS_PATTERN.test(afterEmailText)) {
-    log('步骤2：检测到邮箱已注册，转入老账号（登录）流程');
+    log('步骤2：检测到邮箱已注册（页面文案），转入老账号（登录→按需忘记密码）流程');
     return { emailExists: true };
+  }
+
+  // 落到"密码页"需区分：注册的「创建密码」页 vs 已注册账号的「登录密码」页。
+  // 已注册账号若继续填随机注册密码会卡死（密码错、无法前进，等验证码页 120s 超时）——
+  // 应转 worker 的老账号分流：用本地存储密码登录，密码错再走忘记密码重设。
+  // 判据：URL 命中 /log-in/，或页面出现"忘记了密码/forgot password"链接（创建密码页没有）。
+  if (landing === 'password') {
+    const looksLikeLogin = await page.evaluate(() => {
+      if (/\/log-in(\/|$|\?|#)/i.test(location.href)) return true;
+      const t = document.body?.innerText || '';
+      return /忘记了密码|忘记密码|forgot password|欢迎回来|welcome back/i.test(t);
+    }).catch(() => false);
+    if (looksLikeLogin) {
+      log(`步骤2：落到登录密码页（邮箱已注册），转入老账号（登录→按需忘记密码）流程，URL=${page.url()}`);
+      return { emailExists: true };
+    }
   }
 
   // 步骤3：密码（仅当跳转到密码页时才填；很多流程 email 后直接发码、无密码页）
@@ -709,7 +783,7 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
 
   const afterCodeText = await pageText(page);
   if (S.INVALID_CODE_PATTERN.test(afterCodeText)) {
-    throw new Error(`验证码无效：${code}`);
+    throw new Error('验证码无效');
   }
 
   // 步骤5：资料（姓名 + 生日）
@@ -738,7 +812,7 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
     await submitCodeForm(page, log);
     await sleep(4000);
     const bad = await pageText(page);
-    if (S.INVALID_CODE_PATTERN.test(bad)) throw new Error(`二次验证码无效：${code2}`);
+    if (S.INVALID_CODE_PATTERN.test(bad)) throw new Error('二次验证码无效');
   }
 
   // 步骤6：等待注册成功
@@ -809,17 +883,17 @@ async function fillCode(page, code, log) {
       await cell.pressSequentially(code[i], { delay: 80 }).catch(() => {});
       await sleep(80 + Math.floor(Math.random() * 120));
     }
-    log(`已按分格模拟输入验证码 ${code}`);
+    log('已按分格模拟输入验证码');
     return;
   }
   const single = await firstVisible(page, S.CODE_INPUT, { timeout: 8000 });
   if (single) {
     await humanType(single, code);
-    log(`已模拟输入验证码 ${code}`);
+    log('已模拟输入验证码');
     return;
   }
   await page.keyboard.type(code, { delay: 80 });
-  log(`已通过键盘输入验证码 ${code}`);
+  log('已通过键盘输入验证码');
 }
 
 // 提交验证码表单：先在框内按 Enter，再点"继续"兜底，最后原生 form.requestSubmit()。
@@ -1048,7 +1122,7 @@ async function disable2fa(page, oldSecret, log) {
     }).catch(() => false);
     if (needTotp && oldSecret) {
       const code = generateTotpNow(oldSecret);
-      log(`步骤8：停用需当前验证器码，用旧 secret 生成 TOTP=${code}`);
+      log(`步骤8：停用需当前验证器码，用旧 secret 生成 TOTP`);
       const inp = await firstVisible(page, '#totp_otp, input[name="totp_otp"], input[inputmode="numeric"], input[type="text"]', { timeout: 3000 });
       if (inp) await humanType(inp, code);
     }
@@ -1239,7 +1313,7 @@ async function step8_setupPasswordAnd2FA(page, { email, password, enable2fa = tr
     out.twoFactorSecret = secretInfo.key || '';
     out.twoFactorUri = secretInfo.uri || '';
     const code = generateTotpNow(secret);
-    log(`步骤8：用 secret 生成 TOTP=${code}，回填确认`);
+    log(`步骤8：用 secret 生成 TOTP，回填确认`);
     const codeBox = await firstVisible(page, `${S.CODE_INPUT}, ${S.CODE_INPUT_SEGMENTED}`, { timeout: 6000 });
     if (!codeBox) throw new Error('开2FA失败：未找到 TOTP 确认输入框');
     await fillCode(page, code, log);

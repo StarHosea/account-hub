@@ -492,8 +492,9 @@ def peek_received_at(mail_config: dict, mailbox: dict) -> datetime | None:
 _RELEASE_COOLDOWN_SECONDS = 120
 
 # 「邮箱疑似已注册过账号」的失败特征：命中则永久标坏邮箱，不再领用。
-# invalid_auth_step = platform authorize 落到登录页（该邮箱已存在账号），继续提交注册必失败。
-_BAD_MAILBOX_MARKERS = ("invalid_auth_step", "invalid authorization step", "already exists", "email_exists")
+# 通用兜底：浏览器引擎正常会用 emailExists 在流程内分流，不走这里；此标记仅防
+# 引擎抛出含「已存在」字样的失败时把邮箱回收。
+_BAD_MAILBOX_MARKERS = ("already exists", "email_exists")
 
 
 def _is_bad_mailbox_error(error: Exception | str | None) -> bool:
@@ -504,7 +505,7 @@ def _is_bad_mailbox_error(error: Exception | str | None) -> bool:
 def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str | None = None) -> None:
     """注册流程结束后更新邮箱池状态（仅 API 邮箱池）：
     - 成功：绑定账号并标 used；
-    - 邮箱疑似已注册（invalid_auth_step 等）：标坏邮箱（used=True），不再领用；
+    - 邮箱疑似已注册（命中 _BAD_MAILBOX_MARKERS）：标坏邮箱（used=True），不再领用；
     - 其它（环境类）失败：释放并短暂冷却，避免下个任务立刻重领同一邮箱空转。
 
     CloudMail 为按需生成地址、非池化，无需回写状态。

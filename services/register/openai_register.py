@@ -349,6 +349,25 @@ def _spawn_worker(job: dict) -> subprocess.Popen:
     )
 
 
+def _lookup_stored_credentials(email: str) -> tuple[str, str]:
+    """按 email 查本地账号库，返回 (password, totp_secret)；查不到返回 ('', '')。
+    注册时若邮箱已注册（落到登录页），worker 会用这里注入的密码先尝试登录，
+    密码错再走忘记密码重设——满足"有存储密码优先密码登录"的要求。"""
+    target = str(email or "").strip().lower()
+    if not target:
+        return "", ""
+    try:
+        for acc in account_service.list_accounts():
+            if str(acc.get("email") or "").strip().lower() == target:
+                return (
+                    str(acc.get("password") or "").strip(),
+                    str(acc.get("totp_secret") or "").strip(),
+                )
+    except Exception:  # noqa: BLE001
+        pass
+    return "", ""
+
+
 def _run_browser_job(index: int, email: str, mailbox: dict, browser_proxy: str, identity) -> tuple[dict | None, str | None, dict]:
     """启动 Node 子进程跑浏览器流程，泵 NDJSON，返回 (result_data, error_msg, partial)。"""
     timeout_s = int(config.get("register_timeout") or 300)
@@ -362,6 +381,15 @@ def _run_browser_job(index: int, email: str, mailbox: dict, browser_proxy: str, 
         "timeoutMs": timeout_s * 1000,
         "locale": (str(identity.accept_language).split(",")[0] or "en-US"),
     }
+    # 若该邮箱本地已存过凭据（此前注册过），注入登录密码/2FA 密钥：
+    # 注册中一旦发现邮箱已注册（登录页），先用存储密码登录，错了再忘记密码重设。
+    stored_pwd, stored_totp = _lookup_stored_credentials(email)
+    if stored_pwd:
+        job["loginPassword"] = stored_pwd
+    if stored_totp:
+        job["existingTotpSecret"] = stored_totp
+    if stored_pwd or stored_totp:
+        step(index, f"已注入本地存储凭据兜底（密码{'有' if stored_pwd else '无'}/2FA{'有' if stored_totp else '无'}）")
     baseline = mail_provider.peek_received_at(_mail_config(), mailbox)
 
     proc = _spawn_worker(job)
@@ -408,7 +436,7 @@ def _run_browser_job(index: int, email: str, mailbox: dict, browser_proxy: str, 
                     baseline = newb
                 _send_line(proc, {"type": "code", "code": code})
                 if code:
-                    step(index, f"已向浏览器回传验证码 {code}")
+                    step(index, "已向浏览器回传验证码")
                 else:
                     step(index, "取码超时，已回传空验证码", "yellow")
             elif etype == "result":
@@ -429,7 +457,9 @@ def _run_browser_job(index: int, email: str, mailbox: dict, browser_proxy: str, 
     if data is None and err_msg is None:
         err_msg = "浏览器引擎未返回结果（进程可能被终止或超时）"
         if stderr_tail:
-            log(f"任务{index} 引擎 stderr 末尾：{''.join(stderr_tail[-5:]).strip()}", "yellow")
+            # 引擎 stderr 可能含浏览器组件内部字样/文件路径，仅记入服务端日志，不透出前端
+            with print_lock:
+                print(f"{datetime.now().strftime('%H:%M:%S')} 任务{index} 引擎 stderr 末尾：{''.join(stderr_tail[-5:]).strip()}")
     return data, err_msg, partial
 
 

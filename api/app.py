@@ -1,7 +1,4 @@
-from __future__ import annotations
-
 from contextlib import asynccontextmanager
-from threading import Event
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,7 +6,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 
 from api import accounts, activation, cdks, dispatch, mailboxes, phones, register, run, system
 from api.errors import install_exception_handlers
-from api.support import resolve_web_asset, start_limited_account_watcher
+from api.support import resolve_web_asset
 from services.config import config
 
 
@@ -21,7 +18,6 @@ def create_app() -> FastAPI:
         # 启动顺序（对账必须先于续跑）：
         # 1) 对账清中间态（账号「排队中/激活中」→「未激活」、邮箱释放、手机预占清理）
         # 2) 续跑上次未结束的注册/激活/一键任务（各 start 内 is_alive 幂等，重复调用安全）
-        # 3) 起限流账号 watcher
         from services.recovery import startup_recover
         from services.register_service import register_service
         from services.activation_service import activation_service
@@ -33,13 +29,7 @@ def create_app() -> FastAPI:
             run_service.resume_if_running()
         except Exception as exc:  # noqa: BLE001
             print(f"[startup] recover/resume failed: {exc}")
-        stop_event = Event()
-        thread = start_limited_account_watcher(stop_event)
-        try:
-            yield
-        finally:
-            stop_event.set()
-            thread.join(timeout=1)
+        yield
 
     app = FastAPI(title="小海豚", version=app_version, lifespan=lifespan)
     install_exception_handlers(app)

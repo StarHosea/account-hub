@@ -41,9 +41,6 @@ import {
   deleteAccounts,
   updateAccount,
   createAccounts,
-  enable2FA,
-  disable2FA,
-  fetch2FAProgress,
   exportAccounts,
   exportAccountPool,
   markAccountsUsed,
@@ -64,8 +61,6 @@ import { log, useLogStore } from "@/store/logs";
 
 const { Title, Text } = Typography;
 
-type TwoFAAction = "enable" | "disable";
-
 const PAGE_SIZE = 10;
 const EMPTY_SUMMARY: AccountSummary = { total: 0, alive: 0, dead: 0, activated: 0, pending: 0, needs_review: 0, unused: 0 };
 
@@ -81,14 +76,12 @@ function tierTag(type: string | null | undefined) {
 }
 
 // Plus 激活流程状态（activation_service 维护，写在账号的 plus_* 字段里），与真实档位 type 区分。
-// 账号有效性 + 可用性 + 进行中态（校验 / 2FA）合并为一个「状态」。供表格与卡片共用。
-function accountStatusInfo(a: Account, pending: TwoFAAction | undefined, isRefreshing: boolean) {
+// 账号有效性 + 可用性 + 进行中态（校验）合并为一个「状态」。供表格与卡片共用。
+function accountStatusInfo(a: Account, isRefreshing: boolean) {
   let text = "有效";
   let color: string = "green";
   let spin = false;
-  if (pending === "enable") [text, color, spin] = ["设置 2FA 中", "blue", true];
-  else if (pending === "disable") [text, color, spin] = ["关闭 2FA 中", "blue", true];
-  else if (isRefreshing) [text, color, spin] = ["校验中", "blue", true];
+  if (isRefreshing) [text, color, spin] = ["校验中", "blue", true];
   else if (a.status === "异常" || a.status === "禁用") [text, color] = ["失效", "red"];
   else if (a.plus_unavailable) [text, color] = ["不可用", "red"];
   return { text, color, spin };
@@ -144,7 +137,6 @@ export default function AccountsPage() {
   const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(true);
   const [selectedKeys, setSelectedKeys] = useState<string[]>([]);
-  const [twofaPending, setTwofaPending] = useState<Record<string, TwoFAAction>>({});
   const [refreshing, setRefreshing] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
 
@@ -238,14 +230,6 @@ export default function AccountsPage() {
       return next;
     });
 
-  const setTwofaFlag = (token: string, action: TwoFAAction | null) =>
-    setTwofaPending((prev) => {
-      const next = { ...prev };
-      if (action) next[token] = action;
-      else delete next[token];
-      return next;
-    });
-
   // ---- 操作 ----
   const handleRefresh = async (tokens: string[]) => {
     if (!tokens.length) return;
@@ -295,58 +279,6 @@ export default function AccountsPage() {
       Toast.error(msg);
     } finally {
       tokens.forEach((t) => setRefreshFlag(t, false));
-    }
-  };
-
-  const poll2FA = (id: string, scope: string) =>
-    new Promise<Awaited<ReturnType<typeof fetch2FAProgress>>>((resolve, reject) => {
-      let lastMsg = "";
-      const timer = setInterval(async () => {
-        try {
-          const p = await fetch2FAProgress(id);
-          // 中间步骤实时入日志，去重连续相同消息。
-          if (p.message && p.message !== lastMsg) {
-            lastMsg = p.message;
-            if (!p.done) log.info(scope, p.message);
-          }
-          if (p.done) {
-            clearInterval(timer);
-            resolve(p);
-          }
-        } catch (err) {
-          clearInterval(timer);
-          reject(err);
-        }
-      }, 800);
-    });
-
-  const handle2FA = async (token: string, action: TwoFAAction) => {
-    const label = action === "enable" ? "开启2FA" : "关闭2FA";
-    const scope = `${label} · ${emailOf(token)}`;
-    setTwofaFlag(token, action);
-    log.info(scope, "开始");
-    try {
-      const { progress_id } = action === "enable" ? await enable2FA(token) : await disable2FA(token);
-      const res = await poll2FA(progress_id, scope);
-      if (!res.ok) {
-        // 后端 message 已是完整人话（含失败原因/代理连不上等），优先展示；缺失再退回错误码。
-        // 后端 message 常以「失败：」开头，去掉以免和这里的前缀重复成「失败：失败：」。
-        const detail = res.message?.trim().replace(/^失败：?/, "") || res.error || "未知错误";
-        log.error(scope, detail);
-        openLog(true);
-        Toast.error({ content: `${label}失败：${detail}`, duration: 6 });
-        return;
-      }
-      log.success(scope, res.message?.trim() || "成功");
-      await load(true);
-      Toast.success(action === "enable" ? "已开启 2FA" : "已关闭 2FA");
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : "操作失败";
-      log.error(scope, msg);
-      openLog(true);
-      Toast.error(msg);
-    } finally {
-      setTwofaFlag(token, null);
     }
   };
 
@@ -600,11 +532,11 @@ export default function AccountsPage() {
     },
     {
       title: "Token",
-      width: 120,
+      width: 150,
       render: (_: unknown, a: Account) => {
         const tk = a.access_token || "";
         return (
-          <Text type="tertiary" style={{ fontFamily: "monospace", fontSize: 12 }}>
+          <Text type="tertiary" style={{ fontFamily: "monospace", fontSize: 12, whiteSpace: "nowrap" }}>
             ···{tk.slice(-10)}
           </Text>
         );
@@ -621,7 +553,6 @@ export default function AccountsPage() {
       render: (_: unknown, a: Account) => {
         const { text, color, spin } = accountStatusInfo(
           a,
-          twofaPending[a.access_token],
           refreshing.has(a.access_token),
         );
         return (
@@ -659,19 +590,6 @@ export default function AccountsPage() {
           <Tag color="cyan" type="light">
             未出库
           </Tag>
-        ),
-    },
-    {
-      title: "取件地址",
-      dataIndex: "mail_link",
-      width: 200,
-      render: (v: string | null) =>
-        v ? (
-          <Text ellipsis={{ showTooltip: true }} size="small" style={{ maxWidth: 190 }}>
-            {v}
-          </Text>
-        ) : (
-          <Text type="tertiary" size="small">-</Text>
         ),
     },
     {
@@ -752,7 +670,6 @@ export default function AccountsPage() {
       width: 170,
       fixed: "right",
       render: (_: unknown, a: Account) => {
-        const pending = !!twofaPending[a.access_token];
         return (
           <Space spacing={2}>
             <Button
@@ -786,32 +703,6 @@ export default function AccountsPage() {
                 />
               </Popconfirm>
             ) : null}
-            {a.totp_secret ? (
-              <Popconfirm
-                title="确认关闭 2FA？"
-                content="将移除该账号的两步验证，请确保已知晓风险"
-                onConfirm={() => void handle2FA(a.access_token, "disable")}
-              >
-                <Button
-                  size="small"
-                  theme="borderless"
-                  type="warning"
-                  title="关闭 2FA"
-                  loading={pending}
-                  icon={<IconShield />}
-                />
-              </Popconfirm>
-            ) : (
-              <Button
-                size="small"
-                theme="borderless"
-                type="tertiary"
-                title="开启 2FA"
-                loading={pending}
-                icon={<IconShield />}
-                onClick={() => void handle2FA(a.access_token, "enable")}
-              />
-            )}
             <Button
               size="small"
               theme="borderless"
@@ -1013,12 +904,10 @@ export default function AccountsPage() {
           loading={loading}
           selected={selectedKeys}
           allSelected={allOnPageSelected}
-          twofaPending={twofaPending}
           refreshing={refreshing}
           onToggleAll={toggleSelectAll}
           onToggle={toggleOne}
           onRefresh={(t) => void handleRefresh([t])}
-          on2FA={(t, action) => void handle2FA(t, action)}
           onEdit={openEdit}
           onDelete={(t) => void handleDelete([t])}
           page={page}
@@ -1033,7 +922,7 @@ export default function AccountsPage() {
           loading={loading}
           rowKey="access_token"
           tableLayout="fixed"
-          scroll={{ x: 1400 }}
+          scroll={{ x: 1680 }}
           pagination={{
             currentPage: page,
             pageSize: PAGE_SIZE,
@@ -1179,12 +1068,10 @@ type AccountMobileListProps = {
   loading: boolean;
   selected: string[];
   allSelected: boolean;
-  twofaPending: Record<string, TwoFAAction>;
   refreshing: Set<string>;
   onToggleAll: () => void;
   onToggle: (token: string) => void;
   onRefresh: (token: string) => void;
-  on2FA: (token: string, action: TwoFAAction) => void;
   onEdit: (a: Account) => void;
   onDelete: (token: string) => void;
   page: number;
@@ -1198,12 +1085,10 @@ function AccountMobileList({
   loading,
   selected,
   allSelected,
-  twofaPending,
   refreshing,
   onToggleAll,
   onToggle,
   onRefresh,
-  on2FA,
   onEdit,
   onDelete,
   page,
@@ -1233,8 +1118,7 @@ function AccountMobileList({
         {accounts.map((a) => {
           const checked = selected.includes(a.access_token);
           const token = a.access_token || "";
-          const pending = !!twofaPending[a.access_token];
-          const status = accountStatusInfo(a, twofaPending[a.access_token], refreshing.has(a.access_token));
+          const status = accountStatusInfo(a, refreshing.has(a.access_token));
           return (
             <Card
               key={a.access_token}
@@ -1307,32 +1191,6 @@ function AccountMobileList({
                   loading={refreshing.has(a.access_token)}
                   onClick={() => onRefresh(a.access_token)}
                 />
-                {a.totp_secret ? (
-                  <Popconfirm
-                    title="确认关闭 2FA？"
-                    content="将移除该账号的两步验证，请确保已知晓风险"
-                    onConfirm={() => on2FA(a.access_token, "disable")}
-                  >
-                    <Button
-                      size="small"
-                      theme="borderless"
-                      type="warning"
-                      title="关闭 2FA"
-                      loading={pending}
-                      icon={<IconShield />}
-                    />
-                  </Popconfirm>
-                ) : (
-                  <Button
-                    size="small"
-                    theme="borderless"
-                    type="tertiary"
-                    title="开启 2FA"
-                    loading={pending}
-                    icon={<IconShield />}
-                    onClick={() => on2FA(a.access_token, "enable")}
-                  />
-                )}
                 <Button size="small" theme="borderless" icon={<IconEdit />} title="编辑" onClick={() => onEdit(a)} />
                 <Popconfirm title="删除该账号？" onConfirm={() => onDelete(a.access_token)}>
                   <Button size="small" theme="borderless" type="danger" icon={<IconDelete />} title="删除" />

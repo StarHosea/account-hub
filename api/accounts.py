@@ -363,6 +363,39 @@ def create_router() -> APIRouter:
             headers={"Content-Disposition": f'attachment; filename="accounts-credentials-{timestamp}.txt"'},
         )
 
+    @router.post("/api/accounts/export-pool")
+    async def export_pool(body: AccountCredentialsExportRequest, authorization: str | None = Header(default=None)):
+        """账号管理导出：每行 `邮箱---密码---2FA--Accesstoken`（与导入格式一致，可回环）。"""
+        require_admin(authorization)
+        tokens = _unique_tokens(body.access_tokens)
+        accounts = account_service.list_accounts()
+        if tokens:
+            wanted = {account_service.resolve_access_token(t) for t in tokens}
+            accounts = [a for a in accounts if str(a.get("access_token") or "") in wanted]
+        if body.only_unused:
+            accounts = [a for a in accounts if not a.get("used")]
+        lines: list[str] = []
+        exported_tokens: list[str] = []
+        for acc in accounts:
+            email = str(acc.get("email") or "").strip()
+            password = str(acc.get("password") or "").strip()
+            totp = str(acc.get("totp_secret") or "").strip()
+            access_token = str(acc.get("access_token") or "").strip()
+            # 合成主键（manual::...）不是真实 token，导出留空占位，避免污染回环导入。
+            if access_token.startswith("manual::"):
+                access_token = ""
+            lines.append(f"{email}---{password}---{totp}--{access_token}")
+            exported_tokens.append(str(acc.get("access_token") or ""))
+        if body.mark_used and exported_tokens:
+            account_service.mark_used(exported_tokens, True)
+        text = "\n".join(lines) + ("\n" if lines else "")
+        timestamp = _download_timestamp()
+        return Response(
+            text,
+            media_type="text/plain; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="accounts-pool-{timestamp}.txt"'},
+        )
+
     @router.post("/api/accounts/mark-used")
     async def mark_accounts_used(body: AccountMarkUsedRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)

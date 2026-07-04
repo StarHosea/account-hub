@@ -365,6 +365,10 @@ class AccountService:
         normalized["plus_task_id"] = normalized.get("plus_task_id") or None
         normalized["plus_last_message"] = normalized.get("plus_last_message") or None
         normalized["plus_updated_at"] = normalized.get("plus_updated_at") or None
+        # 首次激活成功（plus_status→已激活）的时间戳，仅写一次，供账号管理「激活日期」列展示。
+        normalized["plus_activated_at"] = normalized.get("plus_activated_at") or None
+        # 指纹 Seed：注册内核迁移后会写入专用随机种子；存量/当前号先回退到注册时的 oai-device-id。
+        normalized["fingerprint_seed"] = normalized.get("fingerprint_seed") or normalized.get("oai-device-id") or None
         # 激活不可用标记：某邮箱账号两种类型 CDK 均连续激活失败后置位，下轮激活自动跳过，
         # 直到人工「标记可用」重置。与 plus_status 分离，保证重置后仍持久生效。
         normalized["plus_unavailable"] = bool(normalized.get("plus_unavailable"))
@@ -1675,6 +1679,24 @@ class AccountService:
             line = raw_line.strip()
             if not line:
                 continue
+
+            # 账号池格式：`邮箱---密码---2FA--Accesstoken`（--/--- 混合分隔、无 key:value 标签）。
+            # 判别：首段是邮箱且次段不是 URL（http 开头）——借此与旧「邮箱----接码地址URL----密码----2FA」
+            # 凭据导出区分（其次段是取件地址 URL）。token 用全行 JWT 正则提取，兼容 token 内含 `-`/`--`。
+            if "：" not in line and ":" not in line and re.search(r"-{2,}", line):
+                fields = [seg.strip() for seg in re.split(r"-{2,}", line)]
+                second = fields[1] if len(fields) > 1 else ""
+                if fields and cls._looks_like_email(fields[0]) and not second.lower().startswith("http"):
+                    dashed_token = cls._extract_access_token(line)
+                    dashed: dict[str, str] = {"email": fields[0]}
+                    if second and not second.startswith("eyJ"):
+                        dashed["password"] = second
+                    third = fields[2] if len(fields) > 2 else ""
+                    if third and not third.startswith("eyJ"):
+                        dashed["totp_secret"] = third
+                    dashed["access_token"] = dashed_token or f"manual::{fields[0]}"
+                    items.append(dashed)
+                    continue
 
             payload: dict[str, str] = {}
             access_token = cls._extract_access_token(line)

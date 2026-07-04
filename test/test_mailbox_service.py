@@ -5,10 +5,11 @@ from pathlib import Path
 
 from services.mailbox_service import MailboxService
 from services.register import mail_provider as mp
+from test.utils import InMemoryStorage
 
 
 def _make_service(tmp: Path) -> MailboxService:
-    svc = MailboxService(store_file=tmp / "mailboxes.json")
+    svc = MailboxService(store_file=tmp / "mailboxes.json", storage=InMemoryStorage())
     svc.import_text("a@x.com----http://a\nb@x.com----http://b\nc@x.com----http://c")
     return svc
 
@@ -97,7 +98,7 @@ class MarkMailboxResultTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self._dir = tempfile.TemporaryDirectory()
-        self.svc = MailboxService(store_file=Path(self._dir.name) / "mailboxes.json")
+        self.svc = MailboxService(store_file=Path(self._dir.name) / "mailboxes.json", storage=InMemoryStorage())
         self.svc.import_text("bad@x.com----http://bad\nenv@x.com----http://env")
         self._orig = mp.mailbox_service
         mp.mailbox_service = self.svc

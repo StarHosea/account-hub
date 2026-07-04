@@ -8,6 +8,7 @@ from typing import Any
 import services.mailbox_service as mailbox_module
 from services.account_service import AccountService
 from services.mailbox_service import MailboxService
+from test.utils import InMemoryStorage
 
 
 class MemoryStorage:
@@ -134,7 +135,7 @@ class MailboxCarryTests(unittest.TestCase):
         mailbox_module.mailbox_service = self._orig_mailbox
 
     def _swap_mailbox(self, name: str) -> MailboxService:
-        mb = MailboxService(store_file=Path(self._tmp) / name)
+        mb = MailboxService(store_file=Path(self._tmp) / name, storage=InMemoryStorage())
         mailbox_module.mailbox_service = mb
         return mb
 

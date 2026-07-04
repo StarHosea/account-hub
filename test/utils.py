@@ -29,6 +29,59 @@ def post_json(path: str, payload: dict) -> dict:
         return json.loads(response.read().decode())
 
 
+class InMemoryStorage:
+    """满足 StorageBackend 契约的纯内存后端，供单元测试隔离用（不落磁盘、不碰全局单例）。
+
+    覆盖账号 / 鉴权密钥 / 平台配置 / 命名集合 / 状态块全部读写接口，
+    以便 MailboxService、CdkService 等直接注入而彼此不串数据。
+    """
+
+    def __init__(self, accounts: list[dict] | None = None) -> None:
+        self.accounts: list[dict] = list(accounts or [])
+        self.auth_keys: list[dict] = []
+        self.settings: dict | None = None
+        self.collections: dict[str, list[dict]] = {}
+        self.states: dict[str, dict] = {}
+
+    def load_accounts(self) -> list[dict]:
+        return list(self.accounts)
+
+    def save_accounts(self, accounts: list[dict]) -> None:
+        self.accounts = list(accounts)
+
+    def load_auth_keys(self) -> list[dict]:
+        return list(self.auth_keys)
+
+    def save_auth_keys(self, auth_keys: list[dict]) -> None:
+        self.auth_keys = list(auth_keys)
+
+    def load_settings(self) -> dict | None:
+        return self.settings
+
+    def save_settings(self, settings: dict) -> None:
+        self.settings = dict(settings)
+
+    def load_collection(self, name: str) -> list[dict] | None:
+        # 未写过返回 None（触发种子迁移逻辑）；写过（哪怕为空）返回列表副本。
+        items = self.collections.get(name)
+        return list(items) if items is not None else None
+
+    def save_collection(self, name: str, items: list[dict]) -> None:
+        self.collections[name] = list(items)
+
+    def load_state(self, key: str) -> dict | None:
+        return self.states.get(key)
+
+    def save_state(self, key: str, data: dict) -> None:
+        self.states[key] = dict(data)
+
+    def health_check(self) -> dict:
+        return {"ok": True}
+
+    def get_backend_info(self) -> dict:
+        return {"type": "memory"}
+
+
 def detect_ext(image_bytes: bytes) -> str:
     if image_bytes.startswith(b"\xff\xd8\xff"):
         return ".jpg"

@@ -25,6 +25,8 @@ class ActivationConfigRequest(BaseModel):
     poll_timeout: float | None = None
     max_attempts_per_type: int | None = None
     auto_activate_after_register: bool | None = None
+    # 激活数量（本轮目标激活数）：作为 start 的 limit 缺省值，持久化到 cdk_activation.target。
+    target: int | None = None
 
 
 def _safe_config() -> dict:

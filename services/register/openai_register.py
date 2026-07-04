@@ -520,6 +520,25 @@ def worker(index: int) -> dict:
 
             # 合格（或未启用检测/检测异常按 fail-open 视为合格）→ 入号池
             acct = _build_account(data, email, acct_proxy, identity, exit_ip)
+            # 未改动的凭据用本地已存值回填（改了才存新的、没改保留旧的），避免用空值覆盖已有密码/2FA。
+            stored_pwd, stored_totp = _lookup_stored_credentials(email)
+            if not str(acct.get("password") or "").strip() and stored_pwd:
+                acct["password"] = stored_pwd
+            if not str(acct.get("totp_secret") or "").strip() and stored_totp:
+                acct["totp_secret"] = stored_totp
+            # 同邮箱的旧账号条目（旧 access_token，密码重置/重登后已失效）先删，避免重复与陈旧凭据。
+            # 必须在 _lookup_stored_credentials 之后删（旧凭据就存在旧条目里）。
+            target_email = email.strip().lower()
+            old_tokens = [
+                str(a.get("access_token") or "")
+                for a in account_service.list_accounts()
+                if str(a.get("email") or "").strip().lower() == target_email
+                and str(a.get("access_token") or "").strip()
+                and str(a.get("access_token") or "") != token
+            ]
+            if old_tokens:
+                account_service.delete_accounts(old_tokens)
+                step(index, f"已清理同邮箱旧账号 {len(old_tokens)} 条（凭据已更新，旧 token 失效）")
             mailbox["access_token"] = token
             account_service.add_account_items([acct])
             refresh_result = account_service.refresh_accounts([token])

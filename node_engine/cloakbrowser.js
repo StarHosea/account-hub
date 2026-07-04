@@ -25,7 +25,7 @@ async function loadCloak() {
   try {
     const mod = await import('cloakbrowser');
     _launchContext = mod.launchContext || mod.default?.launchContext;
-    if (!_launchContext) throw new Error('cloakbrowser 未导出 launchContext');
+    if (!_launchContext) throw new Error('浏览器组件未就绪');
   } catch (err) {
     _loadError = err;
   }
@@ -70,7 +70,7 @@ export async function launchSession(proxyUrl, { headless = false, fingerprintSee
       if (proxyUrl) opts.proxy = proxyUrl; // 带账号密码的完整代理地址
       const context = await launchContext(opts);
       const browser = context.browser();
-      log(`CloakBrowser 已启动（stealth 指纹 seed=${seed}${proxyUrl ? '，出口走代理' : '，直连'}）`);
+      log(`浏览器已启动（seed=${seed}${proxyUrl ? '，出口走代理' : '，直连'}）`);
       return {
         mode: 'cloakbrowser',
         seed,
@@ -83,12 +83,12 @@ export async function launchSession(proxyUrl, { headless = false, fingerprintSee
       };
     } catch (err) {
       if (!FALLBACK_ENABLED) throw err;
-      log(`CloakBrowser 启动失败（${err?.message || err}），回退到本地 chromium`);
+      log(`浏览器启动失败（${err?.message || err}），正在切换备用模式`);
     }
   } else if (!FALLBACK_ENABLED) {
-    throw _loadError || new Error('cloakbrowser 不可用且未开启回退');
+    throw _loadError || new Error('浏览器不可用');
   } else {
-    log(`cloakbrowser 加载失败（${_loadError?.message || _loadError}），回退到本地 chromium`);
+    log(`浏览器加载失败（${_loadError?.message || _loadError}），正在切换备用模式`);
   }
 
   const fb = await launchFallbackChromium(proxyUrl, headless, log);
@@ -117,7 +117,7 @@ async function launchFallbackChromium(proxyUrl, headless, log) {
     try {
       browser = await chromium.launch({ ...launchOpts, channel: 'chrome' });
     } catch (e) {
-      log(`系统 Chrome 启动失败（${e?.message || e}），尝试 playwright 自带 chromium`);
+      log(`浏览器启动失败（${e?.message || e}），尝试备用内核`);
       browser = await chromium.launch(launchOpts);
     }
   }
@@ -131,7 +131,7 @@ async function launchFallbackChromium(proxyUrl, headless, log) {
   await context.addInitScript(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
   });
-  log('已启动 playwright-core chromium（回退模式，无 stealth 指纹）');
+  log('浏览器已启动（备用模式）');
   return {
     mode: 'chromium-fallback',
     browser,

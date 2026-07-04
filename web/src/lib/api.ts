@@ -525,36 +525,6 @@ export async function updateAccount(
   });
 }
 
-export type Account2FAProgress = {
-  action: "enable" | "disable";
-  percent: number;
-  message: string;
-  done: boolean;
-  ok: boolean;
-  error?: string | null;
-  items?: Account[] | null;
-  secret?: string | null;
-  otpauth_url?: string | null;
-};
-
-export async function enable2FA(accessToken: string) {
-  return httpRequest<{ progress_id: string }>("/api/accounts/2fa/enable", {
-    method: "POST",
-    body: { access_token: accessToken },
-  });
-}
-
-export async function disable2FA(accessToken: string) {
-  return httpRequest<{ progress_id: string }>("/api/accounts/2fa/disable", {
-    method: "POST",
-    body: { access_token: accessToken },
-  });
-}
-
-export async function fetch2FAProgress(progressId: string) {
-  return httpRequest<Account2FAProgress>(`/api/accounts/2fa/progress/${progressId}`);
-}
-
 // 导出账号凭据文本：每行 `邮箱----接码----密码----2FA密钥`。传空数组导出全部。
 export async function exportCredentials(
   accessTokens: string[],

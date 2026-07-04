@@ -110,9 +110,9 @@ class MarkMailboxResultTests(unittest.TestCase):
     def _mailbox(self, address: str) -> dict:
         return {"provider": mp.API_MAILBOX_TYPE, "address": address}
 
-    def test_invalid_auth_step_marks_used_bad(self) -> None:
+    def test_email_exists_marks_used_bad(self) -> None:
         self.svc.acquire_unused()  # 占用第一个（bad@x.com）
-        err = RuntimeError('user_register_http_400, detail={"error": {"code": "invalid_auth_step"}}')
+        err = RuntimeError("register failed: email_exists")
         mp.mark_mailbox_result(self._mailbox("bad@x.com"), success=False, error=err)
         item = self.svc._mailboxes["bad@x.com"]
         self.assertTrue(item["used"])  # 永久标坏

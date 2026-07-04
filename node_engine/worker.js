@@ -14,7 +14,7 @@
 import { emit, log, requestCode, onStop, startStdin } from './protocol.js';
 import { launchSession } from './cloakbrowser.js';
 import { sleep } from './utils.js';
-import { registerChatGPT, secureExistingChatGPT } from './flows/openai/register.js';
+import { registerChatGPT, secureExistingChatGPT, loginChatGPT } from './flows/openai/register.js';
 
 function parseJob() {
   const raw = process.argv[2];
@@ -44,7 +44,7 @@ function readJobFromStdin(timeoutMs = 5000) {
 async function runDryRun(job) {
   log('dryRun：开始（不启动浏览器）');
   const code = await requestCode('register');
-  log(`dryRun：收到验证码 ${code}`);
+  log('dryRun：收到验证码');
   emit({
     type: 'result',
     data: {
@@ -89,7 +89,15 @@ async function runReal(job) {
     };
 
     let data;
-    if (job.mode === 'existing') {
+    if (job.mode === 'login') {
+      // 老账号仅登录取 token（刷新/重登主流程用；用存的 password+totp 过 2FA，
+      // 无密码/密码错时 loginChatGPT 内部走邮箱 OTP / 忘记密码兜底）。
+      data = await loginChatGPT({
+        ...common,
+        password: job.loginPassword || '',
+        totpSecret: job.existingTotpSecret || '',
+      });
+    } else if (job.mode === 'existing') {
       // 明确的老账号加固流程
       data = await secureExistingChatGPT({
         ...common,

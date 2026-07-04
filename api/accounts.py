@@ -46,10 +46,6 @@ class AccountUpdateRequest(BaseModel):
     proxy: str | None = None
 
 
-class Account2FARequest(BaseModel):
-    access_token: str = ""
-
-
 class AccountMarkUsedRequest(BaseModel):
     access_tokens: list[str] = Field(default_factory=list)
     used: bool = True
@@ -434,31 +430,5 @@ def create_router() -> APIRouter:
         if account is None:
             raise HTTPException(status_code=404, detail={"error": "account not found"})
         return {"item": account, "items": account_service.list_accounts()}
-
-    @router.post("/api/accounts/2fa/enable")
-    async def enable_account_2fa(body: Account2FARequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        access_token = str(body.access_token or "").strip()
-        if not access_token:
-            raise HTTPException(status_code=400, detail={"error": "access_token is required"})
-        progress_id = account_service.start_2fa_task("enable", access_token)
-        return {"progress_id": progress_id}
-
-    @router.post("/api/accounts/2fa/disable")
-    async def disable_account_2fa(body: Account2FARequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        access_token = str(body.access_token or "").strip()
-        if not access_token:
-            raise HTTPException(status_code=400, detail={"error": "access_token is required"})
-        progress_id = account_service.start_2fa_task("disable", access_token)
-        return {"progress_id": progress_id}
-
-    @router.get("/api/accounts/2fa/progress/{progress_id}")
-    async def get_2fa_progress(progress_id: str, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        progress = account_service.get_2fa_progress(progress_id)
-        if progress is None:
-            raise HTTPException(status_code=404, detail={"error": "progress not found"})
-        return progress
 
     return router

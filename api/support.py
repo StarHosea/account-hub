@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from threading import Event, Thread
 
 from fastapi import HTTPException
 
-from services.account_service import account_service
 from services.auth_service import auth_service
 from services.config import config
 
@@ -44,39 +42,6 @@ def require_admin(authorization: str | None) -> dict[str, object]:
     if identity.get("role") != "admin":
         raise HTTPException(status_code=403, detail={"error": "需要管理员权限才能执行这个操作"})
     return identity
-
-
-def start_limited_account_watcher(stop_event: Event) -> Thread:
-    interval_seconds = config.refresh_account_interval_minute * 60
-
-    def worker() -> None:
-        while not stop_event.is_set():
-            try:
-                limited_tokens = account_service.list_limited_tokens()
-                expiring_tokens = account_service.list_expiring_access_tokens()
-                keepalive_tokens = account_service.list_refresh_token_keepalive_tokens()
-                tokens = list(dict.fromkeys([*limited_tokens, *expiring_tokens]))
-                expiring_token_set = set(expiring_tokens)
-                keepalive_tokens = [token for token in keepalive_tokens if token not in expiring_token_set]
-                if tokens:
-                    print(
-                        "[account-watcher] checking "
-                        f"{len(limited_tokens)} limited accounts, "
-                        f"{len(expiring_tokens)} expiring access tokens"
-                    )
-                    account_service.refresh_accounts(tokens)
-                if keepalive_tokens:
-                    print(f"[account-watcher] keepalive {len(keepalive_tokens)} refresh tokens")
-                    result = account_service.keepalive_refresh_tokens(keepalive_tokens)
-                    if result.get("errors"):
-                        print(f"[account-watcher] keepalive errors: {result['errors']}")
-            except Exception as exc:
-                print(f"[account-watcher] fail {exc}")
-            stop_event.wait(interval_seconds)
-
-    thread = Thread(target=worker, name="account-watcher", daemon=True)
-    thread.start()
-    return thread
 
 
 def resolve_web_asset(requested_path: str) -> Path | None:

@@ -36,3 +36,7 @@ test_batch_output/
 # 工具索引/编辑器目录
 .codegraph/
 .cursor/
+
+# 本地运行日志
+run.local.log
+*.local.log

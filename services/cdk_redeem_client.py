@@ -141,6 +141,14 @@ class RedeemError(Exception):
     pass
 
 
+class NetworkError(RedeemError):
+    """网络类失败：连接异常 / 超时 / HTTP 5xx / 429 / 4xx(非401,403) / 响应非预期。
+
+    语义 = 「没能从接口拿到可信的业务结果，可重试」。重试策略由激活层统一负责
+    （固定间隔 + 有限次数 + 不计入激活尝试次数），本层只做一次请求并分类，不自行重试。
+    """
+
+
 class AuthError(RedeemError):
     """鉴权失败(401/403)：API Key 无效，应立即停止整轮，避免无意义消耗。"""
 

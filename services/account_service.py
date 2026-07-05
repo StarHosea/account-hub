@@ -1315,6 +1315,7 @@ class AccountService:
         with self._lock:
             storage_keys: set[str] = set()
             audit_tokens: list[str] = []
+            released_emails: list[str] = []
             for token in target_set:
                 storage_key = self._resolve_storage_key_locked(token)
                 if not storage_key:
@@ -1326,6 +1327,9 @@ class AccountService:
                     if audit_token:
                         audit_tokens.append(audit_token)
                         self._image_inflight.pop(audit_token, None)
+                    email = str(raw.get("email") or "").strip()
+                    if email:
+                        released_emails.append(email)
             removed = sum(self._accounts.pop(key, None) is not None for key in storage_keys)
             for key in storage_keys:
                 self._image_inflight.pop(key, None)
@@ -1347,6 +1351,13 @@ class AccountService:
                     activation_audit_service.delete_by_access_tokens(audit_tokens or list(storage_keys))
                 except Exception:
                     pass
+                if released_emails:
+                    try:
+                        from services.mailbox_service import mailbox_service
+
+                        mailbox_service.mark_used(released_emails, False)
+                    except Exception:
+                        pass
             items = [dict(item) for item in self._accounts.values()]
         return {"removed": removed, "items": items}
 

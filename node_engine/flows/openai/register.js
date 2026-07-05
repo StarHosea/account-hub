@@ -441,7 +441,7 @@ async function forgotPasswordFlow({ page, email, requestCode, log, recorder = NO
     log('忘记密码2：收码页就绪，取重置码');
     const code = await requestCode('login');
     await fillCode(page, code, log);
-    await submitCodeForm(page, log);
+    await submitCodeForm(page, log, { code });
     await sleep(3500);
     await snapshot(page, 'forgot-03-after-code', log);
     await mark('forgot-03-code', '忘记密码：重置码已提交');
@@ -646,7 +646,7 @@ export async function loginChatGPT({ page, email, chatgptUrl = 'https://chatgpt.
     log('登录4：收码页就绪，取码填码');
     const code = await requestCode('login');
     await fillCode(page, code, log);
-    await submitCodeForm(page, log);
+    await submitCodeForm(page, log, { code });
     await sleep(4000);
     for (let r = 1; r <= 2; r += 1) {
       if (!(await isOnCodePage(page))) break;
@@ -654,7 +654,7 @@ export async function loginChatGPT({ page, email, chatgptUrl = 'https://chatgpt.
       await humanClickByText(page, ['重新发送电子邮件', '重新发送', 'resend email', 'resend'], { timeout: 6000, exclude: OAUTH_EXCLUDE }).catch(() => {});
       const c2 = await requestCode('login');
       await fillCode(page, c2, log);
-      await submitCodeForm(page, log);
+      await submitCodeForm(page, log, { code: c2 });
       await sleep(4000);
     }
     // 邮箱码之后可能再要 2FA（部分账号先邮箱验证再验证器）
@@ -739,9 +739,11 @@ async function tryLoginMfaEmailFallback(page, requestCode, log) {
   log('登录5：2FA 已切换为邮箱验证码，取码并填写');
   const code = await requestCode('login');
   await fillCode(page, code, log);
-  await submitCodeForm(page, log);
+  await submitCodeForm(page, log, { code });
   await sleep(2500);
 
+  // 浏览器错误页（submitCodeForm 已尝试刷新+重填）后仍停在收码页 → 不当作"验证码无效"，交给上层继续
+  if (isChromeErrorUrl(page.url()) || await isMfaEmailChallenge(page)) return true;
   const text = await pageText(page);
   if (S.INVALID_CODE_PATTERN.test(text)) throw new Error('2FA 邮箱验证码无效');
   return true;
@@ -975,10 +977,17 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
   await fillCode(page, code, log);
   await humanClickByText(page, S.CONTINUE_TEXTS, { timeout: 10000, exclude: OAUTH_EXCLUDE });
   await sleep(3000);
+  // 提交后落到浏览器错误页 → 刷新重填同码再提交（否则会被误判为"验证码无效"）
+  if (await recoverFromChromeError(page, log) && await hasVisibleCodeInput(page)) {
+    log('步骤4：验证码提交遇浏览器错误页，刷新后重填同码重试', 'warn');
+    await fillCode(page, code, log);
+    await submitCodeForm(page, log, { code });
+    await sleep(3000);
+  }
   await mark('register-04-code-filled', '注册验证码已填');
 
   const afterCodeText = await pageText(page);
-  if (S.INVALID_CODE_PATTERN.test(afterCodeText)) {
+  if (!isChromeErrorUrl(page.url()) && S.INVALID_CODE_PATTERN.test(afterCodeText)) {
     throw new Error('验证码无效');
   }
 
@@ -1014,10 +1023,10 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
     await humanClickByText(page, ['重新发送电子邮件', '重新发送', 'resend email', 'resend', '重新发送邮件'], { timeout: 6000, exclude: OAUTH_EXCLUDE }).catch(() => {});
     const code2 = await requestCode('register');
     await fillCode(page, code2, log);
-    await submitCodeForm(page, log);
+    await submitCodeForm(page, log, { code: code2 });
     await sleep(4000);
     const bad = await pageText(page);
-    if (S.INVALID_CODE_PATTERN.test(bad)) throw new Error('二次验证码无效');
+    if (!isChromeErrorUrl(page.url()) && S.INVALID_CODE_PATTERN.test(bad)) throw new Error('二次验证码无效');
   }
 
   // 步骤6：等待注册成功
@@ -1170,26 +1179,72 @@ async function clickRetryIfError(page, log, { max = 3, cooldownMs = 4000 } = {})
   return did;
 }
 
-async function submitCodeForm(page, log) {
-  const before = page.url();
-  try {
-    const codeInput = page.locator(`${S.CODE_INPUT}, ${S.CODE_INPUT_SEGMENTED}`).last();
-    if (await codeInput.count()) { await codeInput.press('Enter').catch(() => {}); }
-  } catch { /* ignore */ }
-  await sleep(1500);
-  let left = await hasLeftCodePage(page, before);
-  if (!left) {
-    await humanClickByText(page, S.CONTINUE_TEXTS, { timeout: 8000, exclude: OAUTH_EXCLUDE }).catch(() => {});
-    await sleep(1500);
-    left = await hasLeftCodePage(page, before);
+// 浏览器层加载错误页判定：chrome-error://…（如 ERR_NETWORK_CHANGED / CONNECTION_RESET /
+// TIMED_OUT）、about:neterror。这类页面上 page.evaluate 会直接抛错、DOM 里也没有「重试」按钮，
+// 所以 clickRetryIfError 完全兜不住——只能靠 reload 重新加载失败的那次导航。
+function isChromeErrorUrl(u) {
+  return /^chrome-error:|^chrome:\/\/(error|network-error)|^about:neterror/i.test(String(u || ''));
+}
+
+// 若当前停在浏览器加载错误页则刷新（reload 会重试失败的那次导航），最多 max 次。返回是否发生过恢复。
+async function recoverFromChromeError(page, log, { max = 3 } = {}) {
+  let did = false;
+  for (let i = 0; i < max; i += 1) {
+    let u = '';
+    try { u = page.url(); } catch { u = ''; }
+    if (!isChromeErrorUrl(u)) break;
+    log(`检测到浏览器加载错误页（${u}），刷新重试（第 ${i + 1}/${max} 次）`, 'warn');
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+    did = true;
+    await sleep(2500);
   }
-  if (!left) {
-    await page.evaluate(() => {
-      const inp = document.querySelector('input[name="code"], input[autocomplete="one-time-code"]');
-      const form = inp?.closest('form');
-      if (form) form.requestSubmit ? form.requestSubmit() : form.submit();
-    }).catch(() => {});
+  return did;
+}
+
+// 当前是否有可见的验证码输入框（单框或分格）。用于错误页刷新后判断是否需要重填。
+async function hasVisibleCodeInput(page) {
+  return page.evaluate((sel) => {
+    const vis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
+    const one = document.querySelector(sel.code);
+    const seg = document.querySelectorAll(sel.seg);
+    return vis(one) || (seg.length >= 4 && vis(seg[0]));
+  }, { code: S.CODE_INPUT, seg: S.CODE_INPUT_SEGMENTED }).catch(() => false);
+}
+
+// 提交验证码表单。传入 code 时具备「浏览器错误页」自愈：提交后若落到 chrome-error:// 页，
+// 刷新重新加载收码页 → 重填同一个码（刚取的码仍在有效期内，刷新会清空输入所以必须重填）→ 再提交，
+// 最多 retries 轮。不传 code 时退化为原行为（仅提交，不自愈）。
+async function submitCodeForm(page, log, { code = '', retries = 2 } = {}) {
+  for (let attempt = 0; ; attempt += 1) {
+    const before = page.url();
+    try {
+      const codeInput = page.locator(`${S.CODE_INPUT}, ${S.CODE_INPUT_SEGMENTED}`).last();
+      if (await codeInput.count()) { await codeInput.press('Enter').catch(() => {}); }
+    } catch { /* ignore */ }
     await sleep(1500);
+    let left = await hasLeftCodePage(page, before);
+    if (!left) {
+      await humanClickByText(page, S.CONTINUE_TEXTS, { timeout: 8000, exclude: OAUTH_EXCLUDE }).catch(() => {});
+      await sleep(1500);
+      left = await hasLeftCodePage(page, before);
+    }
+    if (!left) {
+      await page.evaluate(() => {
+        const inp = document.querySelector('input[name="code"], input[autocomplete="one-time-code"]');
+        const form = inp?.closest('form');
+        if (form) form.requestSubmit ? form.requestSubmit() : form.submit();
+      }).catch(() => {});
+      await sleep(1500);
+    }
+    // 浏览器加载错误页 → 刷新；若仍在收码页且手里有码，重填同码再走一轮提交
+    if (attempt < retries && await recoverFromChromeError(page, log)) {
+      if (code && await hasVisibleCodeInput(page)) {
+        log(`验证码提交遇浏览器错误页，刷新后重填同码重试（第 ${attempt + 1}/${retries}）`, 'warn');
+        await fillCode(page, code, log);
+        continue;
+      }
+    }
+    break;
   }
   // 提交后偶发限流/网络异常页 → 点「重试」再确认是否离开收码页
   if (await clickRetryIfError(page, log)) {
@@ -1267,6 +1322,9 @@ export const __test = {
   isMfaEmailChallenge,
   resolveStep8Tolerance,
   fillCode,
+  isChromeErrorUrl,
+  recoverFromChromeError,
+  submitCodeForm,
 };
 
 async function checkConsentIfAny(page, log) {
@@ -1615,7 +1673,7 @@ async function step8_setupPasswordAnd2FA(page, { email, password, enable2fa = tr
         if (r > 1) await humanClickByText(page, ['重新发送电子邮件', '重新发送', 'resend'], { timeout: 5000, exclude: OAUTH_EXCLUDE }).catch(() => {});
         const vcode = await requestCode('password');
         await fillCode(page, vcode, log);
-        await submitCodeForm(page, log);
+        await submitCodeForm(page, log, { code: vcode });
         await sleep(3500);
         await dumpUi(page, `03b-after-verify-${r}`, log);
       }
@@ -1636,7 +1694,7 @@ async function step8_setupPasswordAnd2FA(page, { email, password, enable2fa = tr
           log('步骤8：设密码后需邮箱验证，取码');
           const code = await requestCode('password');
           await fillCode(page, code, log);
-          await submitCodeForm(page, log);
+          await submitCodeForm(page, log, { code });
           await sleep(2500);
         }
         out.passwordSet = true;

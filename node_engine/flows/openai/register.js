@@ -868,6 +868,14 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
     throw new Error('验证码无效');
   }
 
+  // 验证码后按页面路径判新老：无资料页 + 已在已登录主界面 = 邮箱已验证的无密码老号（OTP 登录）。
+  // 转 worker 的老账号加固分流（登录已登录态 → 设密码 → 2FA），避免误当新号在 step8 反复撞设密码坑。
+  const branch = await detectPostCodeBranch(page, log, { timeoutMs: 20000 });
+  if (branch === 'existing') {
+    log('步骤5：验证码后无资料页且已在主界面 → 判定为「邮箱已验证的无密码老号」（OTP 登录），转老账号加固流程');
+    return { emailExists: true };
+  }
+
   // 步骤5：资料（姓名 + 生日）
   log('步骤5：填写姓名与生日');
   await fillProfile(page, { firstName, lastName, birthday }, log);
@@ -1014,6 +1022,41 @@ async function hasLeftCodePage(page, beforeUrl) {
   } catch {
     return true;
   }
+}
+
+// 验证码提交后按「页面路径」判新老，不依赖数据库：
+//   · 真新号：验证码后进「资料页（姓名/生日）」或「创建密码页」等注册专属步骤。
+//   · 邮箱已验证但从未设密码的老号：填邮箱后 OpenAI 直接发 OTP（页面与新号验证码页无法区分），
+//     验证码后 OTP 登录直接落已登录主界面，没有任何注册后续步骤。
+// 返回 'existing'（老号 → 应转 secureExistingChatGPT）或 'register'（新号 → 继续注册）。
+// 判据只取当前 DOM/URL；存疑或超时一律回退 'register'，绝不误伤真新号（新号被误判也只是多走一次
+// 已登录快速登录，step8 同样设密码+2FA，结果等价）。
+async function detectPostCodeBranch(page, log, { timeoutMs = 20000 } = {}) {
+  const profileSel = `${S.NAME_INPUT}, ${S.FIRST_NAME_INPUT}, ${S.LAST_NAME_INPUT}, ${S.BIRTHDAY_INPUT}`;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const st = await page.evaluate((sel) => {
+      const vis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
+      const anyVis = (q) => [...document.querySelectorAll(q)].some(vis);
+      return {
+        url: location.href,
+        hasProfile: anyVis(sel),
+        hasPassword: anyVis('input[type="password"], input[autocomplete="new-password"]'),
+        text: (document.body?.innerText || '').slice(0, 4000),
+      };
+    }, profileSel).catch(() => null);
+    if (!st) { await sleep(1200); continue; }
+    // 出现注册专属步骤（资料 / 创建密码）→ 真新号，继续原注册流程
+    if (st.hasProfile || st.hasPassword) return 'register';
+    // 已落已登录主界面（URL 干净 + 主界面文案，或已能取 token）且无资料页 → 已验证无密码老号
+    if (isLoggedInUrl(st.url)) {
+      if (S.SUCCESS_TEXTS.some((t) => st.text.includes(t))) return 'existing';
+      const tok = await readAccessToken(page).catch(() => ({}));
+      if (tok.accessToken) return 'existing';
+    }
+    await sleep(1500);
+  }
+  return 'register'; // 超时保守回退，避免误伤真新号
 }
 
 async function fillProfile(page, { firstName, lastName, birthday }, log) {

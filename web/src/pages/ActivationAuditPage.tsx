@@ -17,7 +17,7 @@ import {
 import { IconSearch, IconRefresh, IconDelete } from "@douyinfe/semi-icons";
 
 import {
-  deleteAccounts,
+  deleteActivationAudit,
   fetchActivationAudit,
   type ActivationAuditSummary,
 } from "@/lib/api";
@@ -103,21 +103,40 @@ export default function ActivationAuditPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [outcome]);
 
-  const selectedFailedTokens = useMemo(() => {
+  const selectedRows = useMemo(() => {
     const selected = new Set(selectedIds);
-    const tokens = items
-      .filter((row) => selected.has(row.id) && row.outcome === "failed" && row.access_token)
-      .map((row) => row.access_token);
-    return [...new Set(tokens)];
+    return items.filter((row) => selected.has(row.id));
   }, [items, selectedIds]);
 
-  const handleDeleteFailed = async () => {
-    if (!selectedFailedTokens.length) return;
+  const selectedEmails = useMemo(
+    () => [...new Set(selectedRows.map((row) => row.email).filter(Boolean))],
+    [selectedRows],
+  );
+
+  const selectedFailedTokens = useMemo(() => {
+    const tokens = selectedRows
+      .filter((row) => row.outcome === "failed" && row.access_token)
+      .map((row) => row.access_token);
+    return [...new Set(tokens)];
+  }, [selectedRows]);
+
+  const handleDeleteSelected = async () => {
+    if (!selectedEmails.length) return;
     try {
-      const data = await deleteAccounts(selectedFailedTokens);
+      const data = await deleteActivationAudit({
+        emails: selectedEmails,
+        access_tokens: selectedFailedTokens,
+        delete_accounts: selectedFailedTokens.length > 0,
+      });
       setSelectedIds([]);
       await load();
-      Toast.success(`已删除 ${data.removed ?? 0} 个账号`);
+      const auditRemoved = data.removed ?? 0;
+      const accountsRemoved = data.accounts_removed ?? 0;
+      if (accountsRemoved > 0) {
+        Toast.success(`已删除 ${auditRemoved} 条审计记录，并移除 ${accountsRemoved} 个账号`);
+      } else {
+        Toast.success(`已删除 ${auditRemoved} 条审计记录`);
+      }
     } catch (e) {
       Toast.error(e instanceof Error ? e.message : "删除失败");
     }
@@ -234,11 +253,11 @@ export default function ActivationAuditPage() {
             />
             <Button icon={<IconRefresh />} size="small" onClick={() => void load()}>刷新</Button>
             <Popconfirm
-              title="确认删除所选失败账号？"
-              content={`将删除 ${selectedFailedTokens.length} 个账号（仅「激活失败」记录）`}
-              onConfirm={() => void handleDeleteFailed()}
+              title="确认删除所选记录？"
+              content={`将删除 ${selectedEmails.length} 个邮箱的审计记录${selectedFailedTokens.length ? `，并尝试移除 ${selectedFailedTokens.length} 个失败账号` : ""}`}
+              onConfirm={() => void handleDeleteSelected()}
             >
-              <Button icon={<IconDelete />} size="small" type="danger" disabled={!selectedFailedTokens.length}>
+              <Button icon={<IconDelete />} size="small" type="danger" disabled={!selectedEmails.length}>
                 删除
               </Button>
             </Popconfirm>
@@ -256,7 +275,7 @@ export default function ActivationAuditPage() {
             selectedRowKeys: selectedIds,
             onChange: (keys) => setSelectedIds((keys ?? []) as string[]),
             getCheckboxProps: (row) => ({
-              disabled: row.outcome !== "failed",
+              disabled: row.outcome === "success",
             }),
           }}
           empty={<Empty description="暂无激活审计记录" />}

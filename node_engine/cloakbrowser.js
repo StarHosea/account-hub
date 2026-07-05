@@ -54,14 +54,23 @@ function toPlaywrightProxy(proxyUrl) {
   }
 }
 
+function resolveLocale(locale, proxyUrl) {
+  const v = String(locale || '').trim();
+  if (v) return v;
+  // 有代理且开 geoip 时不设 locale，让 CloakBrowser 按出口 IP 自动匹配；无代理则回退 en-US
+  return proxyUrl ? null : 'en-US';
+}
+
 // 返回统一句柄 { mode, seed, browser, context, close() }。
 // fingerprintSeed：固定指纹种子（10000-99999）。同一 seed = 同一指纹，跨会话可复现；
 // 不传则生成一个，并在返回值里带出实际 seed 供存储与后续复用。
-export async function launchSession(proxyUrl, { headless = false, fingerprintSeed = null, log = () => {} } = {}) {
+// locale：浏览器语言（如 en-US / ja-JP / en-IN），与 Python identity.region 对齐；显式传入时覆盖 geoip 自动检测。
+export async function launchSession(proxyUrl, { headless = false, fingerprintSeed = null, locale = null, log = () => {} } = {}) {
   const launchContext = await loadCloak();
   const seed = Number.isInteger(fingerprintSeed) && fingerprintSeed > 0
     ? fingerprintSeed
     : Math.floor(Math.random() * 90000) + 10000;
+  const resolvedLocale = resolveLocale(locale, proxyUrl);
 
   if (launchContext) {
     try {
@@ -69,15 +78,16 @@ export async function launchSession(proxyUrl, { headless = false, fingerprintSee
         geoip: true,             // 按出口 IP 匹配时区/语言（需 mmdb-lib）
         humanize: true,          // 拟人化鼠标/键盘/滚动
         headless,                // 反爬场景建议 false（服务器上用 Xvfb 有头）
-        locale: 'en-US',
         viewport: { width: 1280, height: 800 },
         // 固定指纹种子 + Docker 加固参数（buildArgs 按键去重，用户 args 覆盖默认）
         args: [`--fingerprint=${seed}`, ...HARDENING_ARGS, ...cdpArgs()],
       };
+      if (resolvedLocale) opts.locale = resolvedLocale;
       if (proxyUrl) opts.proxy = proxyUrl; // 带账号密码的完整代理地址
       const context = await launchContext(opts);
       const browser = context.browser();
-      log(`浏览器已启动（seed=${seed}${proxyUrl ? '，出口走代理' : '，直连'}）`);
+      const localeNote = resolvedLocale || (proxyUrl ? 'geoip 自动' : 'en-US');
+      log(`浏览器已启动（seed=${seed}，locale=${localeNote}${proxyUrl ? '，出口走代理' : '，直连'}）`);
       return {
         mode: 'cloakbrowser',
         seed,
@@ -98,13 +108,13 @@ export async function launchSession(proxyUrl, { headless = false, fingerprintSee
     log(`浏览器加载失败（${_loadError?.message || _loadError}），正在切换备用模式`);
   }
 
-  const fb = await launchFallbackChromium(proxyUrl, headless, log);
+  const fb = await launchFallbackChromium(proxyUrl, headless, resolvedLocale || 'en-US', log);
   fb.seed = seed; // 回退模式无真实指纹，仍记录 seed 保持数据结构一致
   return fb;
 }
 
 // 回退：playwright-core + 系统 Chrome / 自带 chromium（无 stealth 指纹，仅用于跑通链路）。
-async function launchFallbackChromium(proxyUrl, headless, log) {
+async function launchFallbackChromium(proxyUrl, headless, locale, log) {
   const { chromium } = await import('playwright-core');
   const pwProxy = toPlaywrightProxy(proxyUrl);
   const launchOpts = {
@@ -132,7 +142,7 @@ async function launchFallbackChromium(proxyUrl, headless, log) {
   const context = await browser.newContext({
     proxy: pwProxy,
     viewport: { width: 1280, height: 800 },
-    locale: 'en-US',
+    locale: locale || 'en-US',
     userAgent:
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
   });

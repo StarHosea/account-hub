@@ -324,5 +324,41 @@ class ActivationAuditService:
             "success": sum(1 for i in latest if i.get("outcome") == OUTCOME_SUCCESS),
         }
 
+    def delete_by_access_tokens(self, tokens: list[str]) -> int:
+        target = {str(token).strip() for token in tokens if str(token).strip()}
+        if not target:
+            return 0
+        removed = 0
+        with self._lock:
+            to_delete = [
+                audit_id
+                for audit_id, item in self._items.items()
+                if str(item.get("access_token") or "").strip() in target
+            ]
+            for audit_id in to_delete:
+                if self._items.pop(audit_id, None) is not None:
+                    removed += 1
+            if removed:
+                self._save()
+        return removed
+
+    def delete_by_emails(self, emails: list[str]) -> int:
+        target = {_norm_email(email) for email in emails if _norm_email(email)}
+        if not target:
+            return 0
+        removed = 0
+        with self._lock:
+            to_delete = [
+                audit_id
+                for audit_id, item in self._items.items()
+                if _norm_email(str(item.get("email") or "")) in target
+            ]
+            for audit_id in to_delete:
+                if self._items.pop(audit_id, None) is not None:
+                    removed += 1
+            if removed:
+                self._save()
+        return removed
+
 
 activation_audit_service = ActivationAuditService()

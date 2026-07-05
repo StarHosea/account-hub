@@ -1006,6 +1006,17 @@ export async function fetchLatestActivationAudit(params: { access_token?: string
   return httpRequest<{ item: ActivationAuditRecord }>(`/api/activation/audit/by-account/latest?${q.toString()}`);
 }
 
+export async function deleteActivationAudit(params: {
+  emails?: string[];
+  access_tokens?: string[];
+  delete_accounts?: boolean;
+}) {
+  return httpRequest<{ removed: number; accounts_removed: number }>("/api/activation/audit", {
+    method: "DELETE",
+    body: params,
+  });
+}
+
 // ── Settings ───────────────────────────────────────────────────────
 
 export async function fetchSettingsConfig() {

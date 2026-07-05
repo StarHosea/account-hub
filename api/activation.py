@@ -19,6 +19,12 @@ class ActivationStartRequest(BaseModel):
     concurrency: int | None = None
 
 
+class ActivationAuditDeleteRequest(BaseModel):
+    emails: list[str] | None = None
+    access_tokens: list[str] | None = None
+    delete_accounts: bool = False
+
+
 class ActivationConfigRequest(BaseModel):
     base_url: str | None = None
     api_key: str | None = None
@@ -129,5 +135,26 @@ def create_router() -> APIRouter:
         if not item:
             raise HTTPException(status_code=404, detail={"error": "未找到该账号的激活审计记录"})
         return {"item": item}
+
+    @router.delete("/api/activation/audit")
+    async def delete_activation_audit(
+        body: ActivationAuditDeleteRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        require_admin(authorization)
+        from services.account_service import account_service
+        from services.activation_audit_service import activation_audit_service
+
+        emails = [str(e).strip() for e in (body.emails or []) if str(e).strip()]
+        tokens = [str(t).strip() for t in (body.access_tokens or []) if str(t).strip()]
+        removed = 0
+        if emails:
+            removed += activation_audit_service.delete_by_emails(emails)
+        if tokens:
+            removed += activation_audit_service.delete_by_access_tokens(tokens)
+        accounts_removed = 0
+        if body.delete_accounts and tokens:
+            accounts_removed = int(account_service.delete_accounts(tokens).get("removed") or 0)
+        return {"removed": removed, "accounts_removed": accounts_removed}
 
     return router

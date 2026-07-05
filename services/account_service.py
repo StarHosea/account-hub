@@ -602,6 +602,7 @@ class AccountService:
             )
         result = openai_account_ops.run_browser_login(
             email, password, totp_secret=totp_secret, account_proxy=account_proxy,
+            country=str(account.get("country") or ""),
         )
         if recorder is not None:
             recorder.record_http(
@@ -640,6 +641,7 @@ class AccountService:
             # 同时复用账号绑定邮箱的 OTP 取码（登录也可能触发邮箱步进）。
             totp_secret = str((account or {}).get("totp_secret") or "").strip()
             account_proxy = str((account or {}).get("proxy") or "").strip()
+            account_country = str((account or {}).get("country") or "").strip()
             # 浏览器 UI 登录取新 token（用账号存的 password+totp；密码错/无密码时 loginChatGPT
             # 内部走邮箱 OTP / 忘记密码兜底）。住宅代理偶发瞬时断连，做幂等重试（每次全新浏览器会话）。
             from services.register import openai_account_ops
@@ -649,6 +651,7 @@ class AccountService:
                     email, password,
                     totp_secret=totp_secret,
                     account_proxy=account_proxy,
+                    country=account_country,
                 )
                 if result.get("ok") or not _is_tls_connection_error(str(result.get("error") or "")):
                     break

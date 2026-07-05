@@ -114,6 +114,7 @@ async function runReal(job) {
     session = await launchSession(job.proxyUrl || '', {
       headless: Boolean(job.headless),
       fingerprintSeed: Number.isInteger(job.fingerprintSeed) ? job.fingerprintSeed : null,
+      locale: job.locale || null,
       log: (m) => log(m),
     });
     const seed = session.seed;

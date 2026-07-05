@@ -646,7 +646,7 @@ def _run_browser_job(
         "headless": bool(config.get("headless")),
         "chatgptUrl": chatgpt_url,
         "timeoutMs": timeout_s * 1000,
-        "locale": (str(identity.accept_language).split(",")[0] or "en-US"),
+        "locale": identity.browser_locale,
         "staticCache": static_cache_job_options(),
     }
     job.update(record_job_options())

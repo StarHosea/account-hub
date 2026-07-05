@@ -339,6 +339,82 @@ export default function RegisterConfigCard() {
         </div>
       </Card>
 
+      <Card id="settings-register-diag" title="诊断与存证" style={{ marginBottom: 16 }}>
+        <Text type="tertiary" style={{ display: "block", marginBottom: 12 }}>
+          注册失败时记录 DOM / 截图 / Trace，供本地 AI 分析。默认「仅保留失败」：注册成功自动清理，不占磁盘。
+          诊断 API 无鉴权，可在设置里填对外域名后复制链接给 Cursor。
+        </Text>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 16 }}>
+          <div>
+            <Text style={{ display: "block", marginBottom: 6 }}>开启失败存证</Text>
+            <Switch checked={config.record_enabled !== false} onChange={setRecordEnabled} disabled={running} />
+          </div>
+          <div>
+            <Text style={{ display: "block", marginBottom: 6 }}>存证策略</Text>
+            <Select
+              value={config.record_keep || "fail"}
+              onChange={(v) => setRecordKeep((String(v) || "fail") as "fail" | "all" | "none")}
+              disabled={running || config.record_enabled === false}
+              style={{ width: "100%" }}
+              optionList={[
+                { label: "仅保留失败（成功自动删）", value: "fail" },
+                { label: "全部保留（调试用）", value: "all" },
+                { label: "关闭存证", value: "none" },
+              ]}
+            />
+          </div>
+          <div style={{ gridColumn: "span 2" }}>
+            <Text style={{ display: "block", marginBottom: 6 }}>存证目录（可选）</Text>
+            <Input
+              value={config.record_dir || ""}
+              onChange={setRecordDir}
+              placeholder="留空使用默认 data/recordings"
+              disabled={running || config.record_enabled === false}
+            />
+          </div>
+          <div style={{ gridColumn: "span 2" }}>
+            <Text style={{ display: "block", marginBottom: 6 }}>诊断对外地址（给本地 AI 的直链域名）</Text>
+            <Input
+              value={config.diag_public_url || ""}
+              onChange={setDiagPublicUrl}
+              placeholder="生产填 https://hao.shuangdeng.space；本地测试留空即用当前访问地址"
+              disabled={running}
+            />
+          </div>
+          <div style={{ gridColumn: "span 2" }}>
+            <Space align="center" wrap>
+              <Text>
+                当前存证占用：<Text strong>{formatBytes(config.record_size_bytes ?? 0)}</Text>
+                {typeof config.record_dir_count === "number" ? (
+                  <Text type="tertiary">（{config.record_dir_count} 个失败现场）</Text>
+                ) : null}
+              </Text>
+              <Button
+                icon={<IconLink />}
+                size="small"
+                onClick={() => {
+                  const base = (config.diag_public_url || window.location.origin).replace(/\/$/, "");
+                  void copyToClipboard(`${base}/api/register/diag/brief.md`, "最近失败诊断链接");
+                }}
+              >
+                复制 AI 诊断链接
+              </Button>
+              <Button icon={<IconRefresh />} size="small" theme="borderless" loading={isLoadingRegister} onClick={() => void loadRegister()}>
+                刷新
+              </Button>
+            </Space>
+            {config.record_resolved_dir ? (
+              <Text type="tertiary" size="small" style={{ display: "block", marginTop: 6 }}>
+                路径：{config.record_resolved_dir}
+              </Text>
+            ) : null}
+            <Text type="tertiary" size="small" style={{ display: "block", marginTop: 6 }}>
+              本地一键拉取：<Text code>python3 scripts/fetch-register-diag.py</Text>
+            </Text>
+          </div>
+        </div>
+      </Card>
+
       <Card id="settings-mail" title="邮箱配置" style={{ marginBottom: 16 }}>
         <div style={{ marginBottom: 12 }}>
           <Text style={{ display: "block", marginBottom: 6 }}>邮箱模式</Text>

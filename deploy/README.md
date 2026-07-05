@@ -43,31 +43,19 @@ sudo docker compose ps                                   # 状态
 
 ## 注册失败诊断 → 本地 AI
 
-服务器域名：**https://hao.shuangdeng.space**（OpenResty 反代 `127.0.0.1:8090`）
+在管理后台 **设置 → 诊断与存证** 配置（不用环境变量）：
 
-**首次部署**在 `~/apps/account-hub/.env` 加上（诊断 JSON 里会带完整 URL）：
+- **存证策略**：`仅保留失败`（成功自动删，默认）
+- **诊断对外地址**：`https://hao.shuangdeng.space`
 
-```bash
-ACCOUNT_HUB_BASE_URL=https://hao.shuangdeng.space
-```
+直链（无鉴权）：
 
-注册失败存证默认开启（`data/recordings`，随 `data/` 卷持久化）。
+- 最近失败：`https://hao.shuangdeng.space/api/register/diag/brief.md`
+- 异常列表：`https://hao.shuangdeng.space/api/register/diag/list`
 
-### 给本地 AI 的直链（无鉴权）
-
-| 链接 | 说明 |
-|------|------|
-| https://hao.shuangdeng.space/api/register/diag/brief.md | 最近一条失败 Markdown 简报 |
-| https://hao.shuangdeng.space/api/register/diag/brief.md?email=a%40b.com | 指定邮箱 |
-| https://hao.shuangdeng.space/api/register/diag/list | 全部异常 + 各条链接 |
-
-### 本地一键拉取（Mac 自动复制剪贴板）
+本地 Mac 一键拉取并复制剪贴板：
 
 ```bash
-cd /path/to/account-hub
-python3 scripts/fetch-register-diag.py          # 最近失败
-python3 scripts/fetch-register-diag.py list       # 异常列表
-python3 scripts/fetch-register-diag.py url        # 只打印 AI 链接
+python3 scripts/fetch-register-diag.py --remote
+python3 scripts/fetch-register-diag.py --local    # 本地 127.0.0.1:8000
 ```
-
-`scripts/diag.local.env` 已默认指向 `https://hao.shuangdeng.space`。

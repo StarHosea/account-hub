@@ -1,50 +1,53 @@
 ---
 name: register-diag-fetch
-description: 从 account-hub 服务器拉注册失败诊断给本地 AI 分析。服务器域名 https://hao.shuangdeng.space ，诊断接口无鉴权。触发：服务器注册失败 / 分析注册失败 / 拉诊断 / 异常清单排查 / register diag。
+description: 从 account-hub 服务器或本地拉注册失败诊断给 AI 分析。诊断 API 无鉴权；地址在「设置→诊断与存证」配置。触发：注册失败分析 / 拉诊断 / fetch-register-diag / 异常清单排查。
 ---
 
-# 服务器注册诊断 → 本地 AI
+# 注册诊断 → 本地 AI
 
-生产服务器：**https://hao.shuangdeng.space**（nginx 反代，诊断 API 无鉴权）
+## 配置位置（不用环境变量）
 
-## 最快方式（推荐）
+在管理后台 **设置 → 注册配置 → 诊断与存证**：
 
-把下面链接直接发给 AI，或让 AI 用 WebFetch/curl 读取：
+| 设置项 | 建议值 |
+|--------|--------|
+| 开启失败存证 | 开 |
+| 存证策略 | **仅保留失败（成功自动删）** |
+| 诊断对外地址 | 生产：`https://hao.shuangdeng.space`；本地留空 |
 
-| 用途 | URL |
-|------|-----|
-| **最近一条失败（Markdown，最适合 AI）** | `https://hao.shuangdeng.space/api/register/diag/brief.md` |
-| 指定邮箱 | `https://hao.shuangdeng.space/api/register/diag/brief.md?email=a%40b.com` |
-| JSON 详情 | `https://hao.shuangdeng.space/api/register/diag/brief?email=a%40b.com` |
-| 全部异常 + 链接 | `https://hao.shuangdeng.space/api/register/diag/list` |
-| 完整诊断包 zip | `https://hao.shuangdeng.space/api/register/diag/artifacts?email=a%40b.com` |
+## 给 AI 的直链（复制即用）
+
+**生产最近一条失败：**
+```
+https://hao.shuangdeng.space/api/register/diag/brief.md
+```
+
+**指定邮箱：**
+```
+https://hao.shuangdeng.space/api/register/diag/brief.md?email=a%40b.com
+```
+
+**本地最近一条失败：**
+```
+http://127.0.0.1:8000/api/register/diag/brief.md
+```
 
 ## 本地一键脚本
 
 ```bash
-# 最近失败 → 打印 Markdown + 复制到剪贴板
-python3 scripts/fetch-register-diag.py
-
-# 指定邮箱
-python3 scripts/fetch-register-diag.py user@example.com
-
-# 只看链接（复制给 AI fetch）
-python3 scripts/fetch-register-diag.py url
-
-# 异常列表
+python3 scripts/fetch-register-diag.py           # 自动：先本地后远程
+python3 scripts/fetch-register-diag.py --local   # 只拉本地
+python3 scripts/fetch-register-diag.py --remote  # 只拉生产
 python3 scripts/fetch-register-diag.py list
+python3 scripts/fetch-register-diag.py url
 ```
 
-配置在 `scripts/diag.local.env`：`ACCOUNT_HUB_URL=https://hao.shuangdeng.space`
+Mac 下自动复制 Markdown 到剪贴板。
 
-## AI 分析时应关注
+## AI 分析关注点
 
-1. `failed_step` + `manifest_tail` → 卡在哪一步
-2. `visible_ui.buttons` / `hints` → selector 或文案是否变了
-3. `pageState` + `state_reason` → 状态机判错还是真卡死
-4. `logs_tail` → 超时/代理/验证码等基础设施问题
-5. 需要网络时序 → 下 `trace.zip` 用 `npx playwright show-trace`
-
-## 管理后台
-
-注册页 → 异常清单 → 点链接图标可复制该邮箱的诊断 URL。
+1. `failed_step` + `manifest_tail` — 卡在哪一步
+2. `visible_ui` — 按钮/提示是否改版
+3. `pageState` — 状态机是否判错
+4. `logs_tail` — 代理/验证码/超时
+5. 需网络时序 → `/api/register/diag/trace?email=...`

@@ -27,7 +27,7 @@ class RegisterRecordConfigTest(unittest.TestCase):
         self.assertTrue(cfg["record_enabled"])
         self.assertEqual(cfg["record_keep"], "fail")
 
-    def test_spawn_worker_sets_record_env(self):
+    def test_spawn_worker_sets_record_on_job(self):
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.dict(openai_register.config, {
                 "record_enabled": True,
@@ -36,19 +36,21 @@ class RegisterRecordConfigTest(unittest.TestCase):
             }, clear=False):
                 with mock.patch("services.register.openai_register.subprocess.Popen") as popen:
                     popen.return_value = mock.Mock()
-                    openai_register._spawn_worker({"email": "a@b.com"})
-        env = popen.call_args.kwargs["env"]
-        self.assertEqual(env["REG_RECORD_DIR"], tmp)
-        self.assertEqual(env["REG_RECORD_KEEP"], "fail")
+                    openai_register._spawn_worker({"email": "a@b.com", "recordDir": tmp, "recordKeep": "fail"})
+        cmd = popen.call_args.args[0]
+        job = json.loads(cmd[2])
+        self.assertEqual(job["recordDir"], tmp)
+        self.assertEqual(job["recordKeep"], "fail")
 
-    def test_spawn_worker_clears_record_env_when_disabled(self):
-        with mock.patch.dict(openai_register.config, {"record_enabled": False}, clear=False):
-            with mock.patch("services.register.openai_register.subprocess.Popen") as popen:
-                with mock.patch.dict("os.environ", {"REG_RECORD_DIR": "/tmp/old"}, clear=False):
-                    popen.return_value = mock.Mock()
-                    openai_register._spawn_worker({"email": "a@b.com"})
-        env = popen.call_args.kwargs["env"]
-        self.assertNotIn("REG_RECORD_DIR", env)
+    def test_record_job_options_default_keep_fail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(openai_register.config, {
+                "record_enabled": True,
+                "record_dir": tmp,
+            }, clear=False):
+                opts = openai_register.record_job_options()
+        self.assertEqual(opts["recordDir"], tmp)
+        self.assertEqual(opts["recordKeep"], "fail")
 
 
 class RegisterDiagServiceTest(unittest.TestCase):

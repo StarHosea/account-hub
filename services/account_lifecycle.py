@@ -312,7 +312,7 @@ def account_in_view(account: dict[str, Any], view: str) -> bool:
     stage = str(item.get("stage") or "")
     plan = str(item.get("plan") or PLAN_FREE)
     if view == "free":
-        if stage in (STAGE_UNREGISTERED, STAGE_REGISTERING):
+        if stage in (STAGE_UNREGISTERED, STAGE_REGISTERING, STAGE_ACTIVATING):
             return False
         if stage not in FREE_STAGES:
             return False
@@ -435,8 +435,9 @@ def migrate_legacy(account_service, mailbox_service) -> int:
         with account_service._lock:
             for key, raw in list(account_service._accounts.items()):
                 enriched = enrich_account(raw)
-                if enriched != raw:
-                    account_service._accounts[key] = enriched
+                account_service._accounts[key] = enriched
+                next_key = account_service._rekey_account_locked(key)
+                if enriched != raw or next_key != key:
                     changed += 1
             if changed:
                 account_service._save_accounts()
@@ -487,12 +488,20 @@ def migrate_legacy(account_service, mailbox_service) -> int:
                 item["access_token"] = str(mailbox.get("account_token"))
 
             enriched = enrich_account(item)
+            next_key = account_service._rekey_account_locked(key)
+            if next_key != key:
+                account_service._accounts.pop(key, None)
+                key = next_key
             account_service._accounts[key] = enriched
             changed += 1
 
         for key, raw in list(account_service._accounts.items()):
             enriched = enrich_account(raw)
-            if enriched != raw:
+            next_key = account_service._rekey_account_locked(key)
+            if next_key != key:
+                account_service._accounts.pop(key, None)
+                key = next_key
+            if enriched != account_service._accounts.get(key):
                 account_service._accounts[key] = enriched
                 changed += 1
 

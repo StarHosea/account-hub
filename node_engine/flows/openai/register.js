@@ -1,6 +1,7 @@
 import { sleep, generateRandomName, generateRandomBirthday, generatePassword, generateTotpNow } from '../../utils.js';
 import * as S from './selectors.js';
 import { detectInvalidCode } from './code-errors.js';
+import { throwIfRateLimited } from './rate-limit.js';
 import { detectAuthState, PAGE_STATE } from './auth-state.js';
 
 // 未开启 DOM 记录时的空记录器（record/finalize 均无副作用，保证生产零开销）。
@@ -113,14 +114,16 @@ async function humanClickByText(page, texts, { timeout = 15000, poll = 400, excl
 }
 
 // 轮询等待某选择器可见后返回其 locator（等待窗口弹出，不是绕过）。
+// 轮询期间若命中限流页则立即抛错，避免长时间空等。
 async function firstVisible(page, selector, { timeout = 15000 } = {}) {
-  try {
-    const loc = page.locator(selector).first();
-    await loc.waitFor({ state: 'visible', timeout });
-    return loc;
-  } catch {
-    return null;
+  const deadline = Date.now() + timeout;
+  const loc = page.locator(selector).first();
+  while (Date.now() < deadline) {
+    await throwIfRateLimited(page);
+    if (await loc.isVisible().catch(() => false)) return loc;
+    await sleep(400);
   }
+  return null;
 }
 
 /** 步骤级时间预算：避免单步长轮询把整轮注册拖到 register_timeout 才失败。 */
@@ -330,6 +333,7 @@ async function waitForPostEmailLanding(page, log, { timeoutMs = 120000, poll = 1
 
     if (state === 'code') { log('已跳转到验证码页'); return 'code'; }
     if (state === 'password') { log('已跳转到密码页'); return 'password'; }
+    await throwIfRateLimited(page, log);
     if (!logged) { log('正在加载，等待跳转到验证码页…'); logged = true; }
     await sleep(poll);
   }
@@ -659,6 +663,7 @@ async function forgotPasswordFlow({ page, email, requestCode, log, recorder = NO
   if (/reset-password/i.test(page.url())) {
     const moved2 = await clickButtonRobust(page, /继续|continue|发送|send/i, { timeout: 12000, tries: 4, reloadOnFail: true, log });
     log(`重设密码 · 点击继续发送重置邮件，${moved2 ? '页面已跳转' : '页面未变化'}`);
+    await throwIfRateLimited(page, log);
     await sleep(2500);
     await snapshot(page, 'forgot-02-after-continue', log);
   }
@@ -674,6 +679,7 @@ async function forgotPasswordFlow({ page, email, requestCode, log, recorder = NO
     await snapshot(page, 'forgot-03-after-code', log);
     await mark('forgot-03-code', '忘记密码：重置码已提交');
   } else {
+    await throwIfRateLimited(page, log);
     log('重设密码 · 未出现验证码输入页，继续尝试');
     await snapshot(page, 'forgot-02b-no-code', log);
   }
@@ -795,6 +801,7 @@ async function waitForLoginPasswordOutcome(page, beforeUrl, { timeoutMs = 8000, 
     try {
       if (page.url() !== beforeUrl) return 'navigated';
     } catch { /* page closed */ }
+    await throwIfRateLimited(page);
     if (await isLoginPasswordRejected(page)) return 'rejected';
     await sleep(pollMs);
   }
@@ -1514,30 +1521,32 @@ async function fillCode(page, code, log) {
 // OpenAI 偶发异常页：提交（密码 / 邮箱验证码 / 2FA 一次性码）后出现「请求超出限制
 // rate_limit_exceeded」或「网络异常」，页面带一个「重试」按钮。用稳定属性
 // data-dd-action-name="Try again" 定位（class 是 hash 混淆的不可靠），兜底文案「重试/Try again」。
-// 检测到就点重试，最多 max 次；限流时多冷却。点官方重试 UI 属正常操作、非规避检测；
-// 日志如实记录（限流/网络）便于排查。返回是否点过重试。
+// 限流页：不重试、不阻塞，立即抛错终止本账号任务（其它并发注册不受影响）。
+// 网络类异常：点重试，最多 max 次。返回是否点过重试。
 async function clickRetryIfError(page, log, { max = 3, cooldownMs = 4000 } = {}) {
+  await throwIfRateLimited(page, log);
+
   let did = false;
   for (let i = 0; i < max; i += 1) {
     const found = await page.evaluate(() => {
       const vis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
       const text = document.body?.innerText || '';
-      const rate = /rate_limit_exceeded|请求超出限制|too many requests/i.test(text);
-      const isErr = rate || /网络.*(异常|错误)|network error|出了点问题|出错了|糟糕|something went wrong|请稍后.*重试/i.test(text);
+      const isErr = /网络.*(异常|错误)|network error|出了点问题|something went wrong|请稍后.*重试/i.test(text);
       let btn = document.querySelector('[data-dd-action-name="Try again"]');
       if (!(btn && vis(btn))) {
         btn = [...document.querySelectorAll('button,[role="button"]')].filter(vis)
           .find((b) => /^(重试|再试一次|重新尝试|try again|retry)$/i.test((b.innerText || '').trim()));
       }
-      if (btn && vis(btn)) { btn.setAttribute('data-reg-retry', '1'); return { isErr, rate }; }
+      if (btn && vis(btn) && isErr) { btn.setAttribute('data-reg-retry', '1'); return { isErr: true }; }
       return null;
     }).catch(() => null);
     if (!found) break;
+    await throwIfRateLimited(page, log);
     await page.click('[data-reg-retry="1"]', { timeout: 4000 }).catch(() => {});
     await page.evaluate(() => document.querySelector('[data-reg-retry]')?.removeAttribute('data-reg-retry')).catch(() => {});
-    log(`检测到请求受限，已点击重试，第 ${i + 1}/${max} 次`, 'warn');
+    log(`检测到网络异常页，已点击重试，第 ${i + 1}/${max} 次`, 'warn');
     did = true;
-    await sleep(found.rate ? cooldownMs * 2 : cooldownMs); // 限流多等一会
+    await sleep(cooldownMs);
   }
   return did;
 }

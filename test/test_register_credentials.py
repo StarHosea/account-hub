@@ -44,7 +44,8 @@ class RegisterCredentialsPersistenceTest(unittest.TestCase):
         assert account is not None
         self.assertEqual(account.get("password"), "PwReg123!")
         self.assertEqual(account.get("totp_secret"), "JBSWY3DPEHPK3PXP")
-        self.assertNotIn(email_key, self.service._accounts)
+        self.assertIn(email_key, self.service._accounts)
+        self.assertNotIn(self.TOKEN, self.service._accounts)
 
     def test_complete_registration_accepts_credentials_in_payload(self) -> None:
         email_key = email_storage_key(self.EMAIL)

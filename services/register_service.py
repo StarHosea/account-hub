@@ -46,7 +46,7 @@ def _default_config() -> dict:
         # 浏览器引擎（CloakBrowser）相关：注册内核已完全替换为浏览器引擎
         "engine": "browser",
         "headless": False,
-        "register_timeout": 300,
+        "register_timeout": 900,
         "node_bin": "node",
         # 浏览器静态资源 route 缓存（JS/CSS/字体等，不共享 Cookie）
         "static_cache_enabled": True,
@@ -130,7 +130,7 @@ def _normalize(raw: dict) -> dict:
     # register_timeout 每账号整轮超时（秒）；node_bin 为 node 可执行文件。
     cfg["engine"] = "browser"
     cfg["headless"] = bool(raw.get("headless"))
-    cfg["register_timeout"] = min(1800, max(60, int(raw.get("register_timeout") or 300)))
+    cfg["register_timeout"] = min(1800, max(60, int(raw.get("register_timeout") or 900)))
     cfg["node_bin"] = str(raw.get("node_bin") or "node").strip() or "node"
     cfg["static_cache_enabled"] = bool(raw.get("static_cache_enabled", cfg["static_cache_enabled"]))
     cfg["static_cache_max_age_days"] = min(90, max(1, int(raw.get("static_cache_max_age_days") or cfg["static_cache_max_age_days"])))

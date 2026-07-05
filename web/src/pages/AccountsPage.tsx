@@ -139,6 +139,14 @@ function downloadText(text: string, name: string) {
 
 export type AccountPlanPage = "free" | "plus";
 
+function accountKey(a: Account): string {
+  return (a.email || a.access_token || "").trim();
+}
+
+function accountOpKey(a: Account): string {
+  return (a.access_token || a.email || "").trim();
+}
+
 export default function AccountsPage({ planType }: { planType: AccountPlanPage }) {
   const isMobile = useIsMobile();
   const [accounts, setAccounts] = useState<Account[]>([]);
@@ -202,7 +210,7 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
       setAccounts(data.items);
       setSummary(data.summary);
       setTotal(data.total);
-      setSelectedKeys((prev) => prev.filter((k) => data.items.some((a) => a.access_token === k)));
+      setSelectedKeys((prev) => prev.filter((k) => data.items.some((a) => accountKey(a) === k)));
     } catch (e) {
       Toast.error(e instanceof Error ? e.message : "加载账户失败");
     } finally {
@@ -348,7 +356,7 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
           page: 1,
           page_size: Math.max(total, 1),
         });
-        tokens = data.items.map((a) => a.access_token);
+        tokens = data.items.map((a) => accountOpKey(a)).filter(Boolean);
         if (!tokens.length) {
           Toast.warning("没有可导出的账号");
           return;
@@ -421,7 +429,7 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
           typeof (it as { access_token?: unknown }).access_token === "string" &&
           !!(it as { access_token?: string }).access_token,
       );
-      tokens = accounts.map((a) => a.access_token);
+      tokens = accounts.map((a) => accountOpKey(a)).filter(Boolean);
     } else if (isAccountPoolImportText(raw)) {
       importBlobText = raw;
     } else {
@@ -504,7 +512,7 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
     {
       title: "状态",
       width: 110,
-      render: (_: unknown, a: Account) => stageTag(a, refreshing.has(a.access_token)),
+      render: (_: unknown, a: Account) => stageTag(a, refreshing.has(accountKey(a))),
     },
     {
       title: "出口IP/国家",
@@ -594,8 +602,8 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
               theme="borderless"
               icon={<IconRefresh />}
               title="校验/刷新"
-              loading={refreshing.has(a.access_token)}
-              onClick={() => void handleRefresh([a.access_token])}
+              loading={refreshing.has(accountKey(a))}
+              onClick={() => void handleRefresh([accountOpKey(a)])}
             />
             {planType === "plus" && a.stage === "plus_review" ? (
               <Button
@@ -604,10 +612,10 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
                 type="warning"
                 title="撤销激活"
                 icon={<IconClose />}
-                onClick={() => openRevokeActivationModal([a.access_token])}
+                onClick={() => openRevokeActivationModal([accountOpKey(a)])}
               />
             ) : null}
-            <Popconfirm title="删除该账号？" onConfirm={() => void handleDelete([a.access_token])}>
+            <Popconfirm title="删除该账号？" onConfirm={() => void handleDelete([accountKey(a)])}>
               <Button size="small" theme="borderless" type="danger" icon={<IconDelete />} title="删除" />
             </Popconfirm>
           </Space>
@@ -616,9 +624,9 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
     },
   ];
 
-  const allOnPageSelected = accounts.length > 0 && accounts.every((a) => selectedKeys.includes(a.access_token));
+  const allOnPageSelected = accounts.length > 0 && accounts.every((a) => selectedKeys.includes(accountKey(a)));
   const toggleSelectAll = () =>
-    setSelectedKeys(allOnPageSelected ? [] : accounts.map((a) => a.access_token));
+    setSelectedKeys(allOnPageSelected ? [] : accounts.map((a) => accountKey(a)).filter(Boolean));
   const toggleOne = (token: string) =>
     setSelectedKeys((prev) => (prev.includes(token) ? prev.filter((t) => t !== token) : [...prev, token]));
 
@@ -627,7 +635,6 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
       ? [
           { label: "总数", value: summary.total },
           { label: "已注册", value: summary.registered ?? 0, color: "var(--semi-color-success)" },
-          { label: "激活中", value: summary.activating ?? 0, color: "var(--semi-color-warning)" },
         ]
       : [
           { label: "总数", value: summary.total },
@@ -642,7 +649,6 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
       ? [
           { label: "全部状态", value: "" },
           { label: "已注册", value: "registered" },
-          { label: "激活中", value: "activating" },
         ]
       : [
           { label: "全部状态", value: "" },
@@ -777,7 +783,7 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
           columns={columns}
           dataSource={accounts}
           loading={loading}
-          rowKey="access_token"
+          rowKey={(a) => accountKey(a as Account)}
           tableLayout="fixed"
           scroll={{ x: 1680 }}
           pagination={{
@@ -982,18 +988,19 @@ function AccountMobileList({
 
       <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
         {accounts.map((a) => {
-          const checked = selected.includes(a.access_token);
+          const key = accountKey(a);
+          const checked = selected.includes(key);
           const token = a.access_token || "";
-          const statusNode = stageTag(a, refreshing.has(a.access_token));
+          const statusNode = stageTag(a, refreshing.has(key));
           return (
             <Card
-              key={a.access_token}
+              key={key}
               bodyStyle={{ padding: 14 }}
               style={{ borderColor: checked ? "var(--semi-color-primary)" : undefined }}
             >
               {/* 顶行：勾选 + 邮箱 + 状态 */}
               <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
-                <Checkbox checked={checked} onChange={() => onToggle(a.access_token)} />
+                <Checkbox checked={checked} onChange={() => onToggle(key)} />
                 {a.email ? (
                   <Text
                     strong
@@ -1043,10 +1050,10 @@ function AccountMobileList({
                   theme="borderless"
                   icon={<IconRefresh />}
                   title="校验/刷新"
-                  loading={refreshing.has(a.access_token)}
-                  onClick={() => onRefresh(a.access_token)}
+                  loading={refreshing.has(key)}
+                  onClick={() => onRefresh(accountOpKey(a))}
                 />
-                <Popconfirm title="删除该账号？" onConfirm={() => onDelete(a.access_token)}>
+                <Popconfirm title="删除该账号？" onConfirm={() => onDelete(key)}>
                   <Button size="small" theme="borderless" type="danger" icon={<IconDelete />} title="删除" />
                 </Popconfirm>
               </div>

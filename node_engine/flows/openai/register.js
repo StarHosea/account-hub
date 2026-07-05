@@ -72,6 +72,30 @@ async function firstVisible(page, selector, { timeout = 15000 } = {}) {
   }
 }
 
+// 按 data-testid 真实点击。OpenAI 设置面板每个 tab 都带稳定 testid（如 security-tab），
+// 远比中文文案可靠：不受本地化/文案改动影响，也不会被新增的“内容安全”(safety-setting-tab) 抢词。
+async function clickByTestId(page, testid, { timeout = 6000 } = {}) {
+  try {
+    const loc = page.locator(`[data-testid="${testid}"]`).first();
+    await loc.waitFor({ state: 'visible', timeout });
+    await loc.click({ timeout: 5000 });
+    return testid;
+  } catch {
+    return null;
+  }
+}
+
+// 设置弹窗是否已打开（存在 dialog 且能看到设置 tab）。
+async function settingsDialogOpen(page) {
+  return page.evaluate(() => {
+    const vis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
+    const hasDialog = [...document.querySelectorAll('[role=dialog]')].some(vis);
+    const hasTab = !!document.querySelector('[data-testid="security-tab"],[data-testid="account-tab"],[data-testid="data-controls-tab"]');
+    return hasDialog && hasTab;
+  }).catch(() => false);
+}
+
+
 // 模拟人输入：点击聚焦 -> 全选清空 -> 逐字符带延迟输入（humanize 接管键盘节奏）。
 async function humanType(locator, value) {
   await locator.click({ delay: 40 });
@@ -1161,6 +1185,12 @@ async function openSettings(page, log) {
   await sleep(1200);
   const clicked = await humanClickByText(page, ['设置', 'settings'], { timeout: 6000 });
   await sleep(2500);
+  // 兜底：账户菜单/设置项点击不稳时，设置弹窗为 hash 路由（chatgpt.com/#settings），直接直达。
+  if (!(await settingsDialogOpen(page))) {
+    log('步骤8：菜单未打开设置弹窗，改用 #settings 直达');
+    await page.evaluate(() => { window.location.hash = 'settings'; }).catch(() => {});
+    await sleep(2800);
+  }
   return clicked;
 }
 
@@ -1185,7 +1215,14 @@ async function waitForSecurityTabReady(page, { timeout = 20000 } = {}) {
         const txt = (el.innerText || '').trim();
         return txt.length < 200 && /authenticator|验证器应用|身份验证器/i.test(txt);
       });
-      return hasPasswordRow || hasAuthRow;
+      // 全新号安全tab里密码尚未设置，只有“设置密码”按钮 + 多重验证入口——
+      // 上面两个检测会漏判。补：security-tab 处于选中态，或出现“设置密码/多重验证”即算就绪。
+      const secTabActive = !!document.querySelector('[data-testid="security-tab"][aria-selected="true"],[data-testid="security-tab"][data-state="active"]');
+      const hasSecurityContent = rows.some((el) => {
+        const txt = (el.innerText || '').trim();
+        return txt.length < 200 && /设置密码|create password|set password|多重验证|多因素|two-factor|multi-factor|恢复码|recovery code|通行密钥|passkey/i.test(txt);
+      });
+      return hasPasswordRow || hasAuthRow || secTabActive || hasSecurityContent;
     }).catch(() => false);
 
     if (ready) return true;
@@ -1202,8 +1239,13 @@ async function openSecurityTab(page, log, { maxRetries = 3 } = {}) {
     // 打开设置
     await openSettings(page, log);
 
-    // 点击安全tab
-    const secTab = await humanClickByText(page, ['账户安全与登录', '帐户安全与登录', 'security', 'account security'], { timeout: 6000 }).catch(() => null);
+    // 点击安全tab：优先用稳定 testid（security-tab），失败再退回中文文案。
+    // 注意：设置面板新增了“内容安全”(safety-setting-tab)，任何按“安全”做包含匹配都会误点它，
+    // 所以文案兜底只用完整词“账户安全与登录”，绝不用裸“安全/security”。
+    let secTab = await clickByTestId(page, 'security-tab', { timeout: 6000 });
+    if (!secTab) {
+      secTab = await humanClickByText(page, ['账户安全与登录', '帐户安全与登录', 'account security & sign in'], { timeout: 6000 }).catch(() => null);
+    }
     log(`步骤8：点击安全tab「${secTab || '未命中'}」`);
     await sleep(1800);
 
@@ -1477,3 +1519,5 @@ async function extractTotpSecret(page) {
 
 export default { registerChatGPT, loginChatGPT, secureExistingChatGPT };
 export { step8_setupPasswordAnd2FA, dismissWelcomeOverlays, fillCode, isOnCodePage, isLoggedInUrl };
+// 内部辅助导出（供 scripts/ 勘察脚本按生产同款路径复现，不改变行为）
+export { openSettings, openSecurityTab, waitForSecurityTabReady };

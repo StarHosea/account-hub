@@ -18,20 +18,34 @@ class RegisterTimeoutTest(unittest.TestCase):
         openai_register.reset_stop_requested()
         openai_register.reset_progress()
 
-    def test_default_register_timeout_is_15_minutes(self):
-        with mock.patch.dict(openai_register.config, {"register_timeout": 900}, clear=False):
-            self.assertEqual(openai_register._register_timeout_s(), 900)
+    def test_default_register_timeout_is_10_minutes(self):
+        from services.register_service import _normalize
+
+        cfg = _normalize({})
+        self.assertEqual(cfg["register_timeout"], 600)
+        self.assertEqual(cfg["ip_duration"], 10)
+
+        with mock.patch.dict(openai_register.config, {"register_timeout": 600}, clear=False):
+            self.assertEqual(openai_register._register_timeout_s(), 600)
+
+    def test_ip_duration_follows_register_timeout(self):
+        from services.register_service import _normalize
+
+        cfg = _normalize({"register_timeout": 600})
+        self.assertEqual(cfg["register_timeout"], 600)
+        self.assertEqual(cfg["ip_duration"], 10)
+
+        cfg2 = _normalize({"register_timeout": 120})
+        self.assertEqual(cfg2["ip_duration"], 2)
 
     def test_worker_fails_when_deadline_elapsed_before_browser(self):
         mailbox = {"provider": mail_provider.API_MAILBOX_TYPE, "address": "a@b.com", "fetch_url": "http://x"}
-        # worker 启动时记 deadline；邮箱/代理步骤很快走完，到启动浏览器前时钟已越过 deadline。
-        time_seq = iter([1000.0, 1000.0, 1000.0, 1002.0, 1002.0, 1002.0])
-        with mock.patch.dict(openai_register.config, {"register_timeout": 1}, clear=False):
-            with mock.patch("services.register.openai_register.time.time", side_effect=lambda: next(time_seq)):
-                with mock.patch.object(mail_provider, "create_mailbox", return_value=mailbox):
-                    with mock.patch.object(openai_register, "_acquire_working_proxy", return_value=("", "")):
-                        with mock.patch.object(openai_register, "_run_browser_job") as browser_job:
-                            result = openai_register.worker(1)
+        checks = iter([60.0, 60.0, 0.0, 0.0])
+        with mock.patch.object(openai_register, "_remaining_task_seconds", side_effect=lambda _d: next(checks)):
+            with mock.patch.object(mail_provider, "create_mailbox", return_value=mailbox):
+                with mock.patch.object(openai_register, "_acquire_working_proxy", return_value=("", "")):
+                    with mock.patch.object(openai_register, "_run_browser_job") as browser_job:
+                        result = openai_register.worker(1)
         browser_job.assert_not_called()
         self.assertFalse(result.get("ok"))
         self.assertIn("注册超时", str(result.get("error") or ""))
@@ -41,13 +55,14 @@ class RegisterTimeoutTest(unittest.TestCase):
         identity = openai_register.build_identity(enabled_regions=["US"])
         deadline_at = time.time() - 1
         with mock.patch.object(openai_register, "_spawn_worker") as spawn:
-            data, err, partial = openai_register._run_browser_job(
+            data, err, partial, recording_dir = openai_register._run_browser_job(
                 1, "a@b.com", mailbox, "", identity, deadline_at=deadline_at,
             )
         spawn.assert_not_called()
         self.assertIsNone(data)
         self.assertIn("注册超时", str(err or ""))
         self.assertEqual(partial, {})
+        self.assertEqual(recording_dir, "")
 
 
 if __name__ == "__main__":

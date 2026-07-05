@@ -26,6 +26,7 @@ from services.register.fingerprint import (
     parse_proxy,
     rotate_ipweb_proxy,
 )
+from services.config import DATA_DIR
 from services.register_abnormal_service import register_abnormal_service
 
 base_dir = Path(__file__).resolve().parent
@@ -52,27 +53,23 @@ config = {
     # 浏览器引擎相关（由 register_service._push_to_worker 下发）
     "engine": "browser",
     "headless": False,
-    "register_timeout": 900,
+    "register_timeout": 600,
     "node_bin": "node",
     "cloakbrowser_license": "",
     "static_cache_enabled": True,
     "static_cache_max_age_days": 7,
     "static_cache_dir": "",
+    "record_enabled": True,
+    "record_dir": "",
+    "record_keep": "fail",
+    "diag_public_url": "",
 }
-_LEGACY_REGISTER_FILE = base_dir.parents[1] / "data" / "register.json"
 _CONFIG_KEYS = (
     "mail", "proxy", "total", "threads", "regions", "ipweb_rotate", "ip_duration",
     "enable_2fa", "headless", "register_timeout", "node_bin", "ip_probe_retries",
     "static_cache_enabled", "static_cache_max_age_days", "static_cache_dir",
+    "record_enabled", "record_dir", "record_keep", "diag_public_url",
 )
-
-
-def _merge_legacy_register_file() -> None:
-    try:
-        saved_config = json.loads(_LEGACY_REGISTER_FILE.read_text(encoding="utf-8"))
-        config.update({key: saved_config[key] for key in _CONFIG_KEYS if key in saved_config})
-    except Exception:
-        pass
 
 
 def refresh_config_from_storage() -> None:
@@ -90,10 +87,8 @@ def refresh_config_from_storage() -> None:
         data = app_config.get_storage_backend().load_state("register")
         if isinstance(data, dict):
             config.update({key: data[key] for key in _CONFIG_KEYS if key in data})
-            return
     except Exception:
         pass
-    _merge_legacy_register_file()
 
 
 def ensure_config_loaded() -> None:
@@ -297,17 +292,22 @@ def _log_proxy_assignment(index: int, identity, acct_proxy: str, exit_ip: str) -
         step(index, f"{label}已就绪，地区 {region}，未能检测出口 IP，继续使用代理", "yellow")
 
 
+def _ip_duration_minutes() -> int:
+    """ipweb 一号一 IP 粘性时长（分钟），与 register_timeout 对齐。"""
+    return max(1, (_register_timeout_s() + 59) // 60)
+
+
 def _resolve_account_proxy(identity) -> str:
     """按账号解析专属出口代理（不探活，仅归一化 / 换段换 SID）。
 
     ipweb 开启则换国家段 + 全新 SID（号一号一 IP），否则归一化沿用。
-    duration 取 config["ip_duration"]（分钟），延长同 IP 粘性，覆盖注册全程及后续单次操作。
+    duration 取与 register_timeout 对齐的分钟数，覆盖注册全程及后续单次操作。
     """
     base = config.get("proxy") or ""
     if not base:
         return ""
     if config.get("ipweb_rotate"):
-        dur = int(config.get("ip_duration") or 120)
+        dur = _ip_duration_minutes()
         rotated, sid = rotate_ipweb_proxy(base, identity.region.ipweb_country, duration=dur)
         if sid is not None:
             return rotated
@@ -521,6 +521,30 @@ def _build_account(data: dict, email: str, acct_proxy: str, identity, exit_ip: s
     }
 
 
+def _resolve_record_dir() -> str:
+    if not bool(config.get("record_enabled", True)):
+        return ""
+    raw = str(config.get("record_dir") or "").strip()
+    if raw:
+        path = Path(raw)
+        resolved = path if path.is_absolute() else DATA_DIR.parent / path
+    else:
+        resolved = DATA_DIR / "recordings"
+    return str(resolved)
+
+
+def record_job_options() -> dict:
+    """注册存证选项：经 job JSON 传给 worker（不依赖环境变量）。"""
+    record_dir = _resolve_record_dir()
+    if not record_dir:
+        return {}
+    keep = str(config.get("record_keep") or "fail").strip().lower()
+    return {
+        "recordDir": record_dir,
+        "recordKeep": keep if keep in {"fail", "all", "none"} else "fail",
+    }
+
+
 def _spawn_worker(job: dict) -> subprocess.Popen:
     env = {**os.environ}
     license_key = str(config.get("cloakbrowser_license") or "").strip() or os.getenv("CLOAKBROWSER_LICENSE_KEY", "")
@@ -559,7 +583,7 @@ def _lookup_stored_credentials(email: str) -> tuple[str, str]:
 
 
 def _register_timeout_s() -> int:
-    return int(config.get("register_timeout") or 900)
+    return int(config.get("register_timeout") or 600)
 
 
 def _remaining_task_seconds(deadline_at: float) -> float:
@@ -607,11 +631,11 @@ def _run_browser_job(
     identity,
     *,
     deadline_at: float,
-) -> tuple[dict | None, str | None, dict]:
-    """启动 Node 子进程跑浏览器流程，泵 NDJSON，返回 (result_data, error_msg, partial)。"""
+) -> tuple[dict | None, str | None, dict, str]:
+    """启动 Node 子进程跑浏览器流程，泵 NDJSON，返回 (result_data, error_msg, partial, recording_dir)。"""
     remaining = _remaining_task_seconds(deadline_at)
     if remaining <= 0:
-        return None, _timeout_error_message(), {}
+        return None, _timeout_error_message(), {}, ""
 
     timeout_s = max(1, int(remaining))
     job = {
@@ -625,6 +649,7 @@ def _run_browser_job(
         "locale": (str(identity.accept_language).split(",")[0] or "en-US"),
         "staticCache": static_cache_job_options(),
     }
+    job.update(record_job_options())
     # 若该邮箱本地已存过凭据（此前注册过），注入登录密码/2FA 密钥：
     # 注册中一旦发现邮箱已注册（登录页），先用存储密码登录，错了再忘记密码重设。
     stored_pwd, stored_totp = _lookup_stored_credentials(email)
@@ -670,6 +695,7 @@ def _run_browser_job(
     data: dict | None = None
     err_msg: str | None = None
     partial: dict = {}
+    recording_dir = ""
     try:
         while True:
             raw_line = _next_worker_line(proc, out_q, deadline_at)
@@ -710,10 +736,12 @@ def _run_browser_job(
                     step(index, "等待验证码超时，邮箱中未收到新邮件", "yellow")
             elif etype == "result":
                 data = evt.get("data") or {}
+                recording_dir = str(evt.get("recordingDir") or recording_dir or "")
                 break
             elif etype == "error":
                 err_msg = str(evt.get("message") or "注册失败")
                 partial = evt.get("partial") or {}
+                recording_dir = str(evt.get("recordingDir") or recording_dir or "")
                 break
     except Exception as exc:  # noqa: BLE001
         err_msg = err_msg or f"读取引擎输出异常：{exc}"
@@ -730,7 +758,7 @@ def _run_browser_job(
             # 引擎 stderr 可能含浏览器组件内部字样/文件路径，仅记入服务端日志，不透出前端
             with print_lock:
                 print(f"{datetime.now().strftime('%H:%M:%S')} 任务{index} 引擎 stderr 末尾：{''.join(stderr_tail[-5:]).strip()}")
-    return data, err_msg, partial
+    return data, err_msg, partial, recording_dir
 
 
 def worker(index: int) -> dict:
@@ -827,7 +855,7 @@ def worker(index: int) -> dict:
         if _remaining_task_seconds(deadline_at) <= 0:
             return _fail_timeout()
 
-        data, err_msg, partial = _run_browser_job(
+        data, err_msg, partial, recording_dir = _run_browser_job(
             index, email, mailbox, browser_proxy, identity, deadline_at=deadline_at,
         )
 
@@ -876,10 +904,12 @@ def worker(index: int) -> dict:
         # —— 失败：可能带 partial token（step8 失败但已拿 token）—— #
         mailbox_settled = True
         token = str((partial or {}).get("accessToken") or "").strip()
+        abnormal_extra = {"recording_path": recording_dir} if recording_dir else {}
         if token:
             register_abnormal_service.add(
                 email, fetch_url=fetch_url, reason=str(err_msg or "register_error"),
                 access_token=token, password=(partial or {}).get("password"),
+                **abnormal_extra,
             )
             mailbox["access_token"] = token
             mail_provider.mark_mailbox_result(mailbox, success=True)
@@ -887,6 +917,7 @@ def worker(index: int) -> dict:
         else:
             register_abnormal_service.add(
                 email, fetch_url=fetch_url, reason=str(err_msg or "register_error"),
+                **abnormal_extra,
             )
             mail_provider.mark_mailbox_result(mailbox, success=False, error=err_msg)
             log(f"{email} 注册失败，已记入异常清单：{err_msg}", "yellow")

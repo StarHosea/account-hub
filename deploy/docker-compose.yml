@@ -4,6 +4,7 @@
 #   STORAGE_BACKEND=postgres
 #   DATABASE_URL=postgresql://account_hub:<password>@sub2api-postgres:5432/account_hub
 #   ACCOUNT_HUB_AUTH_KEY=<key>
+#   ACCOUNT_HUB_BASE_URL=https://hao.shuangdeng.space   # 诊断 API 返回绝对链接（给本地 AI 直链）
 #
 # 说明：
 # - 应用只绑定 127.0.0.1:8090，由 1Panel OpenResty 反代 hao.shuangdeng.space (80/443)

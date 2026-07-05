@@ -1,14 +1,10 @@
 from __future__ import annotations
 
-import json
 import re
 import threading
 from datetime import datetime, timezone
-from pathlib import Path
 
-from services.config import DATA_DIR, config
-
-PHONE_FILE = DATA_DIR / "phones.json"
+from services.config import config
 
 # 导入分隔符：手机号----接码地址（与邮箱池保持一致）。
 SEP = "----"
@@ -106,8 +102,7 @@ class PhoneService:
     - reserved_at：发号预占时间戳，RESERVE_STALE_SECONDS 内独占（防多人重复出库）。
     """
 
-    def __init__(self, store_file: Path = PHONE_FILE):
-        self._store_file = store_file
+    def __init__(self):
         self._storage = config.get_storage_backend()
         self._lock = threading.RLock()
         self._phones: dict[str, dict] = self._load()
@@ -117,19 +112,9 @@ class PhoneService:
     def _load(self) -> dict[str, dict]:
         items = self._storage.load_collection("phones")
         if items is None:
-            items = self._read_legacy_items()
-            result = self._items_to_map(items)
-            self._storage.save_collection("phones", list(result.values()))
-            return result
+            items = []
+            self._storage.save_collection("phones", [])
         return self._items_to_map(items)
-
-    def _read_legacy_items(self) -> list:
-        try:
-            data = json.loads(self._store_file.read_text(encoding="utf-8"))
-        except Exception:
-            return []
-        items = data if isinstance(data, list) else data.get("items") if isinstance(data, dict) else None
-        return items if isinstance(items, list) else []
 
     def _items_to_map(self, items: list) -> dict[str, dict]:
         result: dict[str, dict] = {}

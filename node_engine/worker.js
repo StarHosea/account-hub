@@ -18,10 +18,10 @@ import { registerChatGPT, secureExistingChatGPT, loginChatGPT } from './flows/op
 import { createRecorder } from './flows/openai/dom-recorder.js';
 import { attachStaticCache } from './static-cache.js';
 
-// DOM 记录目录：设了 REG_RECORD_DIR（或退化用 REG_DIAG_DIR/recordings）才开记录，每账号一子目录。
-// 未设则 createRecorder 返回 no-op，对流程零副作用。keep 由 REG_RECORD_KEEP 控制（默认 fail=成功即删）。
+// DOM 记录：优先读 job.recordDir / job.recordKeep（注册设置下发），CLI 联调可退化环境变量。
 function recordDirFor(job) {
-  const root = process.env.REG_RECORD_DIR
+  const root = String(job.recordDir || '').trim()
+    || process.env.REG_RECORD_DIR
     || (process.env.REG_DIAG_DIR ? `${process.env.REG_DIAG_DIR}/recordings` : '');
   if (!root) return '';
   const safe = String(job.email || 'acct').replace(/[^a-zA-Z0-9._-]+/g, '-').slice(0, 40);
@@ -138,7 +138,7 @@ async function runReal(job) {
       dir: recDir,
       page,
       log: (m, level) => log(m, level),
-      keep: process.env.REG_RECORD_KEEP || 'fail',
+      keep: job.recordKeep || process.env.REG_RECORD_KEEP || 'fail',
     });
     if (recorder.enabled) log('已开启每步 DOM 记录（成功即删、失败留证）');
 
@@ -214,12 +214,23 @@ async function runReal(job) {
   } catch (err) {
     // 失败现场：不管在哪抛错，先补记一帧当前页面（DOM+截图+状态机），再收尾——
     // 保证「失败时刻」总有记录，不依赖各抛错点手动插桩。
+    let recordingDir = '';
     if (recorder) {
       await recorder.record('final-error-scene', { note: String(err?.message || err) }).catch(() => {});
     }
     await stopTrace(true); // 失败：保留 trace.zip（须在 finalize 之前）
-    if (recorder) await recorder.finalize({ success: false }).catch(() => {});
-    emit({ type: 'error', message: String(err?.message || err), partial: err?._partial || {} });
+    if (recorder) {
+      const fin = await recorder.finalize({ success: false }).catch(() => ({ kept: false, dir: '' }));
+      recordingDir = fin?.kept && fin?.dir ? String(fin.dir) : (recDir || '');
+    } else if (recDir) {
+      recordingDir = recDir;
+    }
+    emit({
+      type: 'error',
+      message: String(err?.message || err),
+      partial: err?._partial || {},
+      recordingDir,
+    });
   } finally {
     if (staticCache) await staticCache.logSummary().catch(() => {});
     if (session) { try { await session.close(); } catch { /* ignore */ } }

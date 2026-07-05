@@ -82,7 +82,7 @@ def run_browser_login(
     返回 {ok:True, access_token, reset_password, user, expires} 或 {ok:False, error}。
     """
     browser_proxy = _to_browser_proxy(account_proxy)
-    timeout_s = int(reg.config.get("register_timeout") or 300)
+    timeout_s = int(reg.config.get("register_timeout") or 600)
     job = {
         "email": email,
         "proxyUrl": browser_proxy,
@@ -96,15 +96,14 @@ def run_browser_login(
         "locale": locale or "en-US",
         "staticCache": reg.static_cache_job_options(),
     }
-
-    mail_config, mailbox = _account_mail_ctx(email)
+    job.update(reg.record_job_options())
 
     with _login_sem:
         return _drive_worker(job, mail_config, mailbox, log)
 
 
 def _drive_worker(job: dict, mail_config, mailbox, log) -> dict:
-    timeout_s = int(reg.config.get("register_timeout") or 300)
+    timeout_s = int(reg.config.get("register_timeout") or 600)
     proc = reg._spawn_worker(job)
     with reg._active_lock:
         reg._active_procs.add(proc)

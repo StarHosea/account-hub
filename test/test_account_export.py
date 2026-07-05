@@ -135,7 +135,7 @@ class MailboxCarryTests(unittest.TestCase):
         mailbox_module.mailbox_service = self._orig_mailbox
 
     def _swap_mailbox(self, name: str) -> MailboxService:
-        mb = MailboxService(store_file=Path(self._tmp) / name, storage=InMemoryStorage())
+        mb = MailboxService(storage=InMemoryStorage())
         mailbox_module.mailbox_service = mb
         return mb
 

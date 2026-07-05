@@ -189,7 +189,7 @@ class DatabaseStorageBackend(StorageBackend):
     # ----------------------------- 命名集合（cdks/mailboxes/phones/register_abnormal） ----------------------------- #
 
     def load_collection(self, name: str) -> list[dict[str, Any]] | None:
-        """加载命名集合。空表且未打过种子标志 → 返回 None（触发种子迁移）；否则返回列表。"""
+        """加载命名集合。空表且未打过种子标志 → 返回 None；否则返回列表。"""
         try:
             model, _ = self._collection_model(name)
         except ValueError:

@@ -1,13 +1,9 @@
 from __future__ import annotations
 
-import json
 import threading
 from datetime import datetime, timezone
-from pathlib import Path
 
-from services.config import DATA_DIR, config
-
-CDK_FILE = DATA_DIR / "cdks.json"
+from services.config import config
 
 # 单次批量导入上限（防止一次性提交超大文本拖慢全量重写）。
 MAX_IMPORT_ROWS = 2000
@@ -73,8 +69,7 @@ def parse_cdk_type_lines(text: str) -> list[tuple[str, str | None]]:
 class CdkService:
     """Plus CDK 池服务：维护带本地类型(UPI/IDEL)的 CDK 列表。"""
 
-    def __init__(self, store_file: Path = CDK_FILE):
-        self._store_file = store_file
+    def __init__(self):
         self._storage = config.get_storage_backend()
         self._lock = threading.RLock()
         self._cdks: dict[str, dict] = self._load()
@@ -87,20 +82,9 @@ class CdkService:
     def _load(self) -> dict[str, dict]:
         items = self._storage.load_collection("cdks")
         if items is None:
-            # 后端首次启动：从旧 data/cdks.json 迁移种子数据（无则以空集合打标志）。
-            items = self._read_legacy_items()
-            result = self._items_to_map(items)
-            self._storage.save_collection("cdks", list(result.values()))
-            return result
+            items = []
+            self._storage.save_collection("cdks", [])
         return self._items_to_map(items)
-
-    def _read_legacy_items(self) -> list:
-        try:
-            data = json.loads(self._store_file.read_text(encoding="utf-8"))
-        except Exception:
-            return []
-        items = data if isinstance(data, list) else data.get("items") if isinstance(data, dict) else None
-        return items if isinstance(items, list) else []
 
     def _items_to_map(self, items: list) -> dict[str, dict]:
         result: dict[str, dict] = {}

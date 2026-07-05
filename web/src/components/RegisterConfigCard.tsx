@@ -1,8 +1,16 @@
 import { useState } from "react";
-import { Card, Button, Input, InputNumber, Select, Switch, TextArea, Typography, Space, Toast, Spin } from "@douyinfe/semi-ui-19";
-import { IconSave, IconRefresh } from "@douyinfe/semi-icons";
+import { Card, Button, Input, InputNumber, Select, Switch, TextArea, Typography, Space, Toast, Spin, Radio, RadioGroup } from "@douyinfe/semi-ui-19";
+import { IconSave, IconRefresh, IconLink } from "@douyinfe/semi-icons";
 
 import { useSettingsStore } from "@/store/settings";
+import { copyToClipboard } from "@/lib/clipboard";
+import {
+  DEFAULT_HTTP_PROXY,
+  DEFAULT_IPWEB_ACCOUNT_ID,
+  DEFAULT_IPWEB_GATEWAY,
+  DEFAULT_IPWEB_PASSWORD,
+  type RegisterProxyMode,
+} from "@/lib/register-proxy";
 import type { RegisterProviderType } from "@/lib/api";
 import { NAV_LABELS, navRef } from "@/constants/nav";
 
@@ -22,22 +30,29 @@ function formatBytes(bytes: number): string {
 }
 
 /**
- * 注册机「配置」部分（注册参数 + 区域 + 代理 + 号一号一 IP + 2FA + 邮箱配置）。
+ * 注册机「配置」部分（注册参数 + IPWeb 代理 + 区域 + 2FA + 邮箱配置）。
  * 在「设置」页展示；号池管理页只保留启动/停止（见 RegisterPanel）。
  */
 export default function RegisterConfigCard() {
   const config = useSettingsStore((s) => s.registerConfig);
   const isSaving = useSettingsStore((s) => s.isSavingRegister);
-  const setProxy = useSettingsStore((s) => s.setRegisterProxy);
+  const setIpwebGateway = useSettingsStore((s) => s.setRegisterIpwebGateway);
+  const setIpwebAccountId = useSettingsStore((s) => s.setRegisterIpwebAccountId);
+  const setIpwebPassword = useSettingsStore((s) => s.setRegisterIpwebPassword);
+  const setProxyMode = useSettingsStore((s) => s.setRegisterProxyMode);
+  const setHttpProxy = useSettingsStore((s) => s.setRegisterHttpProxy);
   const setTotal = useSettingsStore((s) => s.setRegisterTotal);
   const setThreads = useSettingsStore((s) => s.setRegisterThreads);
   const setEnable2fa = useSettingsStore((s) => s.setRegisterEnable2fa);
   const setRegions = useSettingsStore((s) => s.setRegisterRegions);
-  const setIpwebRotate = useSettingsStore((s) => s.setRegisterIpwebRotate);
-  const setIpDuration = useSettingsStore((s) => s.setRegisterIpDuration);
+  const setRegisterTimeoutMinutes = useSettingsStore((s) => s.setRegisterTimeoutMinutes);
   const setStaticCacheEnabled = useSettingsStore((s) => s.setRegisterStaticCacheEnabled);
   const setStaticCacheMaxAgeDays = useSettingsStore((s) => s.setRegisterStaticCacheMaxAgeDays);
   const setStaticCacheDir = useSettingsStore((s) => s.setRegisterStaticCacheDir);
+  const setRecordEnabled = useSettingsStore((s) => s.setRegisterRecordEnabled);
+  const setRecordDir = useSettingsStore((s) => s.setRegisterRecordDir);
+  const setRecordKeep = useSettingsStore((s) => s.setRegisterRecordKeep);
+  const setDiagPublicUrl = useSettingsStore((s) => s.setRegisterDiagPublicUrl);
   const setMailField = useSettingsStore((s) => s.setRegisterMailField);
   const setProviderType = useSettingsStore((s) => s.setRegisterProviderType);
   const updateProvider = useSettingsStore((s) => s.updateRegisterProvider);
@@ -53,8 +68,10 @@ export default function RegisterConfigCard() {
   if (!config) return null;
 
   const running = config.enabled;
+  const registerTimeoutMinutes = Math.round((Number(config.register_timeout) || 600) / 60);
   const provider = config.mail.providers?.[0] || { type: "api_mailbox", enable: true };
   const providerType: RegisterProviderType = provider.type === "cloudmail_gen" ? "cloudmail_gen" : "api_mailbox";
+  const proxyMode: RegisterProxyMode = config.proxy_mode || "ipweb";
 
   const handleSave = async () => {
     try {
@@ -99,10 +116,73 @@ export default function RegisterConfigCard() {
             <Text style={{ display: "block", marginBottom: 6 }}>并发数</Text>
             <InputNumber min={1} value={config.threads} onChange={(v) => setThreads(String(v ?? 1))} disabled={running} style={{ width: "100%" }} />
           </div>
-          <div>
-            <Text style={{ display: "block", marginBottom: 6 }}>注册代理</Text>
-            <Input value={config.proxy} onChange={setProxy} placeholder="ipweb: gate2.ipweb.cc:7778:user:pass 或 socks5://user:pass@host:port" disabled={running} />
-          </div>
+        </div>
+        <div style={{ marginTop: 16, padding: 16, borderRadius: 8, background: "var(--semi-color-fill-0)" }}>
+          <Text strong style={{ display: "block", marginBottom: 8 }}>注册出口代理</Text>
+          <RadioGroup
+            type="button"
+            value={proxyMode}
+            onChange={(e) => setProxyMode(e.target.value as RegisterProxyMode)}
+            disabled={running}
+            style={{ marginBottom: 12 }}
+          >
+            <Radio value="none">本机网络</Radio>
+            <Radio value="ipweb">IPWeb 动态代理</Radio>
+            <Radio value="http">固定 HTTP 代理</Radio>
+          </RadioGroup>
+          {proxyMode === "none" ? (
+            <Text type="tertiary" size="small">浏览器直连，适用于服务器本机出口或内网调试。</Text>
+          ) : null}
+          {proxyMode === "ipweb" ? (
+            <>
+              <Text type="tertiary" size="small" style={{ display: "block", marginBottom: 12 }}>
+                一号一 IP：每个任务按注册区域与时限自动生成独立 SID；仅需填写 IPWeb 账号信息。
+              </Text>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 16 }}>
+                <div>
+                  <Text style={{ display: "block", marginBottom: 6 }}>网关</Text>
+                  <Input
+                    value={config.ipweb_gateway || ""}
+                    onChange={setIpwebGateway}
+                    placeholder={DEFAULT_IPWEB_GATEWAY}
+                    disabled={running}
+                  />
+                </div>
+                <div>
+                  <Text style={{ display: "block", marginBottom: 6 }}>账号 ID</Text>
+                  <Input
+                    value={config.ipweb_account_id || ""}
+                    onChange={setIpwebAccountId}
+                    placeholder={DEFAULT_IPWEB_ACCOUNT_ID}
+                    disabled={running}
+                  />
+                </div>
+                <div>
+                  <Text style={{ display: "block", marginBottom: 6 }}>密码</Text>
+                  <Input
+                    mode="password"
+                    value={config.ipweb_password || ""}
+                    onChange={setIpwebPassword}
+                    placeholder={DEFAULT_IPWEB_PASSWORD}
+                    disabled={running}
+                  />
+                </div>
+              </div>
+            </>
+          ) : null}
+          {proxyMode === "http" ? (
+            <>
+              <Text type="tertiary" size="small" style={{ display: "block", marginBottom: 12 }}>
+                本地调试可填 Clash / Surge 等 HTTP 端口，例如本机 7890。
+              </Text>
+              <Input
+                value={config.http_proxy || ""}
+                onChange={setHttpProxy}
+                placeholder={DEFAULT_HTTP_PROXY}
+                disabled={running}
+              />
+            </>
+          ) : null}
         </div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 16, marginTop: 16 }}>
           <div style={{ gridColumn: "span 2" }}>
@@ -121,25 +201,16 @@ export default function RegisterConfigCard() {
             />
           </div>
           <div>
-            <Text style={{ display: "block", marginBottom: 6 }}>号一号一 IP</Text>
-            <Space align="center" style={{ height: 32 }}>
-              <Switch checked={!!config.ipweb_rotate} onChange={setIpwebRotate} disabled={running} />
-              <Text type="tertiary" size="small">仅对 ipweb.cc 代理生效</Text>
-            </Space>
-          </div>
-        </div>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 16, marginTop: 16 }}>
-          <div>
-            <Text style={{ display: "block", marginBottom: 6 }}>同 IP 保活时长（分钟）</Text>
+            <Text style={{ display: "block", marginBottom: 6 }}>单次注册时限（分钟）</Text>
             <InputNumber
               min={1}
-              max={2880}
-              value={config.ip_duration ?? 120}
-              onChange={(v) => setIpDuration(Math.min(2880, Math.max(1, Number(v) || 120)))}
-              disabled={running || !config.ipweb_rotate}
+              max={30}
+              value={registerTimeoutMinutes}
+              onChange={(v) => setRegisterTimeoutMinutes(Number(v) || 10)}
+              disabled={running}
               style={{ width: "100%" }}
             />
-            <Text type="tertiary" size="small">窗口内同账号固定同一 IP；超时同地区换新 IP。覆盖注册全程，默认 120</Text>
+            <Text type="tertiary" size="small">超时自动终止并记为失败，不阻塞后续注册；默认 10 分钟。同时作为 IP 粘性时长。</Text>
           </div>
         </div>
         <div style={{ marginTop: 16 }}>

@@ -16,7 +16,7 @@ import {
   Input,
   Tooltip,
 } from "@douyinfe/semi-ui-19";
-import { IconPlay, IconStop, IconDelete, IconDownload, IconRefresh, IconSearch, IconMail } from "@douyinfe/semi-icons";
+import { IconPlay, IconStop, IconDelete, IconDownload, IconRefresh, IconSearch, IconMail, IconLink } from "@douyinfe/semi-icons";
 import type { ColumnProps } from "@douyinfe/semi-ui-19/lib/es/table";
 
 import {
@@ -33,6 +33,7 @@ import {
 } from "@/lib/api";
 import ResourceZeroWarning from "@/components/ResourceZeroWarning";
 import { useSettingsStore } from "@/store/settings";
+import { copyToClipboard } from "@/lib/clipboard";
 import { useIsMobile } from "@/lib/use-is-mobile";
 import { navRef } from "@/constants/nav";
 
@@ -281,17 +282,29 @@ export default function RegisterPage() {
     },
     {
       title: "操作",
-      width: 56,
+      width: 96,
       fixed: "right",
       render: (_: unknown, row: RegisterAbnormal) => (
-        <Button
-          size="small"
-          theme="borderless"
-          icon={<IconMail />}
-          title={row.fetch_url ? "收邮件（打开邮箱链接）" : "无邮箱链接"}
-          disabled={!row.fetch_url}
-          onClick={() => row.fetch_url && window.open(row.fetch_url, "_blank", "noopener")}
-        />
+        <Space>
+          <Button
+            size="small"
+            theme="borderless"
+            icon={<IconLink />}
+            title="复制诊断链接（给本地 AI）"
+            onClick={() => {
+              const url = `${window.location.origin}/api/register/diag/brief?email=${encodeURIComponent(row.email)}`;
+              void copyToClipboard(url, "诊断链接");
+            }}
+          />
+          <Button
+            size="small"
+            theme="borderless"
+            icon={<IconMail />}
+            title={row.fetch_url ? "收邮件（打开邮箱链接）" : "无邮箱链接"}
+            disabled={!row.fetch_url}
+            onClick={() => row.fetch_url && window.open(row.fetch_url, "_blank", "noopener")}
+          />
+        </Space>
       ),
     },
   ];

@@ -11,9 +11,7 @@ from services.storage.base import PLATFORM_CONFIG_STATE_KEY, StorageBackend
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
 CONFIG_FILE = BASE_DIR / "config.json"
-LEGACY_SETTINGS_FILE = DATA_DIR / "settings.json"
 VERSION_FILE = BASE_DIR / "VERSION"
-BACKUP_STATE_FILE = DATA_DIR / "backup_state.json"
 
 DEFAULT_BACKUP_INCLUDE = {
     "config": True,
@@ -180,8 +178,6 @@ class ConfigStore:
         self.path = path
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         self._storage_backend: StorageBackend | None = None
-        # 平台配置持久化到存储后端 state（json → data/config.json，db/git 各自实现）。
-        # 根目录 config.json 仅作为首启动种子与 auth-key 兜底来源。
         self.data = self._load()
         if _is_invalid_auth_key(self.auth_key):
             raise ValueError(
@@ -193,60 +189,21 @@ class ConfigStore:
                 '   "auth-key": "your_real_auth_key"'
             )
 
-    @staticmethod
-    def _load_legacy_settings_file() -> dict[str, object]:
-        """一次性兼容：从已废弃的 data/settings.json 读取旧配置。"""
-        return _read_json_object(LEGACY_SETTINGS_FILE, name="settings.json")
-
     def _load(self) -> dict[str, object]:
-        """加载平台配置：优先从存储后端 state 读取；后端为空时迁移旧文件并写回。
-
-        存储后端不可用时（如数据库暂时连不上），降级为直接读取 config.json，保证进程可启动。
-        """
-        seed = _read_json_object(self.path, name="config.json")
-        try:
-            backend = self.get_storage_backend()
-        except Exception as exc:  # 后端不可用：降级到本地文件，避免阻塞启动
-            print(f"[config] storage backend unavailable, falling back to config.json: {exc}")
-            return seed
-
-        try:
-            stored = backend.load_state(PLATFORM_CONFIG_STATE_KEY)
-        except Exception as exc:
-            print(f"[config] failed to load platform config from storage backend, using config.json: {exc}")
-            return seed
-
-        if stored is not None:
-            return stored
-
-        # 首次迁移：优先 data/settings.json（旧版），其次根目录 config.json 种子。
-        legacy = self._load_legacy_settings_file()
-        migrated = legacy if legacy else seed
-        if not migrated:
-            return seed
-
-        try:
-            backend.save_state(PLATFORM_CONFIG_STATE_KEY, migrated)
-            source = "data/settings.json" if legacy else "config.json"
-            print(f"[config] migrated {source} into storage backend state '{PLATFORM_CONFIG_STATE_KEY}' (first run)")
-        except Exception as exc:
-            print(f"[config] failed to seed storage backend from migrated config: {exc}")
-        return migrated
+        """从存储后端加载平台配置。"""
+        backend = self.get_storage_backend()
+        stored = backend.load_state(PLATFORM_CONFIG_STATE_KEY)
+        return stored if stored is not None else {}
 
     def _save(self) -> None:
-        """持久化配置到存储后端 state。根目录 config.json 仅作种子，不再降级覆盖写。"""
-        try:
-            backend = self.get_storage_backend()
-            backend.save_state(PLATFORM_CONFIG_STATE_KEY, self.data)
-        except Exception as exc:
-            print(
-                f"[config] failed to save platform config to storage backend "
-                f"(config.json remains read-only seed): {exc}"
-            )
+        """持久化配置到存储后端 state。"""
+        backend = self.get_storage_backend()
+        backend.save_state(PLATFORM_CONFIG_STATE_KEY, self.data)
 
     @property
     def auth_key(self) -> str:
-        return _normalize_auth_key(os.getenv("ACCOUNT_HUB_AUTH_KEY") or self.data.get("auth-key"))
+        file_auth = _normalize_auth_key(_read_json_object(CONFIG_FILE, name="config.json").get("auth-key"))
+        return _normalize_auth_key(os.getenv("ACCOUNT_HUB_AUTH_KEY") or self.data.get("auth-key") or file_auth)
 
     @property
     def admin_path(self) -> str:
@@ -456,8 +413,7 @@ def load_backup_state() -> dict[str, object]:
     backend = config.get_storage_backend()
     data = backend.load_state("backup_state")
     if data is None:
-        # 后端首次启动：从旧 backup_state.json 迁移种子
-        normalized = _normalize_backup_state(_read_json_object(BACKUP_STATE_FILE, name="backup_state.json"))
+        normalized = _normalize_backup_state({})
         backend.save_state("backup_state", normalized)
         return normalized
     return _normalize_backup_state(data)

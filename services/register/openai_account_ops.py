@@ -18,7 +18,7 @@ from urllib.parse import quote, unquote
 from services.register import mail_provider
 from services.register import mail_code
 from services.register import openai_register as reg
-from services.register.fingerprint import parse_proxy
+from services.register.fingerprint import parse_proxy, browser_locale_for_region
 
 # 浏览器登录很重（每次起一个浏览器几秒），批量刷新时限全局并发，避免同时起几十个浏览器打爆机器。
 # 与注册线程池相互独立；如需调整改这里即可。
@@ -71,7 +71,8 @@ def run_browser_login(
     *,
     totp_secret: str = "",
     account_proxy: str = "",
-    locale: str = "en-US",
+    locale: str = "",
+    country: str = "",
     log=lambda *_: None,
 ) -> dict:
     """用浏览器 UI 登录老账号取新 token（刷新 / 重登主流程）。
@@ -93,7 +94,7 @@ def run_browser_login(
         "headless": bool(reg.config.get("headless")),
         "chatgptUrl": reg.chatgpt_url,
         "timeoutMs": timeout_s * 1000,
-        "locale": locale or "en-US",
+        "locale": (locale or browser_locale_for_region(country) or "en-US"),
         "staticCache": reg.static_cache_job_options(),
     }
     job.update(reg.record_job_options())

@@ -178,6 +178,11 @@ class Identity:
         return self.region.sentinel_language
 
     @property
+    def browser_locale(self) -> str:
+        """CloakBrowser context locale（Accept-Language 首项，如 en-US / ja-JP）。"""
+        return browser_locale_for_region(self.region.code)
+
+    @property
     def impersonate(self) -> str:
         return self.profile.impersonate
 
@@ -218,6 +223,12 @@ def build_identity(
         prof = random.choice(PROFILES)
     gmt_offset, tz_label = random.choice(reg.tz_pool)
     return Identity(region=reg, profile=prof, gmt_offset=gmt_offset, tz_label=tz_label)
+
+
+def browser_locale_for_region(code: str | None) -> str:
+    """按地区码返回浏览器 locale；未知地区回退 US。"""
+    reg = REGIONS.get(str(code or "").upper(), REGIONS["US"])
+    return (reg.accept_language.split(",")[0] or "en-US").strip()
 
 
 def random_name(identity: Identity | None = None) -> tuple[str, str]:

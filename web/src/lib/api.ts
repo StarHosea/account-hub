@@ -75,13 +75,23 @@ export type Account = {
   // 激活成功/最近一次尝试所用的 CDK 类型（UPI/IDEL），用于号池列表的类型标识与 CDK↔账号绑定溯源。
   plus_cdk_type?: CdkType | null;
   plus_task_id?: string | null;
+  // 激活进度与失败原因（批量激活页「激活失败清单」/「需核查」展示）。
   plus_last_message?: string | null;
   plus_updated_at?: string | null;
+  last_activation_audit_id?: string | null;
   // 激活不可用标记：两种类型 CDK 均连续激活失败后置位，下轮激活自动跳过，直到人工标记可用。
   plus_unavailable?: boolean;
   // 首次激活成功（plus_status→已激活）时间，用于账号管理「激活日期」列。
   plus_activated_at?: string | null;
-  // 指纹 Seed（注册内核迁移后写入专用种子；当前回退注册时的 oai-device-id）。
+  activated_at?: string | null;
+  stage?: AccountStage;
+  stage_label?: string;
+  plan?: "free" | "plus";
+  token_status?: "ok" | "rate_limited" | "invalid";
+  // 注册失败与 Token 刷新失败（账号页「错误信息」）；不含激活失败详情。
+  last_error?: string | null;
+  fetch_url?: string | null;
+  dispatch?: DispatchInfo | null;
   fingerprint_seed?: string | number | null;
 };
 
@@ -92,18 +102,6 @@ export type AccountImportPayload = {
   export_type?: string;
   source_type?: string;
   [key: string]: unknown;
-};
-
-export type AccountSummary = {
-  total: number;
-  alive: number;
-  dead: number;
-  activated: number;
-  // 待激活（按 plus_status==未激活 的激活流程口径）。
-  pending: number;
-  // 不一致告警数：plus_status=已激活 但真实档位仍非 Plus，需人工核查。
-  needs_review: number;
-  unused: number;
 };
 
 type AccountListResponse = {
@@ -128,7 +126,6 @@ type AccountMutationResponse = {
 export type AccountRefreshResponse = {
   items: Account[];
   refreshed: number;
-  relogined?: number;
   errors: Array<{ access_token: string; error: string }>;
 };
 
@@ -153,10 +150,8 @@ export type SettingsConfig = {
   base_url?: string;
   global_system_prompt?: string;
   sensitive_words?: string[];
-  refresh_account_interval_minute?: number | string;
   auto_remove_invalid_accounts?: boolean;
   auto_remove_rate_limited_accounts?: boolean;
-  auto_relogin_after_refresh?: boolean;
   log_levels?: string[];
   [key: string]: unknown;
 };
@@ -341,9 +336,11 @@ export type ActivationSummary = {
   activated: number;
   activating: number;
   total: number;
-  // 按真实套餐 type 判定：plus_by_type=已是 Plus；not_plus_by_type=注册成功但还不是 Plus（待激活口径）。
+  // 按真实套餐 type 判定：plus_by_type=已是 Plus；not_plus_by_type=非 Plus 账号总数。
   plus_by_type?: number;
   not_plus_by_type?: number;
+  // pending=可被激活引擎选中的账号数（与 start 时 _resolve_targets 口径一致）。
+  pending?: number;
 };
 
 export type ActivationLog = {
@@ -408,6 +405,12 @@ export type RegisterConfig = {
   regions?: string[];
   ipweb_rotate?: boolean;
   ip_duration?: number;
+  static_cache_enabled?: boolean;
+  static_cache_max_age_days?: number;
+  static_cache_dir?: string;
+  static_cache_size_bytes?: number;
+  static_cache_file_count?: number;
+  static_cache_resolved_dir?: string;
   stats: {
     job_id?: string;
     success: number;
@@ -415,6 +418,7 @@ export type RegisterConfig = {
     done: number;
     running: number;
     threads: number;
+    active_browsers?: number;
     elapsed_seconds?: number;
     avg_seconds?: number;
     success_rate?: number;
@@ -457,14 +461,55 @@ export async function login(authKey: string) {
 
 // ── Accounts ───────────────────────────────────────────────────────
 
+export type AccountStage =
+  | "unregistered"
+  | "registering"
+  | "registered"
+  | "activating"
+  | "plus_activated"
+  | "plus_review";
+
+export type AccountView = "free" | "plus";
+
+export type DispatchInfo = {
+  dispatched?: boolean;
+  dispatched_at?: string | null;
+  customer?: string;
+  wechat?: string;
+  xianyu?: string;
+  plan?: string;
+  note?: string;
+  dispatch_no?: string;
+};
+
 export type AccountListParams = PageParams & {
   q?: string;
-  status?: "alive" | "dead";
+  view?: AccountView;
+  stage?: AccountStage;
   plan?: "free" | "plus";
+  status?: "alive" | "dead";
   avail?: "available" | "unavailable";
-  // 激活流程筛选：待激活/已激活/激活中/激活失败/需人工核查（review=档位与 plus_status 不一致）。
   activation?: "pending" | "activated" | "activating" | "failed" | "review";
   used?: boolean;
+  dispatched?: boolean;
+};
+
+export type AccountSummary = {
+  total: number;
+  undispatched?: number;
+  unregistered?: number;
+  registering?: number;
+  registered?: number;
+  activating?: number;
+  plus_activated?: number;
+  plus_review?: number;
+  // legacy fields for older callers
+  alive?: number;
+  dead?: number;
+  activated?: number;
+  pending?: number;
+  needs_review?: number;
+  unused?: number;
 };
 
 export async function fetchAccounts(params: AccountListParams = {}) {
@@ -542,18 +587,33 @@ export async function exportCredentials(
 // 账号管理导出：每行 `邮箱---密码---2FA--Accesstoken`（与导入格式一致，可回环）。传空数组导出全部。
 export async function exportAccountPool(
   accessTokens: string[],
-  opts: { onlyUnused?: boolean; markUsed?: boolean } = {},
+  opts: {
+    onlyUnused?: boolean;
+    markUsed?: boolean;
+    view?: AccountView;
+    stage?: AccountStage;
+    onlyUndispatched?: boolean;
+    markDispatched?: boolean;
+  } = {},
 ) {
   const response = await request.request<string>({
     url: "/api/accounts/export-pool",
     method: "POST",
-    data: { access_tokens: accessTokens, only_unused: !!opts.onlyUnused, mark_used: !!opts.markUsed },
+    data: {
+      access_tokens: accessTokens,
+      only_unused: !!opts.onlyUnused,
+      mark_used: !!(opts.markUsed || opts.markDispatched),
+      view: opts.view,
+      stage: opts.stage,
+      only_undispatched: opts.onlyUndispatched !== false,
+      mark_dispatched: !!opts.markDispatched,
+    },
     responseType: "text",
   });
   return response.data;
 }
 
-// 迁移导出：完整 JSON（含 access/refresh/id token + proxy/country/exit_ip + 密码/2FA），用于在两套系统间搬账号。
+// 账号导出：完整 JSON（含 access/refresh/id token + proxy/country/exit_ip + 密码/2FA）。
 export async function exportAccounts(
   accessTokens: string[],
   format: "json" | "zip" = "json",
@@ -578,20 +638,15 @@ export async function markAccountsUsed(
   });
 }
 
-// 标记账号激活「可用/不可用」。available=true 会清除不可用标记并重置激活态，使其重新进入激活。
-export async function markPlusAvailable(accessTokens: string[], available: boolean) {
-  return httpRequest<{ updated: number; items: Account[] }>("/api/accounts/mark-plus-available", {
-    method: "POST",
-    body: { access_tokens: accessTokens, available },
-  });
-}
-
-// 危险操作：批量撤销账号激活（复位为未激活），仅供程序误标激活状态时人工纠正。
-export async function revokeActivation(accessTokens: string[]) {
-  return httpRequest<{ updated: number; items: Account[] }>("/api/accounts/revoke-activation", {
-    method: "POST",
-    body: { access_tokens: accessTokens },
-  });
+// 撤销激活：将 plus_review 账号复位为免费可激活态，可选同步撤销 CDK 使用。
+export async function revokeActivation(accessTokens: string[], revokeCdk = true) {
+  return httpRequest<{ updated: number; cdk_revoked: number; skipped: number; items: Account[] }>(
+    "/api/accounts/revoke-activation",
+    {
+      method: "POST",
+      body: { access_tokens: accessTokens, revoke_cdk: revokeCdk },
+    },
+  );
 }
 
 // ── Mailboxes ──────────────────────────────────────────────────────
@@ -767,11 +822,18 @@ export async function fetchDispatchSummary() {
   return httpRequest<DispatchSummary>("/api/dispatch/summary");
 }
 
-/** 发号：预占并返回最老的一个可用号。releaseId 用于「下一个」先释放当前预占。 */
-export async function acquireDispatch(kind: DispatchKind, releaseId?: string) {
+export async function fetchDispatchAccounts() {
+  return httpRequest<{
+    items: Array<{ email: string | null; access_token: string; activated_at?: string | null; country?: string | null; exit_ip?: string | null }>;
+    summary: DispatchSummary;
+  }>("/api/dispatch/accounts");
+}
+
+/** 发号：预占并返回可用号。releaseId 用于「下一个」先释放当前预占；token 指定 Plus 账号。 */
+export async function acquireDispatch(kind: DispatchKind, releaseId?: string, token?: string) {
   return httpRequest<{ item: DispatchItem | null; summary: DispatchSummary }>("/api/dispatch/acquire", {
     method: "POST",
-    body: { kind, release_id: releaseId },
+    body: { kind, release_id: releaseId, token },
   });
 }
 
@@ -839,10 +901,17 @@ export async function updateActivationConfig(updates: Partial<{
   });
 }
 
-export async function startActivation(tokens?: string[], limit?: number) {
+export async function startActivation(
+  tokens?: string[],
+  limit?: number,
+  emails?: string[],
+  concurrency?: number,
+) {
   const body: Record<string, unknown> = {};
   if (tokens && tokens.length > 0) body.tokens = tokens;
+  if (emails && emails.length > 0) body.emails = emails;
   if (limit && limit > 0) body.limit = limit;
+  if (concurrency && concurrency > 0) body.concurrency = concurrency;
   return httpRequest<ActivationState>("/api/activation/start", {
     method: "POST",
     body,
@@ -855,6 +924,72 @@ export async function stopActivation() {
 
 export async function clearActivationLogs() {
   return httpRequest<ActivationState>("/api/activation/clear-logs", { method: "POST" });
+}
+
+export type ActivationAuditEvent = {
+  time: string;
+  kind: "log" | "http" | "plan_verify";
+  text?: string;
+  level?: string;
+  phase?: string;
+  attempt?: number;
+  retrying?: boolean;
+  method?: string;
+  path?: string;
+  url?: string;
+  http_status?: number | null;
+  request?: unknown;
+  response?: unknown;
+  error?: string | null;
+  tier?: string;
+};
+
+export type ActivationAuditSummary = {
+  id: string;
+  email: string;
+  access_token: string;
+  job_id?: string | null;
+  source?: string;
+  outcome: string;
+  summary: string;
+  cdk?: string | null;
+  cdk_type?: string | null;
+  cdk_consumed?: boolean;
+  started_at: string;
+  finished_at?: string | null;
+  event_count?: number;
+  attempt_count?: number;
+};
+
+export type ActivationAuditRecord = ActivationAuditSummary & {
+  events: ActivationAuditEvent[];
+};
+
+export type ActivationAuditListParams = PageParams & {
+  q?: string;
+  outcome?: string;
+  abnormal_only?: boolean;
+};
+
+export async function fetchActivationAudit(params: ActivationAuditListParams = {}) {
+  return httpRequest<{
+    items: ActivationAuditSummary[];
+    total: number;
+    page: number;
+    page_size: number;
+    stats: { total: number; accounts: number; failed: number; review: number; success: number };
+  }>(`/api/activation/audit${buildQuery(params)}`);
+}
+
+export async function fetchActivationAuditDetail(auditId: string) {
+  return httpRequest<{ item: ActivationAuditRecord }>(`/api/activation/audit/${encodeURIComponent(auditId)}`);
+}
+
+export async function fetchLatestActivationAudit(params: { access_token?: string; email?: string }) {
+  const q = new URLSearchParams();
+  if (params.access_token) q.set("access_token", params.access_token);
+  if (params.email) q.set("email", params.email);
+  return httpRequest<{ item: ActivationAuditRecord }>(`/api/activation/audit/by-account/latest?${q.toString()}`);
 }
 
 // ── Settings ───────────────────────────────────────────────────────
@@ -909,8 +1044,11 @@ export async function updateRegisterConfig(updates: Partial<RegisterConfig>) {
   });
 }
 
-export async function startRegister() {
-  return httpRequest<{ register: RegisterConfig }>("/api/register/start", { method: "POST" });
+export async function startRegister(emails?: string[]) {
+  return httpRequest<{ register: RegisterConfig }>("/api/register/start", {
+    method: "POST",
+    body: emails && emails.length ? { emails } : {},
+  });
 }
 
 export async function stopRegister() {
@@ -966,25 +1104,6 @@ export async function deleteRegisterAbnormal(emails: string[]) {
 export async function fetchRegisterAbnormalExportText(): Promise<string> {
   const response = await request.get<string>("/api/register/abnormal/export", { responseType: "text" });
   return String(response.data ?? "");
-}
-
-// ── Trial check config（试用资格检测，Phase B 生效）────────────────────
-
-export type TrialCheckConfig = {
-  enabled: boolean;
-  base_url: string;
-  has_api_key: boolean;
-};
-
-export async function fetchTrialCheckConfig() {
-  return httpRequest<{ config: TrialCheckConfig }>("/api/trial-check");
-}
-
-export async function updateTrialCheckConfig(updates: Partial<{ enabled: boolean; base_url: string; api_key: string }>) {
-  return httpRequest<{ config: TrialCheckConfig }>("/api/trial-check", {
-    method: "POST",
-    body: updates,
-  });
 }
 
 // ── Upstream proxy ─────────────────────────────────────────────────

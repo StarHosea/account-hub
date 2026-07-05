@@ -18,13 +18,13 @@
   其它                          → success
 
 可调环境变量：
-  MOCK_API_KEY         期望的 X-External-Api-Key（默认 "mock-key"，与 config.json 对齐）
+  MOCK_API_KEY         期望的 X-External-Api-Key（默认 "mock-key"，与平台配置 cdk_activation.api_key 对齐）
   MOCK_ENVELOPE_CODE   成功信封的顶层 code（默认 0；设为 200 可复现「旧逻辑按 code!=0 直接判失败」的历史 bug）
   MOCK_SUCCESS_SECS    默认成功所需秒数（默认 6）
 
 用法：
   python3 scripts/mock_cdk_server.py --port 8899
-  然后把 config.json 的 cdk_activation.base_url 设为 http://127.0.0.1:8899 ，api_key 设为 MOCK_API_KEY。
+  然后把平台配置 cdk_activation.base_url 设为 http://127.0.0.1:8899 ，api_key 设为 MOCK_API_KEY。
 """
 from __future__ import annotations
 
@@ -316,7 +316,7 @@ def main() -> None:
     print(
         f"[mock-cdk] listening on http://{args.host}:{args.port}\n"
         f"[mock-cdk] X-External-Api-Key = {API_KEY!r} | envelope code = {ENVELOPE_CODE} | success in ~{SUCCESS_SECS}s\n"
-        f"[mock-cdk] 把 config.json 的 cdk_activation.base_url 设为 http://{args.host}:{args.port} ，api_key 设为 {API_KEY!r}\n"
+        f"[mock-cdk] 把平台配置 cdk_activation.base_url 设为 http://{args.host}:{args.port} ，api_key 设为 {API_KEY!r}\n"
         f"[mock-cdk] cdkey 关键字：INVALID/BAD→not_found，FAIL→失败，TIMEOUT→卡住，SLOW→慢成功，其它→成功",
         flush=True,
     )

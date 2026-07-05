@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import json
 import threading
 from datetime import datetime, timezone
+from pathlib import Path
 
-from services.config import config
+from services.config import DATA_DIR, config
 
 
 COLLECTION = "register_abnormal"
+LEGACY_FILE = DATA_DIR / "register_abnormal.json"
 
 
 def _now() -> str:
@@ -20,13 +23,13 @@ def _norm_email(email: str) -> str:
 class RegisterAbnormalService:
     """注册机异常账号清单：主键=邮箱。
 
-    记录「注册成功但无试用资格」或「注册过程发生异常」的账号，供人工排查。
-    这些账号不进入号池（账号管理）。数据结构与接口本轮先落地；真正的写入分流由注册内核
-    迁移时（Phase B）在 openai_register.worker() 调 add() 接入。
+    记录注册过程发生异常的账号，供人工排查。
+    这些账号不进入号池（账号管理）。由 openai_register.worker() 在各类失败路径调用 add() 写入。
     """
 
-    def __init__(self) -> None:
-        self._storage = config.get_storage_backend()
+    def __init__(self, store_file: Path = LEGACY_FILE, storage=None) -> None:
+        self._store_file = store_file
+        self._storage = storage if storage is not None else config.get_storage_backend()
         self._lock = threading.RLock()
         self._items: dict[str, dict] = self._load()
 
@@ -35,9 +38,19 @@ class RegisterAbnormalService:
     def _load(self) -> dict[str, dict]:
         items = self._storage.load_collection(COLLECTION)
         if items is None:
-            self._storage.save_collection(COLLECTION, [])
-            return {}
+            items = self._read_legacy_items()
+            result = self._items_to_map(items)
+            self._storage.save_collection(COLLECTION, list(result.values()))
+            return result
         return self._items_to_map(items)
+
+    def _read_legacy_items(self) -> list:
+        try:
+            data = json.loads(self._store_file.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        items = data if isinstance(data, list) else data.get("items") if isinstance(data, dict) else None
+        return items if isinstance(items, list) else []
 
     def _items_to_map(self, items: list) -> dict[str, dict]:
         result: dict[str, dict] = {}

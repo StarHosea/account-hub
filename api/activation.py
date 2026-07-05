@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 
-from fastapi import APIRouter, Header
+from fastapi import APIRouter, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -14,7 +14,9 @@ from services.config import config
 
 class ActivationStartRequest(BaseModel):
     tokens: list[str] | None = None
+    emails: list[str] | None = None
     limit: int | None = None
+    concurrency: int | None = None
 
 
 class ActivationConfigRequest(BaseModel):
@@ -51,7 +53,10 @@ def create_router() -> APIRouter:
     @router.post("/api/activation/start")
     async def start_activation(body: ActivationStartRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"activation": activation_service.start(body.tokens, body.limit), "config": _safe_config()}
+        return {
+            "activation": activation_service.start(body.tokens, body.limit, body.emails, body.concurrency),
+            "config": _safe_config(),
+        }
 
     @router.post("/api/activation/stop")
     async def stop_activation(authorization: str | None = Header(default=None)):
@@ -77,5 +82,52 @@ def create_router() -> APIRouter:
                 await asyncio.sleep(0.5)
 
         return StreamingResponse(stream(), media_type="text/event-stream")
+
+    @router.get("/api/activation/audit")
+    async def list_activation_audit(
+        authorization: str | None = Header(default=None),
+        q: str = "",
+        outcome: str = "",
+        abnormal_only: bool = False,
+        page: int = 1,
+        page_size: int = 50,
+    ):
+        require_admin(authorization)
+        from services.activation_audit_service import activation_audit_service
+
+        return {
+            **activation_audit_service.list_items(
+                q=q or None,
+                outcome=outcome or None,
+                abnormal_only=abnormal_only,
+                page=page,
+                page_size=page_size,
+            ),
+            "stats": activation_audit_service.stats(),
+        }
+
+    @router.get("/api/activation/audit/{audit_id}")
+    async def get_activation_audit(audit_id: str, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        from services.activation_audit_service import activation_audit_service
+
+        item = activation_audit_service.get(audit_id)
+        if not item:
+            raise HTTPException(status_code=404, detail={"error": "审计记录不存在"})
+        return {"item": item}
+
+    @router.get("/api/activation/audit/by-account/latest")
+    async def get_latest_activation_audit(
+        authorization: str | None = Header(default=None),
+        access_token: str = "",
+        email: str = "",
+    ):
+        require_admin(authorization)
+        from services.activation_audit_service import activation_audit_service
+
+        item = activation_audit_service.latest_for_account(access_token=access_token, email=email)
+        if not item:
+            raise HTTPException(status_code=404, detail={"error": "未找到该账号的激活审计记录"})
+        return {"item": item}
 
     return router

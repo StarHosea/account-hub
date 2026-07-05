@@ -18,3 +18,122 @@ a {
   color: inherit;
   text-decoration: none;
 }
+
+/* 侧栏：Semi Nav 默认 240px，强制跟随 Sider 容器宽度 */
+.app-sider .semi-navigation,
+.app-sider .semi-navigation.semi-navigation-collapsed {
+  width: 100% !important;
+  max-width: 100% !important;
+  min-width: 0 !important;
+  padding-left: 8px !important;
+  padding-right: 8px !important;
+}
+
+.app-sider .semi-navigation-header {
+  padding: 16px 8px !important;
+}
+
+.app-sider .semi-navigation-item,
+.app-sider .semi-navigation-sub-title {
+  padding-left: 10px !important;
+  padding-right: 10px !important;
+}
+
+.app-sider .semi-navigation-footer {
+  padding: 8px !important;
+}
+
+/* 侧栏折叠：宽度动画 + 底栏收起按钮始终贴底 */
+.app-sider {
+  transition: width 0.2s ease, flex-basis 0.2s ease;
+}
+
+.app-sider-nav {
+  display: flex;
+  flex-direction: column;
+}
+
+.app-sider-nav .semi-navigation-inner {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.app-sider-nav .semi-navigation-list {
+  flex: 1;
+  overflow: auto;
+}
+
+.app-sider-nav .semi-navigation-footer {
+  flex-shrink: 0;
+  border-top: 1px solid var(--semi-color-border);
+}
+
+.app-content-scroll {
+  --content-pad-x: 24px;
+  --content-pad-y: 24px;
+}
+
+@media (max-width: 768px) {
+  .app-content-scroll {
+    --content-pad-x: 12px;
+    --content-pad-y: 12px;
+  }
+}
+
+/* 系统设置 */
+.settings-page-body {
+  max-width: 880px;
+}
+
+.settings-page [id^="settings-"] {
+  scroll-margin-top: 56px;
+}
+
+/* 吸顶条：设置页顶栏无上内边距，背景铺满整行 */
+.settings-quick-nav-sticky {
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  box-sizing: border-box;
+  width: calc(100% + 2 * var(--content-pad-x));
+  margin: 0 calc(-1 * var(--content-pad-x)) 16px;
+  padding: 10px var(--content-pad-x) 12px;
+  background-color: var(--semi-color-bg-1);
+  border-bottom: 1px solid var(--semi-color-border);
+}
+
+.settings-quick-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  max-width: 880px;
+}
+
+.settings-quick-nav-item {
+  border: 1px solid var(--semi-color-border);
+  border-radius: 999px;
+  padding: 4px 12px;
+  background: var(--semi-color-bg-1);
+  color: var(--semi-color-text-1);
+  font: inherit;
+  font-size: 13px;
+  line-height: 20px;
+  cursor: pointer;
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease,
+    color 0.15s ease;
+}
+
+.settings-quick-nav-item:hover {
+  border-color: var(--semi-color-primary-light-active);
+  color: var(--semi-color-primary);
+}
+
+.settings-quick-nav-item.is-active {
+  border-color: var(--semi-color-primary);
+  background: var(--semi-color-primary-light-default);
+  color: var(--semi-color-primary);
+  font-weight: 600;
+}

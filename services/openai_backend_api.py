@@ -251,37 +251,73 @@ class OpenAIBackendAPI:
             raise InvalidAccessTokenError(f"token invalidated ({path})")
         raise RuntimeError(f"{path} failed: HTTP {response.status_code}")
 
-    def _get_me(self) -> Dict[str, Any]:
-        path = "/backend-api/me"
-        response = self.session.get(self.base_url + path, headers=self._headers(path), timeout=20)
+    def _request_json(
+        self,
+        phase: str,
+        method: str,
+        path: str,
+        *,
+        json_body: dict | None = None,
+        query: str = "",
+        timeout: float = 20,
+        extra_headers: dict | None = None,
+    ) -> Dict[str, Any]:
+        url = self.base_url + path + query
+        headers = self._headers(path, extra_headers)
+        kwargs: Dict[str, Any] = {"headers": headers, "timeout": timeout}
+        if json_body is not None:
+            kwargs["json"] = json_body
+        response = self.session.request(method, url, **kwargs)
+        try:
+            resp_data = response.json() if response.text else None
+        except Exception:
+            resp_data = {"_raw": response.text}
+        from services.activation_audit_context import get_recorder
+        recorder = get_recorder()
+        if recorder is not None:
+            req_log: dict | str | None = json_body
+            if method.upper() == "GET" and query:
+                req_log = {"query": query.lstrip("?")}
+            recorder.record_http(
+                f"openai_{phase}",
+                {
+                    "method": method.upper(),
+                    "path": path,
+                    "url": url,
+                    "request": req_log,
+                    "http_status": response.status_code,
+                    "response": resp_data,
+                    "error": None if response.status_code == 200 else f"HTTP {response.status_code}",
+                },
+            )
         if response.status_code != 200:
             self._raise_on_error(response, path)
-        return response.json()
+        return resp_data if isinstance(resp_data, dict) else {}
+
+    def _get_me(self) -> Dict[str, Any]:
+        return self._request_json("me", "GET", "/backend-api/me")
 
     def _get_conversation_init(self) -> Dict[str, Any]:
-        path = "/backend-api/conversation/init"
-        response = self.session.post(
-            self.base_url + path,
-            headers=self._headers(path, {"Content-Type": "application/json"}),
-            json={
+        return self._request_json(
+            "conversation_init",
+            "POST",
+            "/backend-api/conversation/init",
+            json_body={
                 "gizmo_id": None,
                 "requested_default_model": None,
                 "conversation_id": None,
                 "timezone_offset_min": -480,
             },
-            timeout=20,
+            extra_headers={"Content-Type": "application/json"},
         )
-        if response.status_code != 200:
-            self._raise_on_error(response, path)
-        return response.json()
 
     def _get_default_account(self) -> Dict[str, Any]:
-        path = "/backend-api/accounts/check/v4-2023-04-27"
-        response = self.session.get(self.base_url + path + "?timezone_offset_min=-480", headers=self._headers(path),
-                                    timeout=20)
-        if response.status_code != 200:
-            self._raise_on_error(response, path)
-        payload = response.json()
+        payload = self._request_json(
+            "accounts_check",
+            "GET",
+            "/backend-api/accounts/check/v4-2023-04-27",
+            query="?timezone_offset_min=-480",
+        )
         default_account = ((payload.get("accounts") or {}).get("default") or {}).get("account") or {}
         logger.debug({
             "event": "backend_user_info_account_payload",

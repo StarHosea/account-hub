@@ -14,8 +14,10 @@ import {
   Table,
   Empty,
   Input,
+  Tooltip,
 } from "@douyinfe/semi-ui-19";
-import { IconPlay, IconStop, IconDelete, IconAlertTriangle, IconDownload, IconRefresh, IconSearch } from "@douyinfe/semi-icons";
+import { IconPlay, IconStop, IconDelete, IconDownload, IconRefresh, IconSearch, IconMail } from "@douyinfe/semi-icons";
+import type { ColumnProps } from "@douyinfe/semi-ui-19/lib/es/table";
 
 import {
   clearRegisterLogs,
@@ -25,13 +27,16 @@ import {
   fetchRegisterAbnormal,
   deleteRegisterAbnormal,
   fetchRegisterAbnormalExportText,
+  startRegister,
   type RegisterProgressItem,
   type RegisterAbnormal,
 } from "@/lib/api";
+import ResourceZeroWarning from "@/components/ResourceZeroWarning";
 import { useSettingsStore } from "@/store/settings";
 import { useIsMobile } from "@/lib/use-is-mobile";
+import { navRef } from "@/constants/nav";
 
-const { Title, Text } = Typography;
+const { Text } = Typography;
 
 const LEVEL_COLOR: Record<string, string> = {
   red: "var(--semi-color-danger)",
@@ -59,7 +64,7 @@ function LogView({ logs }: { logs: LogEntry[] }) {
     <div
       ref={ref}
       style={{
-        height: 260,
+        height: 360,
         overflow: "auto",
         background: "var(--semi-color-fill-0)",
         borderRadius: 6,
@@ -77,7 +82,7 @@ function LogView({ logs }: { logs: LogEntry[] }) {
           </div>
         ))
       ) : (
-        <Text type="tertiary">暂无日志</Text>
+        <Text type="tertiary">暂无日志。启动注册后，取邮箱、启动/关闭指纹浏览器、注册每一步都会实时显示在这里。</Text>
       )}
     </div>
   );
@@ -103,18 +108,6 @@ function OverviewCard({ label, value, danger }: { label: string; value: number; 
   );
 }
 
-function zerosWarning(zeros: string[]) {
-  if (!zeros.length) return null;
-  return (
-    <Space spacing={4} align="center">
-      <IconAlertTriangle style={{ color: "var(--semi-color-warning)" }} />
-      <Text type="warning" size="small">
-        以下资源为 0：{zeros.join("、")}
-      </Text>
-    </Space>
-  );
-}
-
 export default function RegisterPage() {
   const isMobile = useIsMobile();
 
@@ -123,7 +116,8 @@ export default function RegisterPage() {
   const isSavingRegister = useSettingsStore((s) => s.isSavingRegister);
   const setRegisterTotal = useSettingsStore((s) => s.setRegisterTotal);
   const setRegisterThreads = useSettingsStore((s) => s.setRegisterThreads);
-  const toggleRegister = useSettingsStore((s) => s.toggleRegister);
+  const stopRegisterRun = useSettingsStore((s) => s.stopRegisterRun);
+  const saveRegister = useSettingsStore((s) => s.saveRegister);
   const loadRegister = useSettingsStore((s) => s.loadRegister);
   const setRegisterConfig = useSettingsStore((s) => s.setRegisterConfig);
 
@@ -185,22 +179,30 @@ export default function RegisterPage() {
   const registerRunning = !!registerConfig?.enabled;
   const registerStats = registerConfig?.stats;
   const registerInProgress = registerStats?.running ?? 0;
+  const activeBrowsers = registerStats?.active_browsers ?? 0;
   const registerLogs = registerConfig?.logs ?? [];
   const registerProgress = registerConfig?.progress ?? [];
 
+  useEffect(() => {
+    if (registerRunning) setActiveTab("monitor");
+  }, [registerRunning]);
+
   const handleStartRegister = async () => {
-    if (mailboxUnused === 0) {
-      Toast.warning("可用邮箱为 0，无法开始注册，请先在「邮箱管理」导入");
-      return;
-    }
     if (autoActivate && cdkAvailable === 0) {
       Toast.warning("已开启「注册后自动激活」但可用 CDK 为 0，注册会照常进行，但无法自动激活");
     }
-    await toggleRegister();
+    try {
+      await saveRegister({ silent: true });
+      const data = await startRegister();
+      setRegisterConfig(data.register);
+      Toast.success("注册任务已启动，将自动从邮箱池领取可用邮箱");
+    } catch (e) {
+      Toast.error(e instanceof Error ? e.message : "启动注册失败");
+    }
   };
 
   const handleStopRegister = async () => {
-    await toggleRegister();
+    await stopRegisterRun();
   };
 
   const handleClearRegisterLogs = async () => {
@@ -260,25 +262,13 @@ export default function RegisterPage() {
     },
   ];
 
-  const abnormalColumns = [
+  const abnormalColumns: ColumnProps<RegisterAbnormal>[] = [
     { title: "邮箱", dataIndex: "email", width: 240 },
-    {
-      title: "取件地址",
-      dataIndex: "fetch_url",
-      render: (v: string) =>
-        v ? (
-          <Text ellipsis={{ showTooltip: true }} style={{ maxWidth: 320 }}>
-            {v}
-          </Text>
-        ) : (
-          <Text type="tertiary">—</Text>
-        ),
-    },
     {
       title: "注册失败原因",
       dataIndex: "reason",
       render: (v: string) => (
-        <Text type="danger" size="small" ellipsis={{ showTooltip: true }} style={{ maxWidth: 320 }}>
+        <Text type="danger" size="small" ellipsis={{ showTooltip: true }} style={{ maxWidth: 420 }}>
           {v || "—"}
         </Text>
       ),
@@ -289,6 +279,21 @@ export default function RegisterPage() {
       width: 160,
       render: (v: string) => <Text type="tertiary" size="small">{v ? new Date(v).toLocaleString() : "—"}</Text>,
     },
+    {
+      title: "操作",
+      width: 56,
+      fixed: "right",
+      render: (_: unknown, row: RegisterAbnormal) => (
+        <Button
+          size="small"
+          theme="borderless"
+          icon={<IconMail />}
+          title={row.fetch_url ? "收邮件（打开邮箱链接）" : "无邮箱链接"}
+          disabled={!row.fetch_url}
+          onClick={() => row.fetch_url && window.open(row.fetch_url, "_blank", "noopener")}
+        />
+      ),
+    },
   ];
 
   const tabLabel = (text: string, count: number) => (
@@ -298,35 +303,36 @@ export default function RegisterPage() {
     </span>
   );
 
-  const registerZeros = [
-    mailboxUnused === 0 ? "可用邮箱" : null,
-    autoActivate && cdkAvailable === 0 ? "可用 CDK（自动激活需要）" : null,
+  const registerResourceHints = [
+    mailboxUnused === 0 ? `可用邮箱为空，请先在${navRef("mailboxes")}中导入` : null,
+    autoActivate && cdkAvailable === 0
+      ? `已开启「注册后自动激活」，但激活码为空，请先在${navRef("cdks")}中导入`
+      : null,
   ].filter(Boolean) as string[];
+  const startRegisterDisabled = mailboxUnused === 0;
 
   return (
     <div style={{ maxWidth: 1080 }}>
-      <Title heading={isMobile ? 4 : 3} style={{ marginBottom: 16 }}>
-        注册机
-      </Title>
-
       <div
         style={{
           display: "grid",
-          gridTemplateColumns: isMobile ? "repeat(2, 1fr)" : "repeat(4, minmax(0, 200px))",
+          gridTemplateColumns: isMobile ? "repeat(2, 1fr)" : "repeat(5, minmax(0, 1fr))",
           gap: 12,
           marginBottom: 16,
         }}
       >
-        <OverviewCard label="待注册（可用邮箱）" value={mailboxUnused} danger={mailboxUnused === 0} />
-        <OverviewCard label="注册中" value={registerInProgress} />
+        <OverviewCard label="可用邮箱" value={mailboxUnused} danger={mailboxUnused === 0} />
+        <OverviewCard label="进行中" value={registerInProgress} />
+        <OverviewCard label="活跃浏览器" value={activeBrowsers} danger={activeBrowsers > 0} />
         <OverviewCard label="成功" value={registerStats?.success ?? 0} />
         <OverviewCard label="失败" value={registerStats?.fail ?? 0} />
       </div>
 
-      <Card title="启动设置" headerExtraContent={zerosWarning(registerZeros)} style={{ marginBottom: 16 }}>
+      <Card title="任务配置" style={{ marginBottom: 16 }}>
+        <ResourceZeroWarning hints={registerResourceHints} />
         <Space wrap spacing="loose" align="end">
           <div>
-            <Text style={{ display: "block", marginBottom: 6 }}>注册数量</Text>
+            <Text style={{ display: "block", marginBottom: 6 }}>目标数量</Text>
             <InputNumber
               min={1}
               value={registerConfig?.total ?? 1}
@@ -346,11 +352,23 @@ export default function RegisterPage() {
             />
           </div>
           {registerRunning ? (
-            <Popconfirm title="确认停止注册？" content="将中断正在进行的注册流程" onConfirm={() => void handleStopRegister()}>
+            <Popconfirm
+              title="确认停止注册？"
+              content="将立即终止所有在途指纹浏览器，并安全结束注册任务。"
+              onConfirm={() => void handleStopRegister()}
+            >
               <Button theme="solid" type="danger" icon={<IconStop />} loading={isSavingRegister}>
-                停止
+                停止注册
               </Button>
             </Popconfirm>
+          ) : startRegisterDisabled ? (
+            <Tooltip content="可用邮箱为空">
+              <span style={{ display: "inline-block" }}>
+                <Button theme="solid" type="primary" icon={<IconPlay />} loading={isSavingRegister} disabled>
+                  启动注册
+                </Button>
+              </span>
+            </Tooltip>
           ) : (
             <Button
               theme="solid"
@@ -377,16 +395,16 @@ export default function RegisterPage() {
       </Card>
 
       <Tabs activeKey={activeTab} onChange={setActiveTab} type="line">
-        <TabPane tab={tabLabel("注册监控", registerInProgress)} itemKey="monitor">
+        <TabPane tab={tabLabel("运行监控", registerInProgress)} itemKey="monitor">
           <div style={{ paddingTop: 12 }}>
-            <Card title="正在注册账号" style={{ marginBottom: 16 }}>
+            <Card title="进行中任务" style={{ marginBottom: 16 }}>
               <Table
                 dataSource={registerProgress}
                 columns={registerColumns}
                 rowKey="index"
                 size="small"
                 pagination={false}
-                empty={<Empty description="当前没有正在注册的账号" />}
+                empty={<Empty description="当前没有进行中的注册任务" />}
                 scroll={{ y: 300 }}
               />
             </Card>
@@ -394,6 +412,14 @@ export default function RegisterPage() {
             <Card
               title="详细日志"
               headerExtraContent={
+                <Text type="tertiary" size="small">
+                  实时更新 · 含浏览器启停
+                </Text>
+              }
+              style={{ marginBottom: 0 }}
+              bodyStyle={{ paddingTop: 8 }}
+            >
+              <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 8 }}>
                 <Button
                   icon={<IconDelete />}
                   size="small"
@@ -403,8 +429,7 @@ export default function RegisterPage() {
                 >
                   清空日志
                 </Button>
-              }
-            >
+              </div>
               <LogView logs={registerLogs} />
             </Card>
           </div>
@@ -413,7 +438,7 @@ export default function RegisterPage() {
         <TabPane tab={tabLabel("异常清单", abnormalTotal)} itemKey="abnormal">
           <div style={{ paddingTop: 12 }}>
             <Card
-              title={`注册机异常账号清单（${abnormalTotal}）`}
+              title={`异常账号清单（${abnormalTotal}）`}
               headerExtraContent={
                 <Space>
                   <Input

@@ -1,0 +1,62 @@
+import unittest
+from datetime import datetime, timedelta, timezone
+
+from services.register import mail_code as mc
+
+
+class MailCodeCutoffTests(unittest.TestCase):
+    def test_cutoff_subtracts_buffer_from_local_time(self) -> None:
+        ts = "2026-07-01T14:30:00+00:00"
+        cutoff = mc.cutoff_from_request(ts, buffer_seconds=10)
+        self.assertIsNotNone(cutoff)
+        requested_local = datetime.fromisoformat(ts).astimezone().replace(tzinfo=None)
+        self.assertEqual(cutoff, requested_local - timedelta(seconds=10))
+
+    def test_cutoff_none_without_ts(self) -> None:
+        self.assertIsNone(mc.cutoff_from_request(None))
+
+    def test_purpose_label(self) -> None:
+        self.assertEqual(mc.purpose_label("login"), "登录")
+        self.assertEqual(mc.purpose_label("unknown"), "验证")
+
+
+class MailCodeRoundTimeoutTests(unittest.TestCase):
+    def test_round_timeout_default(self) -> None:
+        self.assertEqual(mc.ROUND_WAIT_TIMEOUT, 90.0)
+
+    def test_fulfill_uses_round_timeout(self) -> None:
+        captured: dict = {}
+
+        class _FakeProvider:
+            conf = {}
+
+            def wait_for_code(self, mailbox, after_received_at=None):
+                captured["wait_timeout"] = self.conf["wait_timeout"]
+                return "654321"
+
+            def close(self):
+                pass
+
+            def __init__(self, conf, _ref=""):
+                self.conf = conf
+
+        import services.register.mail_provider as mp
+
+        original = mp._create_provider
+
+        def _fake_create(mail_config, provider="", provider_ref=""):
+            conf = mp._config(mail_config)
+            return _FakeProvider(conf)
+
+        try:
+            mp._create_provider = _fake_create
+            code = mc.fulfill_need_code({"wait_timeout": 300}, {"address": "a@b.com"}, ts="2026-07-01T14:30:00Z")
+        finally:
+            mp._create_provider = original
+
+        self.assertEqual(code, "654321")
+        self.assertEqual(captured.get("wait_timeout"), 90.0)
+
+
+if __name__ == "__main__":
+    unittest.main()

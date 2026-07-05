@@ -4,6 +4,15 @@ import threading
 import uuid
 from datetime import datetime, timezone
 
+from services.account_lifecycle import (
+    STAGE_ACTIVATING,
+    STAGE_PLUS_ACTIVATED,
+    STAGE_PLUS_REVIEW,
+    STAGE_REGISTERED,
+    apply_stage,
+    enrich_account,
+    is_dispatchable,
+)
 from services.account_service import account_service
 from services.phone_service import phone_service
 
@@ -67,28 +76,41 @@ class DispatchService:
 
     @staticmethod
     def _is_plus(account: dict) -> bool:
-        """真实套餐是否为 Plus（按远端核验回填的 type 判定，而非激活态）。"""
-        return str(account.get("type") or "").strip().lower() == "plus"
+        item = enrich_account(account)
+        return str(item.get("plan") or "").strip().lower() == "plus"
 
-    def acquire_account(self) -> dict | None:
-        """选取「最老」的 Plus 套餐、未出库、存活账号并预占；无可用返回 None。
-
-        可发号来源 = 账号管理中「未出库的 Plus 套餐账号」（按真实 type 判定，而非激活态）。
-        """
+    def list_dispatchable_accounts(self) -> list[dict]:
         now = datetime.now(timezone.utc)
         with self._lock:
             self._purge_stale(now)
-            candidates = [
-                a
-                for a in account_service.list_accounts()
-                if self._is_plus(a)
-                and not a.get("used")
-                and str(a.get("status") or "") not in DEAD_STATUS
-                and str(a.get("access_token") or "") not in self._account_reserved
-            ]
+            reserved = set(self._account_reserved)
+        items = []
+        for account in account_service.list_accounts():
+            token = str(account.get("access_token") or "")
+            if token in reserved:
+                continue
+            if is_dispatchable(account):
+                items.append(account)
+        items.sort(key=lambda a: _parse_dt(a.get("activated_at")) or _parse_dt(a.get("created_at")) or now)
+        return items
+
+    def acquire_account(self, token: str | None = None) -> dict | None:
+        """选取可出库 Plus 账号并预占；可指定 token，否则取最老一个。"""
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            self._purge_stale(now)
+            if token:
+                chosen = account_service.get_account(token)
+                if not chosen or not is_dispatchable(chosen):
+                    return None
+                real = str(chosen.get("access_token") or "")
+                if real in self._account_reserved:
+                    return None
+                self._account_reserved[real] = now
+                return self._account_card(chosen)
+            candidates = self.list_dispatchable_accounts()
             if not candidates:
                 return None
-            candidates.sort(key=lambda a: _parse_dt(a.get("plus_updated_at")) or _parse_dt(a.get("created_at")) or now)
             chosen = candidates[0]
             self._account_reserved[str(chosen.get("access_token"))] = now
             return self._account_card(chosen)
@@ -149,17 +171,7 @@ class DispatchService:
         return True
 
     def account_available_count(self) -> int:
-        now = datetime.now(timezone.utc)
-        with self._lock:
-            self._purge_stale(now)
-            return sum(
-                1
-                for a in account_service.list_accounts()
-                if self._is_plus(a)
-                and not a.get("used")
-                and str(a.get("status") or "") not in DEAD_STATUS
-                and str(a.get("access_token") or "") not in self._account_reserved
-            )
+        return len(self.list_dispatchable_accounts())
 
     # ----------------------------- 手机发号（委托 phone_service） ----------------------------- #
 

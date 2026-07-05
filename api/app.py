@@ -19,10 +19,14 @@ def create_app() -> FastAPI:
         # 1) 对账清中间态（账号「排队中/激活中」→「未激活」、邮箱释放、手机预占清理）
         # 2) 续跑上次未结束的注册/激活/一键任务（各 start 内 is_alive 幂等，重复调用安全）
         from services.recovery import startup_recover
+        from services.account_lifecycle import migrate_legacy
+        from services.account_service import account_service
+        from services.mailbox_service import mailbox_service
         from services.register_service import register_service
         from services.activation_service import activation_service
         from services.run_service import run_service
         try:
+            migrate_legacy(account_service, mailbox_service)
             startup_recover()
             register_service.resume_if_enabled()
             activation_service.resume_if_running()
@@ -31,7 +35,7 @@ def create_app() -> FastAPI:
             print(f"[startup] recover/resume failed: {exc}")
         yield
 
-    app = FastAPI(title="小海豚", version=app_version, lifespan=lifespan)
+    app = FastAPI(title="小鲸鱼", version=app_version, lifespan=lifespan)
     install_exception_handlers(app)
     app.add_middleware(
         CORSMiddleware,
@@ -66,7 +70,10 @@ def create_app() -> FastAPI:
                 html = index.read_text(encoding="utf-8").replace("%%ADMIN_BASE%%", config.admin_path)
             except Exception:
                 return FileResponse(index)
-            return HTMLResponse(html)
+            return HTMLResponse(
+                html,
+                headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+            )
 
         asset = resolve_web_asset(full_path)
         if asset is not None and asset.name != "index.html":

@@ -1,0 +1,41 @@
+# Mock CDK 测试池 — 配合 scripts/mock_cdk_server.py 本地联调
+#
+# 导入方式：管理后台 → CDK 管理 → 批量导入，粘贴下方非注释行即可。
+# 行格式：CDK-类型（UPI / IDEL）；类型也可在导入弹窗里统一选，裸 CDK 行会回退到弹窗类型。
+#
+# Mock 服务按 cdkey 关键字（大小写不敏感）决定兑换结果：
+#   INVALID / BAD / NOTFOUND → 提交即 not_found（平台标记 CDK 无效）
+#   FAIL                     → 约 6s 后 failed
+#   TIMEOUT                  → 卡在 running，永不终态（测 poll 超时）
+#   SLOW                     → 约 12s 后 success（排队更久）
+#   其它                     → 约 6s 后 success
+#
+# 联调前请确认：
+#   1. python3 scripts/mock_cdk_server.py --port 8899
+#   2. 设置 → CDK 激活：base_url = http://127.0.0.1:8899 ，api_key = mock-key
+
+# ---------- 正常成功（主流程，各备几张）----------
+MOCK-SUCCESS-UPI-001-UPI
+MOCK-SUCCESS-UPI-002-UPI
+MOCK-SUCCESS-UPI-003-UPI
+MOCK-SUCCESS-UPI-004-UPI
+MOCK-SUCCESS-UPI-005-UPI
+MOCK-SUCCESS-IDEL-001-IDEL
+MOCK-SUCCESS-IDEL-002-IDEL
+MOCK-SUCCESS-IDEL-003-IDEL
+
+# ---------- 慢成功（测长轮询 / 排队展示）----------
+MOCK-SLOW-UPI-001-UPI
+MOCK-SLOW-IDEL-001-IDEL
+
+# ---------- 兑换失败（测 failed 分支与重试）----------
+MOCK-FAIL-UPI-001-UPI
+MOCK-FAIL-IDEL-001-IDEL
+
+# ---------- 无效 CDK（测 not_found → 本地标记 invalid）----------
+MOCK-INVALID-UPI-001-UPI
+MOCK-BAD-IDEL-001-IDEL
+MOCK-NOTFOUND-UPI-001-UPI
+
+# ---------- 永不终态（测 poll_timeout；勿大量并发消耗）----------
+MOCK-TIMEOUT-UPI-001-UPI

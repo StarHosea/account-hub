@@ -9,6 +9,7 @@ import CdksPage from "@/pages/CdksPage";
 import MailboxesPage from "@/pages/MailboxesPage";
 import PhonesPage from "@/pages/PhonesPage";
 import DispatchPage from "@/pages/DispatchPage";
+import ActivationAuditPage from "@/pages/ActivationAuditPage";
 import SettingsPage from "@/pages/SettingsPage";
 
 export default function App() {
@@ -22,11 +23,14 @@ export default function App() {
         <Route path="/workbench" element={<Navigate to="/register" replace />} />
         <Route path="/register" element={<RegisterPage />} />
         <Route path="/activator" element={<ActivatorPage />} />
-        <Route path="/accounts" element={<AccountsPage />} />
+        <Route path="/accounts/free" element={<AccountsPage planType="free" />} />
+        <Route path="/accounts/plus" element={<AccountsPage planType="plus" />} />
+        <Route path="/accounts" element={<Navigate to="/accounts/free" replace />} />
         <Route path="/mailboxes" element={<MailboxesPage />} />
         <Route path="/cdks" element={<CdksPage />} />
         <Route path="/phones" element={<PhonesPage />} />
         <Route path="/dispatch" element={<DispatchPage />} />
+        <Route path="/activation-audit" element={<ActivationAuditPage />} />
         <Route path="/settings" element={<SettingsPage />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />

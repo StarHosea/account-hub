@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Table,
   Card,
@@ -34,11 +34,12 @@ import {
 import { copyToClipboard as copy } from "@/lib/clipboard";
 import { useDebouncedValue } from "@/lib/use-debounced-value";
 import { useIsMobile } from "@/lib/use-is-mobile";
-import { MAX_IMPORT_ROWS, countImportRows } from "@/lib/utils";
+import { MAX_IMPORT_ROWS } from "@/lib/utils";
+import { importSubmitGuard, validateCdkImport } from "@/lib/import-validation";
 import { StatCards } from "@/components/StatCards";
 import { MobileFilters } from "@/components/MobileFilters";
-
-const { Title, Text } = Typography;
+import ImportCountHint from "@/components/ImportCountHint";
+const { Text } = Typography;
 
 const PAGE_SIZE = 10;
 
@@ -74,8 +75,7 @@ export default function CdksPage() {
 
   const [query, setQuery] = useState("");
   const debouncedQuery = useDebouncedValue(query, 300);
-  // 默认只看「可用」CDK（进入页面即过滤，减少已用/无效的干扰）；可切「全部状态」。
-  const [statusFilter, setStatusFilter] = useState<"" | CdkStatus>("available");
+  const [statusFilter, setStatusFilter] = useState<"" | CdkStatus>("");
   const [typeFilter, setTypeFilter] = useState<"" | CdkType>("");
 
   const buildParams = (overrides?: Partial<CdkListParams>): CdkListParams => ({
@@ -107,12 +107,15 @@ export default function CdksPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [debouncedQuery, statusFilter, typeFilter, page]);
 
+  const importValidation = useMemo(() => validateCdkImport(importText), [importText]);
+
   const handleImport = async () => {
-    if (!importText.trim()) {
-      Toast.warning("请粘贴 CDK");
+    const blockMsg = importSubmitGuard(importValidation, "请粘贴 CDK");
+    if (blockMsg) {
+      Toast.warning(blockMsg);
       return;
     }
-    const rows = countImportRows(importText);
+    const rows = importValidation.validCount;
     if (rows > MAX_IMPORT_ROWS) {
       Toast.warning(`单次最多导入 ${MAX_IMPORT_ROWS} 条，当前 ${rows} 条，请分批导入`);
       return;
@@ -292,25 +295,45 @@ export default function CdksPage() {
 
   return (
     <div>
-      <div
-        style={{
-          display: "flex",
-          flexDirection: isMobile ? "column" : "row",
-          alignItems: isMobile ? "stretch" : "center",
-          justifyContent: "space-between",
-          gap: 12,
-          marginBottom: 16,
-        }}
-      >
-        <Title heading={isMobile ? 4 : 3} style={{ margin: 0 }}>
-          CDK管理
-        </Title>
-        <Space spacing={8} style={{ flexWrap: "wrap" }}>
+      <StatCards mobile={isMobile} items={cards} />
+
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 12, marginBottom: 16, alignItems: "center", justifyContent: "space-between" }}>
+        {isMobile ? (
+          <div style={{ width: "100%" }}>
+            <MobileFilters activeCount={activeFilterCount}>{filterControls}</MobileFilters>
+          </div>
+        ) : (
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 12, alignItems: "center" }}>{filterControls}</div>
+        )}
+
+        <Space spacing={8} wrap>
+          {selected.length > 0 ? (
+            <>
+              <Text type="tertiary">已选 {selected.length} 项</Text>
+              <Popconfirm title={`删除选中的 ${selected.length} 个？`} onConfirm={() => void handleDelete(selected)}>
+                <Button size="small" type="danger" icon={<IconDelete />}>
+                  删除选中
+                </Button>
+              </Popconfirm>
+              <Popconfirm
+                title={`⚠️ 撤销选中的 ${selected.length} 个 CDK 的使用状态？`}
+                content="危险操作：把 CDK 从「已用/无效」复位为「可用」并清除账号绑定，之后可被重新领用。仅在程序异常错误标记了使用状态时使用，请确认后再操作。"
+                okType="danger"
+                okText="确认撤销"
+                onConfirm={() => void handleRevokeUse(selected)}
+              >
+                <Button size="small" type="danger" theme="light" loading={busy}>
+                  撤销使用
+                </Button>
+              </Popconfirm>
+              <span style={{ width: 1, height: 18, background: "var(--semi-color-border)", display: "inline-block" }} />
+            </>
+          ) : null}
           <Button icon={<IconRefresh />} onClick={() => void load()} loading={loading}>
             刷新
           </Button>
           <Button icon={<IconUpload />} theme="solid" type="primary" onClick={() => setImportOpen(true)}>
-            批量创建
+            导入
           </Button>
           <Dropdown
             trigger="click"
@@ -326,38 +349,6 @@ export default function CdksPage() {
           </Dropdown>
         </Space>
       </div>
-
-      <StatCards mobile={isMobile} items={cards} />
-
-      {isMobile ? (
-        <MobileFilters activeCount={activeFilterCount}>{filterControls}</MobileFilters>
-      ) : (
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 12, marginBottom: 16 }}>{filterControls}</div>
-      )}
-
-      {selected.length > 0 ? (
-        <div style={{ marginBottom: 12 }}>
-          <Space>
-            <Text type="tertiary">已选 {selected.length} 项</Text>
-            <Popconfirm title={`删除选中的 ${selected.length} 个？`} onConfirm={() => void handleDelete(selected)}>
-              <Button size="small" type="danger" icon={<IconDelete />}>
-                删除选中
-              </Button>
-            </Popconfirm>
-            <Popconfirm
-              title={`⚠️ 撤销选中的 ${selected.length} 个 CDK 的使用状态？`}
-              content="危险操作：把 CDK 从「已用/无效」复位为「可用」并清除账号绑定，之后可被重新领用。仅在程序异常错误标记了使用状态时使用，请确认后再操作。"
-              okType="danger"
-              okText="确认撤销"
-              onConfirm={() => void handleRevokeUse(selected)}
-            >
-              <Button size="small" type="danger" theme="light" loading={busy}>
-                撤销使用
-              </Button>
-            </Popconfirm>
-          </Space>
-        </div>
-      ) : null}
 
       {isMobile ? (
         <CdkMobileList
@@ -394,8 +385,8 @@ export default function CdksPage() {
         />
       )}
 
-      {/* 批量创建（导入）弹窗 */}
-      <Modal title="批量创建 CDK" visible={importOpen} onCancel={() => setImportOpen(false)} onOk={() => void handleImport()} okText="批量创建" confirmLoading={busy} maskClosable={false} fullScreen={isMobile}>
+      {/* 导入弹窗 */}
+      <Modal title="导入 CDK" visible={importOpen} onCancel={() => setImportOpen(false)} onOk={() => void handleImport()} okText="导入" confirmLoading={busy} maskClosable={false} fullScreen={isMobile}>
         <div style={{ display: "flex", flexDirection: "column", gap: 12, paddingTop: 8 }}>
           <div>
             <Text style={{ display: "block", marginBottom: 6 }}>默认类型（行内未指定时使用）</Text>
@@ -412,6 +403,7 @@ export default function CdksPage() {
           <div>
             <Text style={{ display: "block", marginBottom: 6 }}>CDK 列表（一行一个，可用 `CDK-类型` 指定类型）</Text>
             <TextArea value={importText} onChange={setImportText} rows={10} style={{ fontFamily: "monospace" }} placeholder={"一行一个 CDK，例如：\nABCD1234\nEFGH5678-IDEL"} />
+            <ImportCountHint count={importValidation.validCount} issues={importValidation.issues} maxRows={MAX_IMPORT_ROWS} />
           </div>
         </div>
       </Modal>

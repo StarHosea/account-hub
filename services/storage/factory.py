@@ -5,6 +5,7 @@ from pathlib import Path
 
 from services.storage.base import StorageBackend
 from services.storage.database_storage import DatabaseStorageBackend
+from services.storage.db_url import mask_database_url, resolve_database_url
 from services.storage.git_storage import GitStorageBackend
 from services.storage.json_storage import JSONStorageBackend
 
@@ -15,7 +16,7 @@ def create_storage_backend(data_dir: Path) -> StorageBackend:
     
     环境变量：
     - STORAGE_BACKEND: json|sqlite|postgres|git (默认 json)
-    - DATABASE_URL: 数据库连接字符串 (用于 sqlite/postgres)
+    - DATABASE_URL: PostgreSQL 连接字符串 (用于 postgres；未设时见 services/storage/db_url.py)
     - GIT_REPO_URL: Git 仓库地址 (用于 git)
     - GIT_TOKEN: Git 访问令牌 (用于 git)
     - GIT_BRANCH: Git 分支 (默认 main)
@@ -29,22 +30,17 @@ def create_storage_backend(data_dir: Path) -> StorageBackend:
         # 本地 JSON 文件存储
         file_path = data_dir / "accounts.json"
         auth_keys_path = data_dir / "auth_keys.json"
-        settings_path = data_dir / "settings.json"
         print(f"[storage] Using JSON storage: {file_path}")
-        return JSONStorageBackend(file_path, auth_keys_path, settings_path)
+        return JSONStorageBackend(file_path, auth_keys_path)
     
     elif backend_type in ("sqlite", "postgres", "postgresql", "mysql", "database"):
-        # 数据库存储
-        database_url = os.getenv("DATABASE_URL", "").strip()
-        
-        if not database_url:
-            # 如果没有指定 DATABASE_URL，使用本地 SQLite
-            database_url = f"sqlite:///{data_dir / 'accounts.db'}"
-            print(f"[storage] No DATABASE_URL provided, using local SQLite: {database_url}")
-        else:
-            print(f"[storage] Using database storage: {_mask_password(database_url)}")
-        
-        return DatabaseStorageBackend(database_url)
+        database_url = resolve_database_url(data_dir)
+        print(f"[storage] Using PostgreSQL storage: {mask_database_url(database_url)}")
+        backend = DatabaseStorageBackend(database_url)
+        from services.storage.json_seed_migration import maybe_migrate_json_seeds
+
+        maybe_migrate_json_seeds(backend, data_dir)
+        return backend
     
     elif backend_type == "git":
         # Git 仓库存储
@@ -53,7 +49,7 @@ def create_storage_backend(data_dir: Path) -> StorageBackend:
         branch = os.getenv("GIT_BRANCH", "main").strip()
         file_path = os.getenv("GIT_FILE_PATH", "accounts.json").strip()
         auth_keys_file_path = os.getenv("GIT_AUTH_KEYS_FILE_PATH", "auth_keys.json").strip()
-        settings_file_path = os.getenv("GIT_SETTINGS_FILE_PATH", "settings.json").strip()
+        config_file_path = os.getenv("GIT_CONFIG_FILE_PATH", "config.json").strip()
         
         if not repo_url:
             raise ValueError(
@@ -70,7 +66,7 @@ def create_storage_backend(data_dir: Path) -> StorageBackend:
             branch=branch,
             file_path=file_path,
             auth_keys_file_path=auth_keys_file_path,
-            settings_file_path=settings_file_path,
+            config_file_path=config_file_path,
             local_cache_dir=cache_dir,
         )
     

@@ -5,13 +5,13 @@ import json
 import os
 import sys
 from pathlib import Path
-import time
 
-from services.storage.base import StorageBackend
+from services.storage.base import PLATFORM_CONFIG_STATE_KEY, StorageBackend
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
 CONFIG_FILE = BASE_DIR / "config.json"
+LEGACY_SETTINGS_FILE = DATA_DIR / "settings.json"
 VERSION_FILE = BASE_DIR / "VERSION"
 BACKUP_STATE_FILE = DATA_DIR / "backup_state.json"
 
@@ -21,20 +21,8 @@ DEFAULT_BACKUP_INCLUDE = {
     "cpa": True,
     "sub2api": True,
     "logs": True,
-    "image_tasks": True,
     "accounts_snapshot": True,
     "auth_keys_snapshot": True,
-    "images": False,
-}
-
-DEFAULT_IMAGE_STORAGE = {
-    "enabled": False,
-    "mode": "local",
-    "webdav_url": "",
-    "webdav_username": "",
-    "webdav_password": "",
-    "webdav_root_path": "account-hub/images",
-    "public_base_url": "",
 }
 
 DEFAULT_CHAT_COMPLETION_CACHE = {
@@ -106,26 +94,6 @@ def _normalize_backup_state(value: object) -> dict[str, object]:
     }
 
 
-def _normalize_image_storage_settings(value: object) -> dict[str, object]:
-    source = value if isinstance(value, dict) else {}
-    mode = str(source.get("mode") or "local").strip().lower()
-    if mode not in {"local", "webdav", "both"}:
-        mode = "local"
-    enabled = _normalize_bool(source.get("enabled"), False)
-    if not enabled:
-        mode = "local"
-    root_path = str(source.get("webdav_root_path") or DEFAULT_IMAGE_STORAGE["webdav_root_path"]).strip().strip("/")
-    return {
-        "enabled": enabled,
-        "mode": mode,
-        "webdav_url": str(source.get("webdav_url") or "").strip().rstrip("/"),
-        "webdav_username": str(source.get("webdav_username") or "").strip(),
-        "webdav_password": str(source.get("webdav_password") or "").strip(),
-        "webdav_root_path": root_path or str(DEFAULT_IMAGE_STORAGE["webdav_root_path"]),
-        "public_base_url": str(source.get("public_base_url") or "").strip().rstrip("/"),
-    }
-
-
 def _normalize_chat_completion_cache_settings(value: object) -> dict[str, object]:
     source = value if isinstance(value, dict) else {}
     return {
@@ -163,19 +131,9 @@ def _normalize_chat_completion_cache_settings(value: object) -> dict[str, object
     }
 
 
-def _validate_image_storage_settings(settings: dict[str, object]) -> None:
-    if not _normalize_bool(settings.get("enabled"), False):
-        return
-    if not str(settings.get("webdav_url") or "").strip():
-        raise ValueError("启用 WebDAV 图片存储后必须填写 WebDAV URL")
-    if not str(settings.get("webdav_password") or "").strip():
-        raise ValueError("启用 WebDAV 图片存储后必须填写 WebDAV 密码")
-
-
 @dataclass(frozen=True)
 class LoadedSettings:
     auth_key: str
-    refresh_account_interval_minute: int
 
 
 def _normalize_auth_key(value: object) -> str:
@@ -212,14 +170,8 @@ def _load_settings() -> LoadedSettings:
             "请在环境变量 ACCOUNT_HUB_AUTH_KEY 中设置，或者在 config.json 中填写 auth-key。"
         )
 
-    try:
-        refresh_interval = int(raw_config.get("refresh_account_interval_minute", 5))
-    except (TypeError, ValueError):
-        refresh_interval = 5
-
     return LoadedSettings(
         auth_key=auth_key,
-        refresh_account_interval_minute=refresh_interval,
     )
 
 
@@ -228,8 +180,8 @@ class ConfigStore:
         self.path = path
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         self._storage_backend: StorageBackend | None = None
-        # 配置改为持久化到存储后端（sqlite/postgres/git，或 json 后端的 data/settings.json）。
-        # config.json 仅作为首启动种子与 auth-key 兜底来源。
+        # 平台配置持久化到存储后端 state（json → data/config.json，db/git 各自实现）。
+        # 根目录 config.json 仅作为首启动种子与 auth-key 兜底来源。
         self.data = self._load()
         if _is_invalid_auth_key(self.auth_key):
             raise ValueError(
@@ -241,8 +193,13 @@ class ConfigStore:
                 '   "auth-key": "your_real_auth_key"'
             )
 
+    @staticmethod
+    def _load_legacy_settings_file() -> dict[str, object]:
+        """一次性兼容：从已废弃的 data/settings.json 读取旧配置。"""
+        return _read_json_object(LEGACY_SETTINGS_FILE, name="settings.json")
+
     def _load(self) -> dict[str, object]:
-        """加载平台配置：优先从存储后端读取；后端为空时用 config.json 种子并迁移写回。
+        """加载平台配置：优先从存储后端 state 读取；后端为空时迁移旧文件并写回。
 
         存储后端不可用时（如数据库暂时连不上），降级为直接读取 config.json，保证进程可启动。
         """
@@ -254,31 +211,38 @@ class ConfigStore:
             return seed
 
         try:
-            stored = backend.load_settings()
+            stored = backend.load_state(PLATFORM_CONFIG_STATE_KEY)
         except Exception as exc:
-            print(f"[config] failed to load settings from storage backend, using config.json: {exc}")
+            print(f"[config] failed to load platform config from storage backend, using config.json: {exc}")
             return seed
 
         if stored is not None:
             return stored
 
-        # 首次迁移：后端尚无配置，用 config.json 作为种子写入后端。
+        # 首次迁移：优先 data/settings.json（旧版），其次根目录 config.json 种子。
+        legacy = self._load_legacy_settings_file()
+        migrated = legacy if legacy else seed
+        if not migrated:
+            return seed
+
         try:
-            backend.save_settings(seed)
-            print("[config] migrated config.json into storage backend (first run)")
+            backend.save_state(PLATFORM_CONFIG_STATE_KEY, migrated)
+            source = "data/settings.json" if legacy else "config.json"
+            print(f"[config] migrated {source} into storage backend state '{PLATFORM_CONFIG_STATE_KEY}' (first run)")
         except Exception as exc:
-            print(f"[config] failed to seed storage backend from config.json: {exc}")
-        return seed
+            print(f"[config] failed to seed storage backend from migrated config: {exc}")
+        return migrated
 
     def _save(self) -> None:
-        """持久化配置到存储后端。后端不可用时降级写回 config.json。"""
+        """持久化配置到存储后端 state。根目录 config.json 仅作种子，不再降级覆盖写。"""
         try:
             backend = self.get_storage_backend()
-            backend.save_settings(self.data)
-            return
+            backend.save_state(PLATFORM_CONFIG_STATE_KEY, self.data)
         except Exception as exc:
-            print(f"[config] failed to save settings to storage backend, falling back to config.json: {exc}")
-        self.path.write_text(json.dumps(self.data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            print(
+                f"[config] failed to save platform config to storage backend "
+                f"(config.json remains read-only seed): {exc}"
+            )
 
     @property
     def auth_key(self) -> str:
@@ -300,7 +264,7 @@ class ConfigStore:
         return {
             "base_url": str(os.getenv("CDK_API_BASE_URL") or raw.get("base_url") or "").strip().rstrip("/"),
             "api_key": str(os.getenv("CDK_API_KEY") or raw.get("api_key") or "").strip(),
-            "concurrency": max(1, min(10, int(raw.get("concurrency") or 3))),
+            "concurrency": max(1, min(10, int(raw.get("concurrency") or 10))),
             "poll_interval": max(1.0, float(raw.get("poll_interval") or 5.0)),
             "poll_timeout": max(30.0, float(raw.get("poll_timeout") or 1800.0)),
             "max_attempts_per_type": max(1, int(raw.get("max_attempts_per_type") or 3)),
@@ -321,47 +285,8 @@ class ConfigStore:
         return self.cdk_activation
 
     @property
-    def trial_check(self) -> dict:
-        """注册成功后「试用资格」（资格号）检测配置。API Key 仅存后端，优先取环境变量。
-
-        由 services/register/trial_check.py 调用外部 /api/v1/check 接口判定资格；
-        enabled=False 或 base_url 为空 → 视为不校验（全部成功入池）。
-        """
-        raw = self.data.get("trial_check")
-        raw = raw if isinstance(raw, dict) else {}
-        return {
-            "enabled": bool(raw.get("enabled")),
-            "base_url": str(os.getenv("TRIAL_CHECK_BASE_URL") or raw.get("base_url") or "").strip().rstrip("/"),
-            "api_key": str(os.getenv("TRIAL_CHECK_API_KEY") or raw.get("api_key") or "").strip(),
-        }
-
-    def update_trial_check(self, updates: dict) -> dict:
-        current = self.data.get("trial_check")
-        current = dict(current) if isinstance(current, dict) else {}
-        for key in ("enabled", "base_url", "api_key"):
-            if key in updates and updates[key] is not None:
-                current[key] = updates[key]
-        self.data["trial_check"] = current
-        self._save()
-        return self.trial_check
-
-    @property
     def accounts_file(self) -> Path:
         return DATA_DIR / "accounts.json"
-
-    @property
-    def refresh_account_interval_minute(self) -> int:
-        try:
-            return int(self.data.get("refresh_account_interval_minute", 5))
-        except (TypeError, ValueError):
-            return 5
-
-    @property
-    def image_retention_days(self) -> int:
-        try:
-            return max(1, int(self.data.get("image_retention_days", 30)))
-        except (TypeError, ValueError):
-            return 30
 
     @property
     def image_poll_timeout_secs(self) -> int:
@@ -436,13 +361,6 @@ class ConfigStore:
         return False
 
     @property
-    def auto_relogin_after_refresh(self) -> bool:
-        value = self.data.get("auto_relogin_after_refresh", False)
-        if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "yes", "on"}
-        return bool(value)
-
-    @property
     def log_levels(self) -> list[str]:
         levels = self.data.get("log_levels")
         if not isinstance(levels, list):
@@ -465,32 +383,6 @@ class ConfigStore:
         return str(self.data.get("global_system_prompt") or "").strip()
 
     @property
-    def images_dir(self) -> Path:
-        path = DATA_DIR / "images"
-        path.mkdir(parents=True, exist_ok=True)
-        return path
-
-    @property
-    def image_thumbnails_dir(self) -> Path:
-        path = DATA_DIR / "image_thumbnails"
-        path.mkdir(parents=True, exist_ok=True)
-        return path
-
-    def cleanup_old_images(self) -> int:
-        cutoff = time.time() - self.image_retention_days * 86400
-        removed = 0
-        for path in self.images_dir.rglob("*"):
-            if path.is_file() and path.stat().st_mtime < cutoff:
-                path.unlink()
-                removed += 1
-        for path in sorted((p for p in self.images_dir.rglob("*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
-            try:
-                path.rmdir()
-            except OSError:
-                pass
-        return removed
-
-    @property
     def base_url(self) -> str:
         return str(
             os.getenv("ACCOUNT_HUB_BASE_URL")
@@ -508,8 +400,6 @@ class ConfigStore:
 
     def get(self) -> dict[str, object]:
         data = dict(self.data)
-        data["refresh_account_interval_minute"] = self.refresh_account_interval_minute
-        data["image_retention_days"] = self.image_retention_days
         data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
@@ -517,18 +407,16 @@ class ConfigStore:
         data["image_parallel_generation"] = self.image_parallel_generation
         data["auto_remove_invalid_accounts"] = self.auto_remove_invalid_accounts
         data["auto_remove_rate_limited_accounts"] = self.auto_remove_rate_limited_accounts
-        data["auto_relogin_after_refresh"] = self.auto_relogin_after_refresh
         data["log_levels"] = self.log_levels
         data["sensitive_words"] = self.sensitive_words
         data["ai_review"] = self.ai_review
         data["global_system_prompt"] = self.global_system_prompt
         data["backup"] = self.get_backup_settings()
-        data["image_storage"] = self.get_image_storage_settings()
         data["chat_completion_cache"] = self.get_chat_completion_cache_settings()
         data.pop("auth-key", None)
-        # 敏感密钥不随通用设置返回前端：这两块各有专用端点（/api/activation/config、/api/trial-check）
+        # 敏感密钥不随通用设置返回前端：cdk_activation 有专用端点 /api/activation/config，
         # 以 has_api_key 形式回传状态。此处剥离 api_key，避免 GET /api/settings 泄漏。
-        for section in ("cdk_activation", "trial_check"):
+        for section in ("cdk_activation",):
             if isinstance(data.get(section), dict) and "api_key" in data[section]:
                 data[section] = {k: v for k, v in data[section].items() if k != "api_key"}
         return data
@@ -541,9 +429,6 @@ class ConfigStore:
         next_data.update(dict(data or {}))
         if "backup" in next_data:
             next_data["backup"] = _normalize_backup_settings(next_data.get("backup"))
-        if "image_storage" in next_data:
-            next_data["image_storage"] = _normalize_image_storage_settings(next_data.get("image_storage"))
-            _validate_image_storage_settings(next_data["image_storage"])
         if "chat_completion_cache" in next_data:
             next_data["chat_completion_cache"] = _normalize_chat_completion_cache_settings(
                 next_data.get("chat_completion_cache")
@@ -555,9 +440,6 @@ class ConfigStore:
 
     def get_backup_settings(self) -> dict[str, object]:
         return _normalize_backup_settings(self.data.get("backup"))
-
-    def get_image_storage_settings(self) -> dict[str, object]:
-        return _normalize_image_storage_settings(self.data.get("image_storage"))
 
     def get_chat_completion_cache_settings(self) -> dict[str, object]:
         return _normalize_chat_completion_cache_settings(self.data.get("chat_completion_cache"))

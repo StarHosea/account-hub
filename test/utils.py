@@ -1,13 +1,10 @@
-import base64
 import json
 import sys
-import time
 import urllib.request
 from pathlib import Path
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-OUTPUT_DIR = ROOT_DIR / "data" / "output"
 BASE_URL = "http://127.0.0.1:8000"
 
 if str(ROOT_DIR) not in sys.path:
@@ -39,7 +36,6 @@ class InMemoryStorage:
     def __init__(self, accounts: list[dict] | None = None) -> None:
         self.accounts: list[dict] = list(accounts or [])
         self.auth_keys: list[dict] = []
-        self.settings: dict | None = None
         self.collections: dict[str, list[dict]] = {}
         self.states: dict[str, dict] = {}
 
@@ -55,46 +51,21 @@ class InMemoryStorage:
     def save_auth_keys(self, auth_keys: list[dict]) -> None:
         self.auth_keys = list(auth_keys)
 
-    def load_settings(self) -> dict | None:
-        return self.settings
-
-    def save_settings(self, settings: dict) -> None:
-        self.settings = dict(settings)
-
-    def load_collection(self, name: str) -> list[dict] | None:
-        # 未写过返回 None（触发种子迁移逻辑）；写过（哪怕为空）返回列表副本。
-        items = self.collections.get(name)
-        return list(items) if items is not None else None
-
-    def save_collection(self, name: str, items: list[dict]) -> None:
-        self.collections[name] = list(items)
-
     def load_state(self, key: str) -> dict | None:
         return self.states.get(key)
 
     def save_state(self, key: str, data: dict) -> None:
         self.states[key] = dict(data)
 
+    def load_collection(self, name: str) -> list[dict] | None:
+        items = self.collections.get(name)
+        return list(items) if items is not None else None
+
+    def save_collection(self, name: str, items: list[dict]) -> None:
+        self.collections[name] = list(items)
+
     def health_check(self) -> dict:
         return {"ok": True}
 
     def get_backend_info(self) -> dict:
         return {"type": "memory"}
-
-
-def detect_ext(image_bytes: bytes) -> str:
-    if image_bytes.startswith(b"\xff\xd8\xff"):
-        return ".jpg"
-    if image_bytes.startswith(b"RIFF") and image_bytes[8:12] == b"WEBP":
-        return ".webp"
-    if image_bytes.startswith((b"GIF87a", b"GIF89a")):
-        return ".gif"
-    return ".png"
-
-
-def save_image(image_b64: str, name: str) -> Path:
-    image_bytes = base64.b64decode(image_b64)
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    path = OUTPUT_DIR / f"{name}_{int(time.time())}{detect_ext(image_bytes)}"
-    path.write_bytes(image_bytes)
-    return path

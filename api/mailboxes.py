@@ -5,6 +5,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 
 from api.support import require_admin
+from services.account_service import account_service
 from services.mailbox_service import mailbox_service
 
 
@@ -73,6 +74,9 @@ def create_router() -> APIRouter:
     async def import_mailboxes(body: MailboxImportRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         result = mailbox_service.import_text(body.text)
+        from services.mailbox_service import parse_mailbox_lines
+        for entry in parse_mailbox_lines(body.text):
+            account_service.upsert_mailbox_record(entry["email"], entry["fetch_url"])
         return {**_payload(), "result": result}
 
     @router.delete("/api/mailboxes")

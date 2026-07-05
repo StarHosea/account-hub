@@ -50,6 +50,10 @@ class WaitForFreshCodeTests(unittest.TestCase):
         # 信箱里只有发码前那封（T0），after=T0 -> 不接受，等到超时 None。
         self.assertIsNone(_FakeProvider([("111111", T0)]).wait_for_code({}, after_received_at=T0))
 
+    def test_skips_when_received_at_unparseable_with_baseline(self) -> None:
+        provider = _FakeProvider([("111111", None)])
+        self.assertIsNone(provider.wait_for_code({}, after_received_at=T0))
+
     def test_accepts_newer_email_even_with_same_code(self) -> None:
         # 关键：OpenAI 重发相同的码，但到达时间更晚 -> 应接受（按时间而非码值判断）。
         provider = _FakeProvider([("111111", T0), ("111111", T0), ("111111", T1)])

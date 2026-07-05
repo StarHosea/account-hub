@@ -21,7 +21,11 @@ class FakeLocator {
     if (!this.page.isVisibleSelector(this.selector)) throw new Error(`not visible: ${this.selector}`);
   }
 
-  async click() {}
+  async scrollIntoViewIfNeeded() {}
+  async click() {
+    if (this.page.mode === 'totp') this.page.mode = 'email-code';
+  }
+
   async fill(value) { this.page.typedCode = String(value); }
 
   async press(key) {
@@ -30,6 +34,10 @@ class FakeLocator {
 
   async pressSequentially(value) {
     this.page.typedCode = String(value);
+  }
+
+  async inputValue() {
+    return this.page.typedCode;
   }
 }
 
@@ -54,20 +62,15 @@ class FakeMfaPage {
     return false;
   }
 
-  async click(selector) {
-    if (selector.includes('data-reg-click')) this.mode = 'email-code';
-  }
-
-  async keyboardType(value) {
-    this.typedCode = String(value);
-  }
-
-  get keyboard() {
-    return { type: (value) => this.keyboardType(value) };
-  }
+  async waitForLoadState() {}
+  async reload() {}
 
   async waitForFunction() {
     return false;
+  }
+
+  get keyboard() {
+    return { type: (value) => { this.typedCode = String(value); } };
   }
 
   async evaluate(fn) {
@@ -75,12 +78,13 @@ class FakeMfaPage {
     if (source.includes('querySelectorAll') && source.includes('wanted') && source.includes('mark')) {
       return this.mode === 'totp' ? 'email a code' : null;
     }
-    if (source.includes('check your inbox') || source.includes('verification code')) {
+    if (source.includes('verification code') || source.includes('hasEmailHint') || source.includes('刚刚向')) {
       return this.mode === 'email-code';
     }
     if (source.includes('mfa-challenge') || source.includes('totp_otp')) {
       return this.mode === 'totp' || this.mode === 'email-code';
     }
+    if (source.includes('innerText')) return '';
     if (source.includes('invalid') || source.includes('incorrect')) return false;
     if (source.includes('requestSubmit')) {
       this.submitCode();

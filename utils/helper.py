@@ -23,7 +23,6 @@ PREFIXED_CODEX_IMAGE_MODELS = {
 }
 IMAGE_MODELS = BASE_IMAGE_MODELS | PREFIXED_CODEX_IMAGE_MODELS
 PUBLIC_IMAGE_MODELS = BASE_IMAGE_MODELS | PREFIXED_CODEX_IMAGE_MODELS
-OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 
 SUPPORTED_JSON_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"}
 MAX_JSON_IMAGE_BYTES = 10 * 1024 * 1024
@@ -236,22 +235,6 @@ def iter_sse_payloads(response: requests.Response) -> Iterator[str]:
         payload = line[5:].strip()
         if payload:
             yield payload
-
-
-def save_images_from_text(text: str, prefix: str) -> list[Path]:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    matches = re.findall(r"data:image/[^;]+;base64,[A-Za-z0-9+/=]+", text or "")
-    saved_paths: list[Path] = []
-    timestamp = int(time.time() * 1000)
-    for index, data_url in enumerate(matches, start=1):
-        header, encoded = data_url.split(",", 1)
-        image_type = header.split(";")[0].removeprefix("data:image/").strip() or "png"
-        extension = "jpg" if image_type == "jpeg" else image_type
-        output_path = OUTPUT_DIR / f"{prefix}_{timestamp}_{index}.{extension}"
-        output_path.write_bytes(base64.b64decode(encoded))
-        saved_paths.append(output_path)
-    return saved_paths
-
 
 def anonymize_token(token: object) -> str:
     value = str(token or "").strip()

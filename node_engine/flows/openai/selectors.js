@@ -85,6 +85,15 @@ export const SUCCESS_TEXTS = [
   '有什么可以帮', '给 ChatGPT', '新聊天',
 ];
 
-// 各类错误文案
+// 各类错误文案 → 见 code-errors.js（验证码错误文案来自 auth.openai.com 真实 i18n，含 en/zh/ja）
 export const EMAIL_EXISTS_PATTERN = /already\s+exists|already\s+in\s+use|已存在|既に.*存在/i;
-export const INVALID_CODE_PATTERN = /invalid\s+code|incorrect\s+code|code\s+is\s+invalid|无效|不正确|コードが正しく/i;
+export { INVALID_CODE_PATTERN, detectInvalidCode, hasInvalidCodeError, textIndicatesInvalidCode } from './code-errors.js';
+
+// chatgpt.com 首页登录/注册入口（比文案点击稳定）
+export const SIGNUP_BUTTON_TESTID = 'signup-button';
+export const LOGIN_BUTTON_TESTID = 'login-button';
+// 未登录时右侧内嵌「注册或登录」面板（无中央 signup 按钮的 A/B 布局）
+export const NO_AUTH_RIGHT_LOGIN_PANEL_TESTID = 'no-auth-right-login-panel';
+
+// 登录密码页：邮箱或密码错误（出现即应转忘记密码，勿再重试提交）
+export const WRONG_LOGIN_PASSWORD_PATTERN = /incorrect\s+email\s+address\s+or\s+password|email.*or\s+password.*incorrect|密码.*(不正确|错误|无效)|邮箱.*密码.*(不正确|错误)|incorrect.*password|invalid password|wrong password/i;

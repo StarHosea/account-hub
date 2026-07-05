@@ -45,10 +45,11 @@ import {
 import { useDebouncedValue } from "@/lib/use-debounced-value";
 import { useIsMobile } from "@/lib/use-is-mobile";
 import { copyToClipboard as copy } from "@/lib/clipboard";
+import { importSubmitGuard, isAccountPoolImportText, validatePhoneImport } from "@/lib/import-validation";
 import { StatCards } from "@/components/StatCards";
 import { MobileFilters } from "@/components/MobileFilters";
-
-const { Title, Text } = Typography;
+import ImportCountHint from "@/components/ImportCountHint";
+const { Text } = Typography;
 
 const PAGE_SIZE = 10;
 
@@ -126,9 +127,12 @@ export default function PhonesPage() {
     [phones, selected],
   );
 
+  const importValidation = useMemo(() => validatePhoneImport(importText), [importText]);
+
   const handleImport = async () => {
-    if (!importText.trim()) {
-      Toast.warning("请粘贴手机号");
+    const blockMsg = importSubmitGuard(importValidation, "请粘贴手机号");
+    if (blockMsg) {
+      Toast.warning(blockMsg);
       return;
     }
     setBusy(true);
@@ -403,21 +407,41 @@ export default function PhonesPage() {
 
   return (
     <div>
-      {/* 标题与主操作：手机端纵向堆叠，按钮占满更易点 */}
-      <div
-        style={{
-          display: "flex",
-          flexDirection: isMobile ? "column" : "row",
-          alignItems: isMobile ? "stretch" : "center",
-          justifyContent: "space-between",
-          gap: 12,
-          marginBottom: 16,
-        }}
-      >
-        <Title heading={isMobile ? 4 : 3} style={{ margin: 0 }}>
-          手机号管理
-        </Title>
-        <Space spacing={8} style={{ flexWrap: "wrap" }}>
+      <StatCards mobile={isMobile} items={cards} />
+
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 12, marginBottom: 16, alignItems: "center", justifyContent: "space-between" }}>
+        {isMobile ? (
+          <div style={{ width: "100%" }}>
+            <MobileFilters activeCount={activeFilterCount}>{filterControls}</MobileFilters>
+          </div>
+        ) : (
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 12, alignItems: "center" }}>{filterControls}</div>
+        )}
+
+        <Space spacing={8} wrap>
+          {selected.length > 0 ? (
+            <>
+              <Text type="tertiary">已选 {selected.length} 项</Text>
+              <Button size="small" icon={<IconCopy />} onClick={() => void exportSelectedToClipboard()}>
+                导出到剪贴板
+              </Button>
+              <Button size="small" icon={<IconPlus />} onClick={() => void handleAddUsage(selected)}>
+                次数+1
+              </Button>
+              <Button size="small" icon={<IconTick />} onClick={() => void handleSetUsed(selected, true)}>
+                标记已用
+              </Button>
+              <Button size="small" icon={<IconClose />} onClick={() => void handleSetUsed(selected, false)}>
+                标记未用
+              </Button>
+              <Popconfirm title={`删除选中的 ${selected.length} 个？`} onConfirm={() => void handleDelete(selected)}>
+                <Button size="small" type="danger" icon={<IconDelete />}>
+                  删除选中
+                </Button>
+              </Popconfirm>
+              <span style={{ width: 1, height: 18, background: "var(--semi-color-border)", display: "inline-block" }} />
+            </>
+          ) : null}
           <Button icon={<IconRefresh />} onClick={() => void load()} loading={loading}>
             刷新
           </Button>
@@ -430,43 +454,6 @@ export default function PhonesPage() {
         </Space>
       </div>
 
-      {/* 统计卡：手机端紧凑 */}
-      <StatCards mobile={isMobile} items={cards} />
-
-      {/* 筛选区：PC 平铺，手机端折叠进抽屉 */}
-      {isMobile ? (
-        <MobileFilters activeCount={activeFilterCount}>{filterControls}</MobileFilters>
-      ) : (
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 12, marginBottom: 16 }}>{filterControls}</div>
-      )}
-
-      {/* 批量操作条 */}
-      {selected.length > 0 ? (
-        <div style={{ marginBottom: 12 }}>
-          <Space style={{ flexWrap: "wrap" }}>
-            <Text type="tertiary">已选 {selected.length} 项</Text>
-            <Button size="small" icon={<IconCopy />} onClick={() => void exportSelectedToClipboard()}>
-              导出到剪贴板
-            </Button>
-            <Button size="small" icon={<IconPlus />} onClick={() => void handleAddUsage(selected)}>
-              次数+1
-            </Button>
-            <Button size="small" icon={<IconTick />} onClick={() => void handleSetUsed(selected, true)}>
-              标记已用
-            </Button>
-            <Button size="small" icon={<IconClose />} onClick={() => void handleSetUsed(selected, false)}>
-              标记未用
-            </Button>
-            <Popconfirm title={`删除选中的 ${selected.length} 个？`} onConfirm={() => void handleDelete(selected)}>
-              <Button size="small" type="danger" icon={<IconDelete />}>
-                删除选中
-              </Button>
-            </Popconfirm>
-          </Space>
-        </div>
-      ) : null}
-
-      {/* 内容区：手机端卡片流，PC 表格 */}
       {isMobile ? (
         <MobileList
           phones={phones}
@@ -511,7 +498,7 @@ export default function PhonesPage() {
       >
         <div style={{ display: "flex", flexDirection: "column", gap: 12, paddingTop: 8 }}>
           <Text type="tertiary" size="small">
-            每行一个，格式 <Text code>手机号----接码地址</Text>；无接码地址可只填手机号。重复手机号会自动去重。
+            每行一个，格式 <Text code>手机号 + 分隔符 + 接码地址</Text>（分隔符至少两个连字符 <Text code>-</Text>）；无接码地址可只填手机号。重复手机号会自动去重。
           </Text>
           <TextArea
             value={importText}
@@ -520,6 +507,7 @@ export default function PhonesPage() {
             style={{ fontFamily: "monospace" }}
             placeholder={"13800138000----https://example.com/sms/13800138000\n13900139000----https://example.com/sms/13900139000"}
           />
+          <ImportCountHint count={importValidation.validCount} issues={importValidation.issues} />
         </div>
       </Modal>
     </div>

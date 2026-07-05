@@ -3,6 +3,9 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 
+# 平台配置在存储后端中的统一 state 键（json → data/config.json，db → settings 表，git → config.json）
+PLATFORM_CONFIG_STATE_KEY = "config"
+
 
 class StorageBackend(ABC):
     """抽象存储后端基类"""
@@ -25,19 +28,6 @@ class StorageBackend(ABC):
     @abstractmethod
     def save_auth_keys(self, auth_keys: list[dict[str, Any]]) -> None:
         """保存所有鉴权密钥数据"""
-        pass
-
-    @abstractmethod
-    def load_settings(self) -> dict[str, Any] | None:
-        """加载平台配置（config.json 的内容）。
-
-        返回 None 表示后端尚无配置（首次启动），调用方需从 config.json 迁移种子数据。
-        """
-        pass
-
-    @abstractmethod
-    def save_settings(self, settings: dict[str, Any]) -> None:
-        """持久化平台配置。"""
         pass
 
     @abstractmethod

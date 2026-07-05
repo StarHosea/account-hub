@@ -3,20 +3,23 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import subprocess
 import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote, unquote
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from curl_cffi import requests as curl_requests
 
+from services.account_lifecycle import email_storage_key
 from services.account_service import account_service
 from services.register import mail_provider
+from services.register import mail_code
 from services.register import fingerprint
-from services.register import trial_check
 from services.register.fingerprint import (
+    ParsedProxy,
     build_identity,
     normalize_proxy,
     parse_proxy,
@@ -32,7 +35,7 @@ NODE_WORKER = NODE_ENGINE_DIR / "worker.js"
 config = {
     "mail": {
         "request_timeout": 30,
-        "wait_timeout": 30,
+        "wait_timeout": 300,
         "wait_interval": 2,
         "providers": [],
     },
@@ -51,18 +54,53 @@ config = {
     "register_timeout": 300,
     "node_bin": "node",
     "cloakbrowser_license": "",
+    "static_cache_enabled": True,
+    "static_cache_max_age_days": 7,
+    "static_cache_dir": "",
 }
-register_config_file = base_dir.parents[1] / "data" / "register.json"
-try:
-    saved_config = json.loads(register_config_file.read_text(encoding="utf-8"))
-    config.update({
-        key: saved_config[key]
-        for key in ("mail", "proxy", "total", "threads", "regions", "ipweb_rotate", "ip_duration",
-                    "enable_2fa", "headless", "register_timeout", "node_bin", "ip_probe_retries")
-        if key in saved_config
-    })
-except Exception:
-    pass
+_LEGACY_REGISTER_FILE = base_dir.parents[1] / "data" / "register.json"
+_CONFIG_KEYS = (
+    "mail", "proxy", "total", "threads", "regions", "ipweb_rotate", "ip_duration",
+    "enable_2fa", "headless", "register_timeout", "node_bin", "ip_probe_retries",
+    "static_cache_enabled", "static_cache_max_age_days", "static_cache_dir",
+)
+
+
+def _merge_legacy_register_file() -> None:
+    try:
+        saved_config = json.loads(_LEGACY_REGISTER_FILE.read_text(encoding="utf-8"))
+        config.update({key: saved_config[key] for key in _CONFIG_KEYS if key in saved_config})
+    except Exception:
+        pass
+
+
+def refresh_config_from_storage() -> None:
+    """从 register_service / 存储后端同步配置；独立脚本 import 时作兜底。"""
+    try:
+        from services.register_service import register_service
+
+        register_service._push_to_worker()
+        return
+    except Exception:
+        pass
+    try:
+        from services.config import config as app_config
+
+        data = app_config.get_storage_backend().load_state("register")
+        if isinstance(data, dict):
+            config.update({key: data[key] for key in _CONFIG_KEYS if key in data})
+            return
+    except Exception:
+        pass
+    _merge_legacy_register_file()
+
+
+def ensure_config_loaded() -> None:
+    if getattr(ensure_config_loaded, "_done", False):
+        return
+    refresh_config_from_storage()
+    ensure_config_loaded._done = True  # type: ignore[attr-defined]
+
 
 chatgpt_url = "https://chatgpt.com/"
 
@@ -77,6 +115,7 @@ register_log_sink = None
 # 正在运行的 Node 子进程集合：用于停止任务时优雅终止在途浏览器。
 _active_lock = threading.Lock()
 _active_procs: set[subprocess.Popen] = set()
+_stop_requested = threading.Event()
 
 # 正在注册的每个任务的实时进度（按任务号）：供工作台「正在注册账号」表展示。
 progress_lock = threading.Lock()
@@ -97,6 +136,22 @@ def reset_progress() -> None:
     with progress_lock:
         progress.clear()
     reset_used_exit_ips()
+    reset_stop_requested()
+
+
+def reset_stop_requested() -> None:
+    """新一轮注册开始前清除停止标记。"""
+    _stop_requested.clear()
+
+
+def is_stop_requested() -> bool:
+    return _stop_requested.is_set()
+
+
+def active_browser_count() -> int:
+    """当前在途指纹浏览器（Node worker）子进程数。"""
+    with _active_lock:
+        return len(_active_procs)
 
 
 def reset_used_exit_ips() -> None:
@@ -165,18 +220,10 @@ def create_mailbox(username: str | None = None) -> dict:
 
 
 def wait_for_code(mailbox: dict) -> str | None:
-    return mail_provider.wait_for_code(_mail_config(), mailbox)
+    return mail_code.fulfill_need_code(_mail_config(), mailbox)
 
 
-def _probe_exit_ip(account_proxy: str, timeout: float = 12.0) -> str | None:
-    """经账号专属代理 GET ipify，拿到出口公网 IP 即认为该线路可用；失败返回 None。
-
-    走 curl_cffi（与 mail_provider 一致，支持带认证 socks5h），不复用收件会话——
-    收件永不走代理，这里必须走代理才能验证「这条出口线路是否真的活着」。
-    """
-    proxy = (account_proxy or "").strip()
-    if not proxy:
-        return None
+def _probe_exit_ip_once(proxy: str, timeout: float = 12.0) -> str | None:
     try:
         resp = curl_requests.get(
             _EXIT_IP_PROBE_URL,
@@ -191,6 +238,60 @@ def _probe_exit_ip(account_proxy: str, timeout: float = 12.0) -> str | None:
         return ip or None
     except Exception:
         return None
+
+
+def _probe_exit_ip(account_proxy: str, timeout: float = 12.0) -> str | None:
+    """经账号专属代理 GET ipify，拿到出口公网 IP 即认为该线路可用；失败返回 None。
+
+    走 curl_cffi（与 mail_provider 一致，支持带认证 socks5h），不复用收件会话——
+    收件永不走代理，这里必须走代理才能验证「这条出口线路是否真的活着」。
+    socks5h 探活失败时会再试 http（与浏览器侧 _browser_proxy_url 一致）。
+    """
+    proxy = (account_proxy or "").strip()
+    if not proxy:
+        return None
+    candidates = [proxy]
+    parsed = parse_proxy(proxy)
+    if parsed and (parsed.scheme or "").lower().startswith("socks"):
+        candidates.append(
+            ParsedProxy("http", parsed.host, parsed.port, parsed.user, parsed.password).to_url()
+        )
+    for candidate in candidates:
+        ip = _probe_exit_ip_once(candidate, timeout)
+        if ip:
+            return ip
+    return None
+
+
+def _proxy_sid(acct_proxy: str) -> str:
+    parsed = parse_proxy(acct_proxy)
+    if not parsed or not parsed.user:
+        return "?"
+    parts = parsed.user.split("_")
+    return parts[-1] if parts else "?"
+
+
+def _code_purpose_label(purpose: str) -> str:
+    return mail_code.purpose_label(purpose)
+
+
+def _log_proxy_assignment(index: int, identity, acct_proxy: str, exit_ip: str) -> None:
+    """每个任务固定打一行代理/出口 IP 摘要，避免旧逻辑「首次探活成功不打日志」导致前端看不到。"""
+    region = identity.region.code
+    if not acct_proxy:
+        step(index, "未配置代理，使用本机网络", "yellow")
+        return
+    parsed = parse_proxy(acct_proxy)
+    is_ipweb = bool(parsed and parsed.host.endswith("ipweb.cc"))
+    label = "IPWeb 代理" if is_ipweb else "代理"
+    sid = _proxy_sid(acct_proxy)
+    retries = int(config.get("ip_probe_retries") or 0)
+    if exit_ip:
+        step(index, f"{label}已就绪，地区 {region}，出口 IP {exit_ip}", "green")
+    elif retries <= 0:
+        step(index, f"{label}已就绪，地区 {region}，未检测出口 IP", "yellow")
+    else:
+        step(index, f"{label}已就绪，地区 {region}，未能检测出口 IP，继续使用代理", "yellow")
 
 
 def _resolve_account_proxy(identity) -> str:
@@ -245,19 +346,19 @@ def _acquire_working_proxy(identity, index: int) -> tuple[str, str]:
                 if not duplicated:
                     _used_exit_ips.add(exit_ip)
             if not duplicated:
-                if attempt > 1:
-                    step(index, f"出口 IP 探活通过（第 {attempt} 次换线）：{exit_ip}")
                 return acct_proxy, exit_ip
             if rotate:
-                step(index, f"出口 IP {exit_ip} 已被占用（撞号），换 SID 重试（第 {attempt}/{attempts} 次）", "yellow")
+                step(index, f"出口 IP {exit_ip} 已被其他任务占用，正在更换代理重试 {attempt}/{attempts}", "yellow")
                 continue
             # 非 ipweb 固定代理：换 SID 无意义，撞号也只能沿用（固定代理本就共享同一 IP）
             return acct_proxy, exit_ip
         if rotate:
-            step(index, f"出口 IP 探活失败（第 {attempt}/{attempts} 次），换 SID 重试", "yellow")
+            step(index, f"代理连接检测失败，正在更换代理重试 {attempt}/{attempts}", "yellow")
+        elif attempt == 1:
+            step(index, "代理连接检测失败，继续使用当前代理", "yellow")
 
     if rotate:
-        step(index, "多次换 SID 仍未探到未占用的新 IP，回退沿用最后一条代理继续（本账号可能与他号共用 IP）", "yellow")
+        step(index, "多次更换代理后仍未获得独立 IP，继续使用当前代理", "yellow")
     # 非 ipweb 固定代理：探活失败也照用（换 SID 无意义）
     return last_proxy, ""
 
@@ -273,12 +374,12 @@ def _browser_proxy_url(raw: str, index: int) -> str:
         return ""
     parsed = parse_proxy(raw, default_scheme="http")
     if parsed is None:
-        step(index, f"代理无法解析，浏览器将直连：{raw}", "yellow")
+        step(index, f"代理地址无法解析，使用本机网络：{raw}", "yellow")
         return ""
     scheme = (parsed.scheme or "http").lower()
     if scheme.startswith("socks"):
         if parsed.user:
-            step(index, "检测到带认证的 SOCKS5 代理，Chromium 不支持，已改用 http 方案（若网关不支持 http 可能失败）", "yellow")
+            step(index, "检测到 SOCKS5 代理，已自动切换为 HTTP 方式连接", "yellow")
         scheme = "http"
     elif scheme not in ("http", "https"):
         scheme = "http"
@@ -287,6 +388,20 @@ def _browser_proxy_url(raw: str, index: int) -> str:
     pwd = quote(unquote(parsed.password), safe="") if parsed.password else ""
     auth = f"{user}:{pwd}@" if user else ""
     return f"{scheme}://{auth}{parsed.host}:{parsed.port}"
+
+
+def static_cache_job_options() -> dict:
+    """静态资源 route 缓存配置，随 job JSON 下发给 Node worker。"""
+    raw_dir = str(config.get("static_cache_dir") or "").strip()
+    cache_dir = ""
+    if raw_dir:
+        p = Path(raw_dir)
+        cache_dir = str(p if p.is_absolute() else base_dir.parents[1] / raw_dir)
+    return {
+        "enabled": bool(config.get("static_cache_enabled", True)),
+        "maxAgeDays": min(90, max(1, int(config.get("static_cache_max_age_days") or 7))),
+        "dir": cache_dir,
+    }
 
 
 def _level_color(level: object) -> str:
@@ -320,12 +435,60 @@ def _terminate(proc: subprocess.Popen) -> None:
         pass
 
 
+def signal_stop_new_tasks() -> None:
+    """仅阻止尚未启动浏览器的任务继续；已在跑的注册流程不受影响。"""
+    _stop_requested.set()
+
+
 def request_stop() -> None:
-    """停止注册任务时调用：向所有在途 Node 子进程发 stop 并终止，释放浏览器内存。"""
+    """用户主动停止：标记停止并向所有在途 Node 子进程发 stop 并终止，释放浏览器内存。"""
+    signal_stop_new_tasks()
     with _active_lock:
         procs = list(_active_procs)
+    if procs:
+        log(f"正在终止 {len(procs)} 个在途指纹浏览器进程…", "yellow")
     for proc in procs:
         _terminate(proc)
+    if procs:
+        log(f"已终止 {len(procs)} 个指纹浏览器进程", "yellow")
+
+
+def _totp_secret_from_data(data: dict) -> str:
+    secret = str(data.get("twoFactorSecret") or "").strip()
+    if secret:
+        return secret
+    uri = str(data.get("twoFactorUri") or "").strip()
+    if not uri:
+        return ""
+    try:
+        parsed = parse_qs(urlparse(uri).query)
+        from_uri = str((parsed.get("secret") or [""])[0]).strip()
+        if from_uri:
+            return from_uri
+    except Exception:  # noqa: BLE001
+        pass
+    match = re.search(r"secret=([A-Z2-7]+)", uri, flags=re.IGNORECASE)
+    return match.group(1) if match else ""
+
+
+def _cleanup_stale_accounts_for_email(email: str, keep_token: str) -> int:
+    """删除同邮箱旧记录（含 email:: 占位行），保留本次注册产出的 token 行。"""
+    target = email.strip().lower()
+    keep = str(keep_token or "").strip()
+    to_delete: list[str] = []
+    for acct in account_service.list_accounts():
+        if str(acct.get("email") or "").strip().lower() != target:
+            continue
+        tok = str(acct.get("access_token") or "").strip()
+        if tok and tok != keep:
+            to_delete.append(tok)
+    email_key = email_storage_key(email)
+    if email_key and email_key != keep:
+        to_delete.append(email_key)
+    keys = list(dict.fromkeys(k for k in to_delete if k and k != keep))
+    if keys:
+        account_service.delete_accounts(keys)
+    return len(keys)
 
 
 def _build_account(data: dict, email: str, acct_proxy: str, identity, exit_ip: str = "") -> dict:
@@ -349,7 +512,7 @@ def _build_account(data: dict, email: str, acct_proxy: str, identity, exit_ip: s
         "sec-ch-ua-mobile": prof.sec_ch_ua_mobile,
         "sec-ch-ua-platform": prof.platform,
         # 浏览器会话拿到的 2FA / 指纹种子（token 过期后靠 password+totp 重登）
-        "totp_secret": str(data.get("twoFactorSecret") or ""),
+        "totp_secret": _totp_secret_from_data(data),
         "otpauth_url": str(data.get("twoFactorUri") or ""),
         "fingerprint_seed": data.get("fingerprintSeed"),
     }
@@ -404,6 +567,7 @@ def _run_browser_job(index: int, email: str, mailbox: dict, browser_proxy: str, 
         "chatgptUrl": chatgpt_url,
         "timeoutMs": timeout_s * 1000,
         "locale": (str(identity.accept_language).split(",")[0] or "en-US"),
+        "staticCache": static_cache_job_options(),
     }
     # 若该邮箱本地已存过凭据（此前注册过），注入登录密码/2FA 密钥：
     # 注册中一旦发现邮箱已注册（登录页），先用存储密码登录，错了再忘记密码重设。
@@ -413,10 +577,16 @@ def _run_browser_job(index: int, email: str, mailbox: dict, browser_proxy: str, 
     if stored_totp:
         job["existingTotpSecret"] = stored_totp
     if stored_pwd or stored_totp:
-        step(index, f"已注入本地存储凭据兜底（密码{'有' if stored_pwd else '无'}/2FA{'有' if stored_totp else '无'}）")
-    baseline = mail_provider.peek_received_at(_mail_config(), mailbox)
-
+        parts = []
+        if stored_pwd:
+            parts.append("密码")
+        if stored_totp:
+            parts.append("双重验证密钥")
+        step(index, f"已从本地读取历史{'和'.join(parts)}")
+    mode_label = "无头" if job.get("headless") else "有界面"
+    step(index, f"正在启动浏览器，{mode_label}模式，最长等待 {timeout_s} 秒")
     proc = _spawn_worker(job)
+    step(index, "浏览器已启动")
     with _active_lock:
         _active_procs.add(proc)
 
@@ -454,15 +624,17 @@ def _run_browser_job(index: int, email: str, mailbox: dict, browser_proxy: str, 
             if etype == "log":
                 step(index, str(evt.get("message") or ""), _level_color(evt.get("level")))
             elif etype == "need_code":
-                code = mail_provider.wait_for_code(_mail_config(), mailbox, after_received_at=baseline)
-                newb = mail_provider.peek_received_at(_mail_config(), mailbox)
-                if isinstance(newb, datetime):
-                    baseline = newb
+                purpose = str(evt.get("purpose") or "register")
+                label = _code_purpose_label(purpose)
+                step(index, f"正在等待{label}验证码…")
+                code = mail_code.fulfill_need_code(
+                    _mail_config(), mailbox, ts=evt.get("ts"), purpose=purpose,
+                )
                 _send_line(proc, {"type": "code", "code": code})
                 if code:
-                    step(index, "已向浏览器回传验证码")
+                    step(index, f"收到{label}验证码：{code}")
                 else:
-                    step(index, "取码超时，已回传空验证码", "yellow")
+                    step(index, "等待验证码超时，邮箱中未收到新邮件", "yellow")
             elif etype == "result":
                 data = evt.get("data") or {}
                 break
@@ -477,6 +649,7 @@ def _run_browser_job(index: int, email: str, mailbox: dict, browser_proxy: str, 
         _terminate(proc)
         with _active_lock:
             _active_procs.discard(proc)
+        step(index, "浏览器已关闭")
 
     if data is None and err_msg is None:
         err_msg = "浏览器引擎未返回结果（进程可能被终止或超时）"
@@ -488,61 +661,75 @@ def _run_browser_job(index: int, email: str, mailbox: dict, browser_proxy: str, 
 
 
 def worker(index: int) -> dict:
+    ensure_config_loaded()
     start = time.time()
     _progress_update(index, status="running", step="任务启动", email="")
-    identity = build_identity(enabled_regions=config.get("regions") or ["US"])
-    acct_proxy, exit_ip = _acquire_working_proxy(identity, index)
-    browser_proxy = _browser_proxy_url(acct_proxy, index)
+    mailbox: dict | None = None
+    mailbox_settled = False
 
     verb = _mailbox_verb()
-    step(index, f"任务启动，开始{verb}邮箱")
     try:
-        mailbox = mail_provider.create_mailbox(_mail_config())
-    except Exception as exc:  # noqa: BLE001
-        with stats_lock:
-            stats["done"] += 1
-            stats["fail"] += 1
-        log(f"任务{index} 取邮箱失败：{exc}", "red")
-        _remove_progress(index)
-        return {"ok": False, "index": index, "error": str(exc)}
+        step(index, f"任务启动，开始{verb}邮箱")
+        try:
+            mailbox = mail_provider.create_mailbox(_mail_config())
+        except mail_provider.MailboxPoolExhaustedError as exc:
+            with stats_lock:
+                stats["done"] += 1
+                stats["fail"] += 1
+            log(f"任务{index} 取邮箱失败：{exc}", "red")
+            return {"ok": False, "index": index, "error": str(exc), "stop_run": True}
+        except Exception as exc:  # noqa: BLE001
+            with stats_lock:
+                stats["done"] += 1
+                stats["fail"] += 1
+            log(f"任务{index} 取邮箱失败：{exc}", "red")
+            return {"ok": False, "index": index, "error": str(exc)}
 
-    email = str(mailbox.get("address") or "").strip()
-    if not email:
-        mail_provider.release_mailbox(mailbox)
-        with stats_lock:
-            stats["done"] += 1
-            stats["fail"] += 1
-        _remove_progress(index)
-        return {"ok": False, "index": index, "error": "邮箱服务未返回 address"}
+        if is_stop_requested():
+            with stats_lock:
+                stats["done"] += 1
+                stats["fail"] += 1
+            log(f"任务{index} 注册任务已停止，跳过启动浏览器", "yellow")
+            return {"ok": False, "index": index, "error": "注册任务已停止", "stop_run": True}
 
-    label = str(mailbox.get("label") or "")
-    fetch_url = str(mailbox.get("fetch_url") or "")
-    set_progress_email(index, email)
-    step(index, f"邮箱{verb}完成[{label}]: {email}")
+        identity = build_identity(enabled_regions=config.get("regions") or ["US"])
+        acct_proxy, exit_ip = _acquire_working_proxy(identity, index)
+        if is_stop_requested():
+            with stats_lock:
+                stats["done"] += 1
+                stats["fail"] += 1
+            log(f"任务{index} 注册任务已停止，跳过启动浏览器", "yellow")
+            return {"ok": False, "index": index, "error": "注册任务已停止", "stop_run": True}
+        _log_proxy_assignment(index, identity, acct_proxy, exit_ip)
+        browser_proxy = _browser_proxy_url(acct_proxy, index)
 
-    try:
+        email = str(mailbox.get("address") or "").strip()
+        if not email:
+            mail_provider.release_mailbox(mailbox)
+            mailbox_settled = True
+            with stats_lock:
+                stats["done"] += 1
+                stats["fail"] += 1
+            return {"ok": False, "index": index, "error": "邮箱服务未返回 address"}
+
+        label = str(mailbox.get("label") or "")
+        fetch_url = str(mailbox.get("fetch_url") or "")
+        set_progress_email(index, email)
+        step(index, f"已分配邮箱：{email}")
+
+        if is_stop_requested():
+            with stats_lock:
+                stats["done"] += 1
+                stats["fail"] += 1
+            log(f"任务{index} 注册任务已停止，跳过启动浏览器", "yellow")
+            return {"ok": False, "index": index, "error": "注册任务已停止", "stop_run": True}
+
         data, err_msg, partial = _run_browser_job(index, email, mailbox, browser_proxy, identity)
 
         # —— 成功：拿到 token —— #
         if data and str(data.get("accessToken") or "").strip():
+            mailbox_settled = True
             token = str(data.get("accessToken")).strip()
-            elig = trial_check.check_eligibility(token, email)
-            if elig.get("eligible") is False:
-                # 注册成功但无试用资格：入异常清单，不进号池、不自动激活
-                register_abnormal_service.add(
-                    email, fetch_url=fetch_url, reason=str(elig.get("reason") or "no_trial"),
-                    access_token=token, password=data.get("password"), eligible=False,
-                )
-                mailbox["access_token"] = token
-                mail_provider.mark_mailbox_result(mailbox, success=True)
-                cost = time.time() - start
-                with stats_lock:
-                    stats["done"] += 1
-                    stats["fail"] += 1
-                log(f"{email} 注册成功但无试用资格（{elig.get('reason')}），已入异常清单，不入号池，本次耗时{cost:.1f}s", "yellow")
-                return {"ok": False, "index": index, "error": "no_trial"}
-
-            # 合格（或未启用检测/检测异常按 fail-open 视为合格）→ 入号池
             acct = _build_account(data, email, acct_proxy, identity, exit_ip)
             # 未改动的凭据用本地已存值回填（改了才存新的、没改保留旧的），避免用空值覆盖已有密码/2FA。
             stored_pwd, stored_totp = _lookup_stored_credentials(email)
@@ -550,20 +737,16 @@ def worker(index: int) -> dict:
                 acct["password"] = stored_pwd
             if not str(acct.get("totp_secret") or "").strip() and stored_totp:
                 acct["totp_secret"] = stored_totp
-            # 同邮箱的旧账号条目（旧 access_token，密码重置/重登后已失效）先删，避免重复与陈旧凭据。
+            # 同邮箱的旧账号条目（旧 access_token / email:: 占位）先删，避免重复与陈旧凭据。
             # 必须在 _lookup_stored_credentials 之后删（旧凭据就存在旧条目里）。
-            target_email = email.strip().lower()
-            old_tokens = [
-                str(a.get("access_token") or "")
-                for a in account_service.list_accounts()
-                if str(a.get("email") or "").strip().lower() == target_email
-                and str(a.get("access_token") or "").strip()
-                and str(a.get("access_token") or "") != token
-            ]
-            if old_tokens:
-                account_service.delete_accounts(old_tokens)
-                step(index, f"已清理同邮箱旧账号 {len(old_tokens)} 条（凭据已更新，旧 token 失效）")
+            removed = _cleanup_stale_accounts_for_email(email, token)
+            if removed:
+                step(index, f"已清理同邮箱 {removed} 条旧记录")
             mailbox["access_token"] = token
+            for field in ("password", "totp_secret", "otpauth_url"):
+                val = str(acct.get(field) or "").strip()
+                if val:
+                    mailbox[field] = val
             account_service.add_account_items([acct])
             refresh_result = account_service.refresh_accounts([token])
             if refresh_result.get("errors"):
@@ -575,40 +758,62 @@ def worker(index: int) -> dict:
                 stats["success"] += 1
                 avg = (time.time() - stats["start_time"]) / max(1, stats["success"])
             mode = str(data.get("mode") or "register")
-            log(f'{email} {"注册" if mode == "register" else "老账号加固"}成功，本次耗时{cost:.1f}s，全局平均每个号耗时{avg:.1f}s', "green")
+            log(f'{email} {"注册" if mode == "register" else "账号加固"}成功，耗时 {cost:.1f} 秒，平均每个 {avg:.1f} 秒', "green")
+            cred_parts = []
+            if str(acct.get("password") or "").strip():
+                cred_parts.append(f"密码 {acct['password']}")
+            if str(acct.get("totp_secret") or "").strip():
+                cred_parts.append(f"双重验证密钥 {acct['totp_secret']}")
+            if cred_parts:
+                step(index, "账号凭据 · " + " · ".join(cred_parts), "green")
             return {"ok": True, "index": index, "result": acct}
 
         # —— 失败：可能带 partial token（step8 失败但已拿 token）—— #
+        mailbox_settled = True
         token = str((partial or {}).get("accessToken") or "").strip()
         if token:
-            elig = trial_check.check_eligibility(token, email)
             register_abnormal_service.add(
                 email, fetch_url=fetch_url, reason=str(err_msg or "register_error"),
                 access_token=token, password=(partial or {}).get("password"),
-                eligible=elig.get("eligible"),
             )
             mailbox["access_token"] = token
             mail_provider.mark_mailbox_result(mailbox, success=True)
-            log(f"{email} 注册部分成功（{err_msg}），token 已存入异常清单", "yellow")
+            log(f"{email} 注册部分完成，登录凭证已保存到异常清单：{err_msg}", "yellow")
         else:
+            register_abnormal_service.add(
+                email, fetch_url=fetch_url, reason=str(err_msg or "register_error"),
+            )
             mail_provider.mark_mailbox_result(mailbox, success=False, error=err_msg)
+            log(f"{email} 注册失败，已记入异常清单：{err_msg}", "yellow")
 
         cost = time.time() - start
         with stats_lock:
             stats["done"] += 1
             stats["fail"] += 1
-        log(f"任务{index} 注册失败，本次耗时{cost:.1f}s，原因: {err_msg}", "red")
+        log(f"任务 {index} 注册失败，耗时 {cost:.1f} 秒，原因：{err_msg}", "red")
         return {"ok": False, "index": index, "error": err_msg or "注册失败"}
     except Exception as e:  # noqa: BLE001
-        try:
-            mail_provider.mark_mailbox_result(mailbox, success=False, error=e)
-        except Exception:
-            pass
+        if mailbox is not None:
+            try:
+                mail_provider.mark_mailbox_result(mailbox, success=False, error=e)
+                mailbox_settled = True
+            except Exception:
+                pass
+        email = str((mailbox or {}).get("address") or "").strip()
+        fetch_url = str((mailbox or {}).get("fetch_url") or "")
+        if email:
+            register_abnormal_service.add(email, fetch_url=fetch_url, reason=str(e))
+            log(f"{email} 注册异常，已记入异常清单：{e}", "yellow")
         cost = time.time() - start
         with stats_lock:
             stats["done"] += 1
             stats["fail"] += 1
-        log(f"任务{index} 注册异常，本次耗时{cost:.1f}s，原因: {e}", "red")
+        log(f"任务 {index} 注册异常，耗时 {cost:.1f} 秒，原因：{e}", "red")
         return {"ok": False, "index": index, "error": str(e)}
     finally:
+        if mailbox is not None and not mailbox_settled:
+            try:
+                mail_provider.release_mailbox(mailbox)
+            except Exception:
+                pass
         _remove_progress(index)

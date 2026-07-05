@@ -1,0 +1,30 @@
+# 本地开发用 PostgreSQL（独立 compose，不修改 docker-compose.yml 规范模板）
+#
+# 启动：docker compose -f docker-compose.postgres.yml up -d
+# 连接：postgresql://account_hub:account_hub@127.0.0.1:5433/account_hub
+#
+# 应用侧环境变量示例：
+#   STORAGE_BACKEND=postgres
+#   DATABASE_URL=postgresql://account_hub:account_hub@127.0.0.1:5433/account_hub
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: account-hub-postgres
+    restart: unless-stopped
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: account_hub
+      POSTGRES_PASSWORD: account_hub
+      POSTGRES_DB: account_hub
+    volumes:
+      - account_hub_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U account_hub -d account_hub"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  account_hub_pgdata:

@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
-import { Card, Button, Typography, Toast, Space, Tag, RadioGroup, Radio, Spin, Popconfirm, Modal, Input, Checkbox } from "@douyinfe/semi-ui-19";
+import { Card, Button, Typography, Toast, Space, Tag, RadioGroup, Radio, Spin, Popconfirm, Modal, Input, Checkbox, Table } from "@douyinfe/semi-ui-19";
 import { IconCopy, IconSend, IconTickCircle, IconClose, IconRefresh, IconClock } from "@douyinfe/semi-icons";
 
 import {
   fetchDispatchSummary,
+  fetchDispatchAccounts,
   acquireDispatch,
   dispatchAction,
   dispatchCheckout,
@@ -13,8 +14,7 @@ import {
 } from "@/lib/api";
 import { useIsMobile } from "@/lib/use-is-mobile";
 import { copyToClipboard as copy } from "@/lib/clipboard";
-
-const { Title, Text } = Typography;
+const { Text } = Typography;
 
 const EMPTY_SUMMARY: DispatchSummary = { account_available: 0, phone_available: 0 };
 
@@ -30,7 +30,8 @@ export default function DispatchPage() {
   const [xianyu, setXianyu] = useState("");
   const [plan, setPlan] = useState("");
   const [note, setNote] = useState("");
-  const [pairCheckout, setPairCheckout] = useState(false);
+  const [dispatchAccounts, setDispatchAccounts] = useState<Array<{ email: string | null; access_token: string; activated_at?: string | null }>>([]);
+  const [selectedToken, setSelectedToken] = useState("");
   const [relatedPhone, setRelatedPhone] = useState("");
   const [relatedAccountToken, setRelatedAccountToken] = useState("");
 
@@ -42,9 +43,22 @@ export default function DispatchPage() {
     }
   };
 
+  const refreshDispatchAccounts = async () => {
+    try {
+      const data = await fetchDispatchAccounts();
+      setDispatchAccounts(data.items);
+      setSummary(data.summary);
+    } catch {
+      /* ignore */
+    }
+  };
+
   useEffect(() => {
     void refreshSummary();
+    void refreshDispatchAccounts();
   }, []);
+
+  const [pairCheckout, setPairCheckout] = useState(false);
 
   const availableOf = (k: DispatchKind) => (k === "account" ? summary.account_available : summary.phone_available);
 
@@ -61,10 +75,15 @@ export default function DispatchPage() {
     void refreshSummary();
   };
 
-  const acquire = async (releaseId?: string) => {
+  const acquire = async (releaseId?: string, token?: string) => {
     setBusy(true);
     try {
-      const res = await acquireDispatch(kind, releaseId);
+      const pick = token || selectedToken;
+      if (kind === "account" && !pick) {
+        Toast.warning("请先选择要出库的 Plus 账号");
+        return;
+      }
+      const res = await acquireDispatch(kind, releaseId, pick || undefined);
       setSummary(res.summary);
       setItem(res.item);
       if (!res.item) Toast.warning(kind === "account" ? "暂无可发的 Plus 账号" : "暂无可发的手机号（可能都在冷却/已用尽）");
@@ -147,39 +166,61 @@ export default function DispatchPage() {
 
   return (
     <div style={{ maxWidth: 720, margin: "0 auto" }}>
-      <div
-        style={{
-          display: "flex",
-          flexDirection: isMobile ? "column" : "row",
-          alignItems: isMobile ? "stretch" : "center",
-          justifyContent: "space-between",
-          gap: 12,
-          marginBottom: 16,
-        }}
-      >
-        <Title heading={isMobile ? 4 : 3} style={{ margin: 0 }}>
-          出库管理
-        </Title>
-        <Button icon={<IconRefresh />} onClick={() => void refreshSummary()}>
-          刷新可用
-        </Button>
-      </div>
-
       {/* 发号类型 */}
       <Card bodyStyle={{ padding: 16 }} style={{ marginBottom: 16 }}>
-        <RadioGroup
-          type="button"
-          value={kind}
-          onChange={(e) => void switchKind(e.target.value as DispatchKind)}
-          style={{ width: isMobile ? "100%" : undefined }}
+        <div
+          style={{
+            display: "flex",
+            flexWrap: "wrap",
+            gap: 12,
+            alignItems: "center",
+            justifyContent: "space-between",
+            marginBottom: 14,
+          }}
         >
-          <Radio value="account" style={isMobile ? { flex: 1, textAlign: "center" } : undefined}>
-            Plus 账号发号（剩 {summary.account_available}）
-          </Radio>
-          <Radio value="phone" style={isMobile ? { flex: 1, textAlign: "center" } : undefined}>
-            手机发号（剩 {summary.phone_available}）
-          </Radio>
-        </RadioGroup>
+          <RadioGroup
+            type="button"
+            value={kind}
+            onChange={(e) => void switchKind(e.target.value as DispatchKind)}
+            style={{ width: isMobile ? "100%" : undefined }}
+          >
+            <Radio value="account" style={isMobile ? { flex: 1, textAlign: "center" } : undefined}>
+              会员账号发号（剩 {summary.account_available}）
+            </Radio>
+            <Radio value="phone" style={isMobile ? { flex: 1, textAlign: "center" } : undefined}>
+              手机号码发号（剩 {summary.phone_available}）
+            </Radio>
+          </RadioGroup>
+          <Button icon={<IconRefresh />} size="small" onClick={() => void refreshSummary()}>
+            刷新可用
+          </Button>
+        </div>
+
+        {kind === "account" ? (
+          <div style={{ marginBottom: 14 }}>
+            <Table
+              dataSource={dispatchAccounts}
+              rowKey="access_token"
+              size="small"
+              pagination={false}
+              rowSelection={{
+                type: "radio",
+                selectedRowKeys: selectedToken ? [selectedToken] : [],
+                onChange: (keys) => setSelectedToken(String((keys ?? [])[0] || "")),
+              }}
+              columns={[
+                { title: "邮箱", dataIndex: "email" },
+                {
+                  title: "激活时间",
+                  dataIndex: "activated_at",
+                  render: (v: string | null) => (v ? new Date(v).toLocaleString() : "—"),
+                },
+              ]}
+              scroll={{ y: 200 }}
+              empty="暂无可出库 Plus 账号"
+            />
+          </div>
+        ) : null}
 
         <div style={{ marginTop: 14 }}>
           <Button
@@ -189,13 +230,13 @@ export default function DispatchPage() {
             icon={<IconSend />}
             block
             loading={busy && !item}
-            disabled={availableOf(kind) <= 0 && !item}
-            onClick={() => void acquire(item?.id)}
+            disabled={(kind === "account" ? !selectedToken && availableOf(kind) <= 0 : availableOf(kind) <= 0) && !item}
+            onClick={() => void acquire(item?.id, selectedToken)}
           >
             {item ? "重新发一个" : `发一个${kindLabel}`}
           </Button>
           <Text type="tertiary" size="small" style={{ display: "block", marginTop: 8, textAlign: "center" }}>
-            按{kind === "account" ? "激活时间" : "导入时间"}最老优先，发号即锁定，确认出库前其他人不会拿到同一个号
+            {kind === "account" ? "先勾选 Plus 账号，再预占并发号" : "按导入时间最老优先"}
           </Text>
         </div>
       </Card>

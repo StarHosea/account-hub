@@ -1,5 +1,5 @@
 import { Switch, Button, Typography, Space, Tag, Tooltip, Modal } from "@douyinfe/semi-ui-19";
-import { IconSetting } from "@douyinfe/semi-icons";
+import { IconSetting, IconPlayCircle } from "@douyinfe/semi-icons";
 import { useNavigate } from "react-router-dom";
 
 import { useSettingsStore } from "@/store/settings";
@@ -26,7 +26,7 @@ export default function RegisterPanel() {
     if (running) {
       Modal.confirm({
         title: "确认停止注册机？",
-        content: "将中断正在进行的注册流程",
+        content: "将立即终止所有在途指纹浏览器，并安全结束注册任务。",
         maskClosable: false,
         onOk: () => void toggle(),
       });
@@ -48,9 +48,17 @@ export default function RegisterPanel() {
         <Space align="center" spacing={10}>
           <Text type="success" size="small">成功 <b>{stats.success}</b></Text>
           <Text type="danger" size="small">失败 <b>{stats.fail}</b></Text>
+          <Text type="tertiary" size="small">浏览器 <b>{stats.active_browsers ?? 0}</b></Text>
           <Text type="tertiary" size="small">运行/线程 {stats.running}/{stats.threads}</Text>
         </Space>
       )}
+      {running ? (
+        <Tooltip content="查看注册机实时日志">
+          <Button icon={<IconPlayCircle />} size="small" theme="borderless" onClick={() => navigate("/register")}>
+            日志
+          </Button>
+        </Tooltip>
+      ) : null}
       <Tooltip content="去「设置」页配置注册参数">
         <Button icon={<IconSetting />} size="small" theme="borderless" onClick={() => navigate("/settings")}>
           配置

@@ -186,7 +186,24 @@ class CdkRedeemClient:
             "User-Agent": "account-hub-cdk/1.0",
         }
 
-    def _request(self, method: str, path: str, body: dict | None = None) -> dict | None:
+    def _emit_exchange(self, exchange_cb, meta: dict) -> None:
+        if not exchange_cb:
+            return
+        try:
+            exchange_cb(meta)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _parse_response(text: str) -> dict | list | str | None:
+        if not text:
+            return None
+        try:
+            return json.loads(text)
+        except Exception:
+            return {"_raw": text}
+
+    def _request(self, method: str, path: str, body: dict | None = None, exchange_cb=None) -> dict | None:
         url = self.base_url + path
         data = json.dumps(body).encode("utf-8") if body is not None else None
         last_err: object = None
@@ -199,15 +216,49 @@ class CdkRedeemClient:
                 headers = dict(resp.headers or {})
             except Exception as exc:  # 网络异常 → 退避重试
                 last_err = exc
-                if attempt < NET_RETRIES:
+                will_retry = attempt < NET_RETRIES
+                self._emit_exchange(exchange_cb, {
+                    "method": method,
+                    "path": path,
+                    "url": url,
+                    "request": body,
+                    "http_status": None,
+                    "response": None,
+                    "error": scrub(exc),
+                    "attempt": attempt + 1,
+                    "retrying": will_retry,
+                })
+                if will_retry:
                     time.sleep((BACKOFF_BASE ** attempt) + random.random())
                     continue
                 raise RedeemError(scrub(exc))
             if status in (401, 403):
+                self._emit_exchange(exchange_cb, {
+                    "method": method,
+                    "path": path,
+                    "url": url,
+                    "request": body,
+                    "http_status": status,
+                    "response": self._parse_response(text),
+                    "error": f"鉴权失败 HTTP {status}",
+                    "attempt": attempt + 1,
+                })
                 raise AuthError(f"鉴权失败 HTTP {status}（X-External-Api-Key 可能无效）")
             if status == 429 or 500 <= status < 600:
                 last_err = f"HTTP {status}"
-                if attempt < NET_RETRIES:
+                will_retry = attempt < NET_RETRIES
+                self._emit_exchange(exchange_cb, {
+                    "method": method,
+                    "path": path,
+                    "url": url,
+                    "request": body,
+                    "http_status": status,
+                    "response": self._parse_response(text),
+                    "error": str(last_err),
+                    "attempt": attempt + 1,
+                    "retrying": will_retry,
+                })
+                if will_retry:
                     retry_after = headers.get("Retry-After") or headers.get("retry-after")
                     try:
                         sleep_s = float(retry_after) if retry_after else (BACKOFF_BASE ** attempt) + random.random()
@@ -215,21 +266,40 @@ class CdkRedeemClient:
                         sleep_s = (BACKOFF_BASE ** attempt) + random.random()
                     time.sleep(sleep_s)
                     continue
-            try:
-                return json.loads(text) if text else None
-            except Exception:
-                return None
+            parsed = self._parse_response(text)
+            self._emit_exchange(exchange_cb, {
+                "method": method,
+                "path": path,
+                "url": url,
+                "request": body,
+                "http_status": status,
+                "response": parsed,
+                "attempt": attempt + 1,
+            })
+            if isinstance(parsed, dict) or parsed is None:
+                return parsed if isinstance(parsed, dict) else None
+            return None
+        self._emit_exchange(exchange_cb, {
+            "method": method,
+            "path": path,
+            "url": url,
+            "request": body,
+            "http_status": None,
+            "response": None,
+            "error": scrub(last_err),
+            "attempt": NET_RETRIES + 1,
+        })
         raise RedeemError(scrub(last_err))
 
     # ----------------------------- 接口封装 ----------------------------- #
 
-    def submit(self, cdk: str, access_token: str) -> dict | None:
+    def submit(self, cdk: str, access_token: str, exchange_cb=None) -> dict | None:
         body = {"items": [{"cdkey": cdk.strip(), "access_token": access_token.strip()}]}
-        return self._request("POST", SUBMIT_PATH, body)
+        return self._request("POST", SUBMIT_PATH, body, exchange_cb=exchange_cb)
 
-    def query_status(self, cdks: list[str]) -> dict | None:
+    def query_status(self, cdks: list[str], exchange_cb=None) -> dict | None:
         body = {"cdkeys": [c.strip() for c in cdks]}
-        return self._request("POST", STATUS_PATH, body)
+        return self._request("POST", STATUS_PATH, body, exchange_cb=exchange_cb)
 
     def close(self) -> None:
         try:

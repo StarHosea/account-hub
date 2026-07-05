@@ -11,7 +11,7 @@ from pathlib import Path
 
 from services.account_service import account_service
 from services.config import DATA_DIR, config
-from services.register import mail_provider, openai_register
+from services.register import mail_provider, openai_register, fingerprint
 
 
 REGISTER_FILE = DATA_DIR / "register.json"
@@ -24,7 +24,7 @@ def _now() -> str:
 def _default_mail() -> dict:
     return {
         "request_timeout": 30,
-        "wait_timeout": 60,
+        "wait_timeout": 300,
         "wait_interval": 3,
         "providers": [{"type": mail_provider.API_MAILBOX_TYPE, "enable": True, "label": "API邮箱"}],
     }
@@ -48,6 +48,10 @@ def _default_config() -> dict:
         "headless": False,
         "register_timeout": 300,
         "node_bin": "node",
+        # 浏览器静态资源 route 缓存（JS/CSS/字体等，不共享 Cookie）
+        "static_cache_enabled": True,
+        "static_cache_max_age_days": 7,
+        "static_cache_dir": "",
         "stats": {
             "success": 0,
             "fail": 0,
@@ -109,7 +113,16 @@ def _normalize(raw: dict) -> dict:
     valid_regions = set(openai_register.fingerprint.REGIONS.keys())
     raw_regions = raw.get("regions") if isinstance(raw.get("regions"), list) else []
     cfg["regions"] = [r for r in raw_regions if r in valid_regions] or ["US"]
-    cfg["ipweb_rotate"] = bool(raw.get("ipweb_rotate"))
+    # 未显式配置时：ipweb 动态住宅代理（B_<id>_..._<SID>）默认开启号一号一 IP。
+    if "ipweb_rotate" in raw:
+        cfg["ipweb_rotate"] = bool(raw.get("ipweb_rotate"))
+    else:
+        parsed = fingerprint.parse_proxy(cfg["proxy"])
+        cfg["ipweb_rotate"] = bool(
+            parsed
+            and parsed.host.endswith("ipweb.cc")
+            and parsed.user.startswith("B_")
+        )
     cfg["ip_duration"] = min(2880, max(1, int(raw.get("ip_duration") or 120)))
     # 出口 IP 探活重试：0 关闭探活（旧行为），上限 20 次避免死循环空转
     cfg["ip_probe_retries"] = min(20, max(0, int(raw.get("ip_probe_retries", cfg["ip_probe_retries"]))))
@@ -119,10 +132,44 @@ def _normalize(raw: dict) -> dict:
     cfg["headless"] = bool(raw.get("headless"))
     cfg["register_timeout"] = min(1800, max(60, int(raw.get("register_timeout") or 300)))
     cfg["node_bin"] = str(raw.get("node_bin") or "node").strip() or "node"
+    cfg["static_cache_enabled"] = bool(raw.get("static_cache_enabled", cfg["static_cache_enabled"]))
+    cfg["static_cache_max_age_days"] = min(90, max(1, int(raw.get("static_cache_max_age_days") or cfg["static_cache_max_age_days"])))
+    cfg["static_cache_dir"] = str(raw.get("static_cache_dir") or "").strip()
     base_stats = _default_config()["stats"]
     raw_stats = raw.get("stats") if isinstance(raw.get("stats"), dict) else {}
     cfg["stats"] = {**base_stats, **{k: raw_stats[k] for k in base_stats if k in raw_stats}, "threads": cfg["threads"]}
     return cfg
+
+
+def _resolve_static_cache_dir(cfg: dict) -> Path:
+  raw = str(cfg.get("static_cache_dir") or "").strip()
+  if raw:
+    p = Path(raw)
+    return p if p.is_absolute() else DATA_DIR.parent / p
+  return DATA_DIR / "http-cache"
+
+
+def _static_cache_stats(cfg: dict) -> dict:
+  path = _resolve_static_cache_dir(cfg)
+  size_bytes = 0
+  file_count = 0
+  if path.is_dir():
+    try:
+      for entry in path.rglob("*"):
+        if not entry.is_file():
+          continue
+        try:
+          size_bytes += entry.stat().st_size
+          file_count += 1
+        except OSError:
+          pass
+    except OSError:
+      pass
+  return {
+    "static_cache_size_bytes": size_bytes,
+    "static_cache_file_count": file_count,
+    "static_cache_resolved_dir": str(path),
+  }
 
 
 class RegisterService:
@@ -132,8 +179,10 @@ class RegisterService:
         self._lock = threading.RLock()
         self._runner: threading.Thread | None = None
         self._logs: list[dict] = []
+        self._reserved_mailboxes: list[dict[str, str]] = []
         openai_register.register_log_sink = self._append_log
         self._config = self._load()
+        self._push_to_worker()
         # 注意：不在构造时 auto-start。续跑统一由 api/app.py lifespan 调 resume_if_enabled()，
         # 确保「对账清中间态」先于「续跑」执行，且避免被 import 副作用意外拉起注册任务。
 
@@ -144,9 +193,16 @@ class RegisterService:
         """
         with self._lock:
             enabled = bool(self._config.get("enabled"))
-        if enabled:
-            self._append_log("检测到上次注册任务未结束，自动续跑（重新跑满目标数）", "yellow")
-            self.start()
+        if not enabled:
+            return
+        if mail_provider.is_api_pool_exhausted(self.get().get("mail") or {}):
+            with self._lock:
+                self._config["enabled"] = False
+                self._save()
+            self._append_log("检测到上次注册任务未结束，但邮箱池已无可用地址，已自动停止续跑", "yellow")
+            return
+        self._append_log("检测到上次注册任务未结束，自动续跑并将重新完成目标数量", "yellow")
+        self.start()
 
     def _load(self) -> dict:
         data = self._storage.load_state("register")
@@ -172,10 +228,21 @@ class RegisterService:
             base = json.loads(json.dumps({**self._config, "logs": self._logs[-300:]}, ensure_ascii=False))
         # 正在注册的实时进度（按任务号），与 stats/logs 一起随 SSE 推给前端。
         base["progress"] = openai_register.progress_snapshot()
+        stats = base.get("stats") if isinstance(base.get("stats"), dict) else {}
+        stats["active_browsers"] = openai_register.active_browser_count()
+        base["stats"] = stats
+        base.update(_static_cache_stats(self._config))
         return base
 
     def _push_to_worker(self) -> None:
-        openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads", "enable_2fa", "regions", "ipweb_rotate", "ip_duration", "ip_probe_retries", "engine", "headless", "register_timeout", "node_bin")})
+        openai_register.config.update({
+            k: self._config[k]
+            for k in (
+                "mail", "proxy", "total", "threads", "enable_2fa", "regions", "ipweb_rotate",
+                "ip_duration", "ip_probe_retries", "engine", "headless", "register_timeout", "node_bin",
+                "static_cache_enabled", "static_cache_max_age_days", "static_cache_dir",
+            )
+        })
 
     def update(self, updates: dict) -> dict:
         with self._lock:
@@ -184,11 +251,43 @@ class RegisterService:
             self._save()
             return self.get()
 
-    def start(self) -> dict:
+    def pop_reserved_mailbox(self) -> dict | None:
+        with self._lock:
+            if not self._reserved_mailboxes:
+                return None
+            item = self._reserved_mailboxes.pop(0)
+            return {
+                "provider": mail_provider.API_MAILBOX_TYPE,
+                "provider_ref": f"{mail_provider.API_MAILBOX_TYPE}#1",
+                "label": "API邮箱",
+                "address": item["email"],
+                "fetch_url": item.get("fetch_url") or "",
+            }
+
+    def start(self, emails: list[str] | None = None) -> dict:
         with self._lock:
             if self._runner and self._runner.is_alive():
                 self._config["enabled"] = True
                 self._save()
+                return self.get()
+            selected = [str(e or "").strip() for e in (emails or []) if str(e or "").strip()]
+            if selected:
+                reserved = account_service.reserve_emails_for_register(selected)
+                self._reserved_mailboxes = []
+                for email in reserved:
+                    rec = account_service.find_by_email(email) or {}
+                    self._reserved_mailboxes.append({
+                        "email": email,
+                        "fetch_url": str(rec.get("fetch_url") or ""),
+                    })
+                if not self._reserved_mailboxes:
+                    self._append_log("未选中可注册邮箱，注册任务未启动", "yellow")
+                    return self.get()
+                self._config["total"] = min(int(self._config.get("total") or 1), len(self._reserved_mailboxes))
+            elif mail_provider.is_api_pool_exhausted(self._config.get("mail") or {}):
+                self._config["enabled"] = False
+                self._save()
+                self._append_log("邮箱池无可用地址，注册任务未启动", "yellow")
                 return self.get()
             self._config["enabled"] = True
             self._logs = []
@@ -201,7 +300,9 @@ class RegisterService:
             self._save()
             self._runner = threading.Thread(target=self._run, daemon=True, name="openai-register")
             self._runner.start()
-            self._append_log(f"注册任务启动，目标数量={self._config['total']}，线程数={self._config['threads']}", "yellow")
+            self._append_log(f"注册任务启动，目标 {self._config['total']} 个，并发 {self._config['threads']} 路", "yellow")
+            if selected:
+                self._append_log(f"已预选邮箱：{', '.join(item['email'] for item in self._reserved_mailboxes)}", "yellow")
             return self.get()
 
     def stop(self) -> dict:
@@ -209,7 +310,7 @@ class RegisterService:
             self._config["enabled"] = False
             self._config["stats"]["updated_at"] = _now()
             self._save()
-            self._append_log("已请求停止注册任务，正在终止在途浏览器并等待当前任务结束", "yellow")
+            self._append_log("已请求停止注册，正在关闭浏览器并等待当前任务结束", "yellow")
         # 终止所有在途 Node/CloakBrowser 子进程（在锁外调用，避免阻塞其它请求）
         try:
             openai_register.request_stop()
@@ -290,14 +391,30 @@ class RegisterService:
             self._config["stats"]["updated_at"] = _now()
             self._save()
 
+    def _stop_for_mailbox_shortage(self, *, pool_stop_logged: list[bool]) -> None:
+        with self._lock:
+            self._config["enabled"] = False
+        try:
+            # 邮箱池空：只拦新任务，不杀已在跑的浏览器（避免误报 page.evaluate 关闭）。
+            openai_register.signal_stop_new_tasks()
+        except Exception as exc:  # noqa: BLE001
+            self._append_log(f"停止后续注册任务时出错：{exc}", "red")
+        if not pool_stop_logged[0]:
+            pool_stop_logged[0] = True
+            self._append_log("邮箱不足，已停止提交新任务；在途注册将继续完成", "yellow")
+
     def _run(self) -> None:
         threads = int(self.get()["threads"])
         total = int(self.get()["total"])
         submitted, done, success, fail = 0, 0, 0, 0
+        pool_stop_logged = [False]
         with ThreadPoolExecutor(max_workers=threads) as executor:
             futures = set()
             while True:
                 while self.get()["enabled"] and submitted < total and len(futures) < threads:
+                    if mail_provider.is_api_pool_exhausted(self.get().get("mail") or {}):
+                        self._stop_for_mailbox_shortage(pool_stop_logged=pool_stop_logged)
+                        break
                     submitted += 1
                     futures.add(executor.submit(openai_register.worker, submitted))
                 self._bump(running=len(futures), done=done, success=success, fail=fail, **self._pool_metrics())
@@ -313,12 +430,15 @@ class RegisterService:
                             self._maybe_auto_activate(result)
                         else:
                             fail += 1
+                            if result.get("stop_run"):
+                                self._stop_for_mailbox_shortage(pool_stop_logged=pool_stop_logged)
                     except Exception:
                         fail += 1
         self._bump(running=0, done=done, success=success, fail=fail, finished_at=_now(), **self._pool_metrics())
         with self._lock:
             self._config["enabled"] = False
             self._save()
+        openai_register.reset_stop_requested()
         self._append_log(f"注册任务结束，成功{success}，失败{fail}", "yellow")
 
 

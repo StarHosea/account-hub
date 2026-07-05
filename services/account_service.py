@@ -10,6 +10,19 @@ from pathlib import Path
 from threading import Condition, Lock, Thread
 from typing import Any
 
+from services.account_lifecycle import (
+    PLAN_FREE,
+    STAGE_PLUS_REVIEW,
+    STAGE_REGISTERING,
+    STAGE_REGISTERED,
+    STAGE_UNREGISTERED,
+    apply_stage,
+    email_storage_key,
+    empty_activation,
+    enrich_account,
+    is_email_key,
+    mark_dispatched,
+)
 from services.config import config
 from services.log_service import (
     LOG_TYPE_ACCOUNT,
@@ -181,11 +194,16 @@ class AccountService:
 
     def _load_accounts(self) -> dict[str, dict]:
         accounts = self.storage.load_accounts()
-        return {
-            normalized["access_token"]: normalized
-            for item in accounts
-            if (normalized := self._normalize_account(item)) is not None
-        }
+        result: dict[str, dict] = {}
+        for item in accounts:
+            normalized = self._normalize_account(item)
+            if normalized is None:
+                continue
+            raw_token = str(item.get("access_token") or item.get("accessToken") or "").strip()
+            key = raw_token if is_email_key(raw_token) else self._account_dict_key(normalized)
+            if key:
+                result[key] = normalized
+        return result
 
     def _save_accounts(self) -> None:
         self.storage.save_accounts(list(self._accounts.values()))
@@ -267,11 +285,22 @@ class AccountService:
                     return plan
         return None
 
+    @staticmethod
+    def _account_dict_key(item: dict) -> str:
+        token = str(item.get("access_token") or "").strip()
+        if token and not is_email_key(token):
+            return token
+        email = str(item.get("email") or "").strip()
+        return email_storage_key(email) if email else ""
+
     def _normalize_account(self, item: dict) -> dict | None:
         if not isinstance(item, dict):
             return None
-        access_token = item.get("access_token") or item.get("accessToken") or ""
-        if not access_token:
+        access_token = str(item.get("access_token") or item.get("accessToken") or "").strip()
+        if is_email_key(access_token):
+            access_token = ""
+        email = str(item.get("email") or "").strip()
+        if not access_token and not email:
             return None
         normalized = dict(item)
         normalized.pop("accessToken", None)
@@ -343,7 +372,7 @@ class AccountService:
         # 激活不可用标记：某邮箱账号两种类型 CDK 均连续激活失败后置位，下轮激活自动跳过，
         # 直到人工「标记可用」重置。与 plus_status 分离，保证重置后仍持久生效。
         normalized["plus_unavailable"] = bool(normalized.get("plus_unavailable"))
-        return normalized
+        return enrich_account(normalized)
 
     @staticmethod
     def _jwt_exp(access_token: str) -> int:
@@ -497,9 +526,40 @@ class AccountService:
         # 浏览器登录（并发闸在 openai_account_ops 内）：锁外同步执行，拿到新 token 再落库返回，
         # 保证 fetch_remote_info 等调用方能在同一次调用里拿到有效新 token（否则会误判失效移除账号）。
         from services.register import openai_account_ops
+        from services.activation_audit_context import get_recorder
+        recorder = get_recorder()
+        if recorder is not None:
+            recorder.record_http(
+                "openai_browser_login",
+                {
+                    "method": "BROWSER",
+                    "path": "/browser-login",
+                    "url": "",
+                    "request": {"email": email, "event": event, "force": force},
+                    "http_status": None,
+                    "response": None,
+                },
+            )
         result = openai_account_ops.run_browser_login(
             email, password, totp_secret=totp_secret, account_proxy=account_proxy,
         )
+        if recorder is not None:
+            recorder.record_http(
+                "openai_browser_login_result",
+                {
+                    "method": "BROWSER",
+                    "path": "/browser-login",
+                    "url": "",
+                    "request": {"email": email, "event": event},
+                    "http_status": 200 if result.get("ok") else 500,
+                    "response": {
+                        "ok": bool(result.get("ok")),
+                        "error": str(result.get("error") or ""),
+                        "has_access_token": bool(result.get("access_token")),
+                    },
+                    "error": None if result.get("ok") else str(result.get("error") or "browser login failed"),
+                },
+            )
         if not result.get("ok"):
             self._record_token_refresh_error(active_token, event, str(result.get("error") or ""))
             return active_token
@@ -820,11 +880,153 @@ class AccountService:
         with self._lock:
             result = []
             for item in self._accounts.values():
-                account = dict(item)
+                account = enrich_account(dict(item))
                 token = account.get("access_token") or ""
                 account["image_inflight"] = int(self._image_inflight.get(token, 0))
                 result.append(account)
             return result
+
+    def find_by_email(self, email: str) -> dict | None:
+        norm = str(email or "").strip().lower()
+        if not norm:
+            return None
+        with self._lock:
+            for item in self._accounts.values():
+                if str(item.get("email") or "").strip().lower() == norm:
+                    return enrich_account(dict(item))
+            key = email_storage_key(norm)
+            item = self._accounts.get(key)
+            return enrich_account(dict(item)) if item else None
+
+    def upsert_mailbox_record(self, email: str, fetch_url: str, *, stage: str = STAGE_UNREGISTERED) -> dict:
+        email = str(email or "").strip()
+        fetch_url = str(fetch_url or "").strip()
+        key = email_storage_key(email)
+        with self._lock:
+            current = dict(self._accounts.get(key) or {"email": email})
+            current["email"] = email
+            current["fetch_url"] = fetch_url or current.get("fetch_url")
+            token = str(current.get("access_token") or "").strip()
+            if is_email_key(token):
+                current.pop("access_token", None)
+            current = apply_stage(current, stage)
+            account = self._normalize_account(current)
+            if account is None:
+                raise ValueError(f"invalid mailbox record: {email}")
+            self._accounts[key] = account
+            self._save_accounts()
+            return dict(self._accounts[key])
+
+    def reserve_emails_for_register(self, emails: list[str]) -> list[str]:
+        reserved: list[str] = []
+        with self._lock:
+            for email in emails or []:
+                norm = str(email or "").strip()
+                if not norm:
+                    continue
+                key = email_storage_key(norm)
+                current = self._accounts.get(key)
+                if current is None:
+                    current = {"email": norm, "fetch_url": ""}
+                else:
+                    current = dict(current)
+                    token = str(current.get("access_token") or "").strip()
+                    if is_email_key(token):
+                        current.pop("access_token", None)
+                item = apply_stage(dict(current), STAGE_REGISTERING, _registering=True)
+                self._accounts[key] = self._normalize_account(item)
+                reserved.append(norm)
+            if reserved:
+                self._save_accounts()
+        return reserved
+
+    def complete_registration(self, email: str, payload: dict) -> dict | None:
+        with self._lock:
+            norm = str(email or "").strip().lower()
+            email_key = email_storage_key(norm)
+            new_token = str(payload.get("access_token") or "").strip()
+
+            # 注册成功时 add_account_items 往往已先写入带 password/2FA 的真实 token 行；
+            # 若这里误命中 email:: 占位行再覆盖同 token 键，会把凭据冲掉。
+            current: dict = {}
+            if new_token and new_token in self._accounts:
+                current = dict(self._accounts[new_token])
+            else:
+                key = None
+                for k, item in self._accounts.items():
+                    if str(item.get("email") or "").strip().lower() == norm:
+                        key = k
+                        break
+                if key is None:
+                    key = email_key
+                current = dict(self._accounts.get(key) or {"email": email})
+
+            merged = {**current, **payload, "email": email, "_registering": False}
+            merged = apply_stage(
+                merged,
+                STAGE_REGISTERED,
+                registered_at=merged.get("registered_at") or AccountService._now(),
+            )
+            new_token = str(merged.get("access_token") or "").strip()
+
+            if email_key and email_key != new_token:
+                self._accounts.pop(email_key, None)
+            for stale_key in list(self._accounts.keys()):
+                if stale_key in {new_token, email_key}:
+                    continue
+                stale = self._accounts.get(stale_key)
+                if (
+                    isinstance(stale, dict)
+                    and str(stale.get("email") or "").strip().lower() == norm
+                ):
+                    self._accounts.pop(stale_key, None)
+
+            if new_token:
+                self._accounts[new_token] = self._normalize_account(merged)
+                account = dict(self._accounts[new_token])
+            else:
+                self._accounts[email_key] = self._normalize_account(merged)
+                account = dict(self._accounts[email_key])
+            self._save_accounts()
+            return account
+
+    def release_registration(
+        self, email: str, error: str = "", *, remove_placeholder: bool = False,
+    ) -> None:
+        norm = str(email or "").strip().lower()
+        if not norm:
+            return
+        with self._lock:
+            key = None
+            for k, item in self._accounts.items():
+                if str(item.get("email") or "").strip().lower() == norm:
+                    key = k
+                    break
+            email_key = email_storage_key(norm)
+            if key is None:
+                key = email_key
+            current = dict(self._accounts.get(key) or {"email": email})
+            token = str(current.get("access_token") or "").strip()
+            has_credentials = (
+                token.startswith("eyJ")
+                or token.startswith("manual::")
+                or bool(str(current.get("password") or "").strip())
+            )
+            if remove_placeholder and not has_credentials:
+                self._accounts.pop(key, None)
+                if email_key != key:
+                    self._accounts.pop(email_key, None)
+            else:
+                if is_email_key(token):
+                    current.pop("access_token", None)
+                current = apply_stage(
+                    current,
+                    STAGE_UNREGISTERED,
+                    _registering=False,
+                    last_error=error or current.get("last_error"),
+                )
+                self._accounts[key] = self._normalize_account(current)
+            self._save_accounts()
 
     def list_limited_tokens(self) -> list[str]:
         with self._lock:
@@ -1057,6 +1259,12 @@ class AccountService:
                     self._index = 0
                 self._save_accounts()
                 log_service.add(LOG_TYPE_ACCOUNT, f"删除 {removed} 个账号", {"removed": removed})
+                try:
+                    from services.activation_audit_service import activation_audit_service
+
+                    activation_audit_service.delete_by_access_tokens(list(target_set))
+                except Exception:
+                    pass
             items = [dict(item) for item in self._accounts.values()]
         return {"removed": removed, "items": items}
 
@@ -1078,97 +1286,95 @@ class AccountService:
                 meta_changed = incoming_meta != _normalize_checkout_meta(current.get("checkout_meta"))
                 if not state_changed and not meta_changed:
                     continue
-                current["used"] = bool(used)
                 if used:
-                    current["checkout_at"] = current.get("checkout_at") or datetime.now(timezone.utc).isoformat()
-                    current["checkout_meta"] = incoming_meta
+                    current = mark_dispatched(current, incoming_meta)
                 else:
+                    dispatch = dict(current.get("dispatch") or {})
+                    dispatch["dispatched"] = False
+                    dispatch["dispatched_at"] = None
+                    current["dispatch"] = dispatch
+                    current["used"] = False
                     current["checkout_at"] = None
                     current["checkout_meta"] = None
+                current = enrich_account(current)
+                self._accounts[resolved] = self._normalize_account(current)
                 updated += 1
             if updated:
                 self._save_accounts()
                 log_service.add(LOG_TYPE_ACCOUNT, f"标记账号{'已用' if used else '未用'}", {"count": updated})
         return {"updated": updated, "items": self.list_accounts()}
 
-    def set_plus_availability(self, tokens: list[str], available: bool) -> dict:
-        """批量标记账号 Plus 激活「可用/不可用」。返回 {updated, items}。
+    def revoke_activation(self, tokens: list[str], *, revoke_cdk: bool = True) -> dict:
+        """撤销激活：将 plus_review 账号复位为免费已注册态，重新进入激活队列。
 
-        available=True（人工标记可用）：清除不可用标记，并重置激活态（未激活 + 尝试次数归零 +
-        清空进度文案），使其重新进入下一轮激活；仅对「不可用」或「激活失败」的账号生效。
-        available=False（人工标记不可用）：置不可用标记，下轮激活自动跳过。
+        revoke_cdk=True 时同步把绑定的 CDK 从 used/invalid 复位为 available。
         """
+        from services.cdk_service import cdk_service
+
         target = [t for t in (tokens or []) if t]
         if not target:
-            return {"updated": 0, "items": self.list_accounts()}
+            return {"updated": 0, "cdk_revoked": 0, "skipped": 0, "items": self.list_accounts()}
         updated = 0
+        skipped = 0
+        cdks_to_revoke: list[str] = []
+        revoked_tokens: list[str] = []
         with self._lock:
             for token in target:
                 resolved = self._resolve_access_token_locked(token)
                 current = self._accounts.get(resolved)
                 if current is None:
+                    skipped += 1
                     continue
-                next_item = dict(current)
-                if available:
-                    # 无需变更：既非不可用、也非失败态。
-                    if not next_item.get("plus_unavailable") and next_item.get("plus_status") != "激活失败":
-                        continue
-                    next_item["plus_unavailable"] = False
-                    next_item["plus_status"] = "未激活"
-                    next_item["plus_attempts"] = {"UPI": 0, "IDEL": 0}
-                    next_item["plus_last_message"] = None
-                else:
-                    if bool(next_item.get("plus_unavailable")):
-                        continue
-                    next_item["plus_unavailable"] = True
-                account = self._normalize_account(next_item)
-                if account is None:
+                item = enrich_account(current)
+                if str(item.get("stage") or "") != STAGE_PLUS_REVIEW:
+                    skipped += 1
                     continue
-                self._accounts[resolved] = account
-                updated += 1
-            if updated:
-                self._save_accounts()
-                log_service.add(
-                    LOG_TYPE_ACCOUNT,
-                    f"标记账号激活{'可用' if available else '不可用'}",
-                    {"count": updated},
+                cdk = str((item.get("activation") or {}).get("cdk") or item.get("plus_cdk") or "").strip()
+                if revoke_cdk and cdk:
+                    cdks_to_revoke.append(cdk)
+                next_item = apply_stage(
+                    item,
+                    STAGE_REGISTERED,
+                    plan=PLAN_FREE,
+                    plus_unavailable=False,
+                    plus_activated_at=None,
+                    activated_at=None,
+                    plus_last_message=None,
+                    plus_cdk=None,
+                    plus_cdk_type=None,
+                    plus_task_id=None,
+                    plus_attempts={"UPI": 0, "IDEL": 0},
+                    activation=empty_activation(),
                 )
-        return {"updated": updated, "items": self.list_accounts()}
-
-    def revoke_activation(self, tokens: list[str]) -> dict:
-        """危险操作：批量「撤销激活」——把选中账号的 Plus 激活状态整体复位为干净的「未激活」。
-
-        仅用于**程序异常错误标记了激活状态**（如 CDK 服务端「假成功」把 free 账号误标成已激活）后的人工纠正。
-        清空 plus_status/plus_cdk/plus_cdk_type/plus_task_id/plus_last_message、尝试次数归零、清除不可用标记；
-        **不改动真实档位 type**（type 由 OpenAI 刷新核实，不属于本操作职责）。返回 {updated, items}。
-        """
-        target = [t for t in (tokens or []) if t]
-        if not target:
-            return {"updated": 0, "items": self.list_accounts()}
-        updated = 0
-        with self._lock:
-            for token in target:
-                resolved = self._resolve_access_token_locked(token)
-                current = self._accounts.get(resolved)
-                if current is None:
-                    continue
-                next_item = dict(current)
-                next_item["plus_status"] = "未激活"
-                next_item["plus_unavailable"] = False
-                next_item["plus_attempts"] = {"UPI": 0, "IDEL": 0}
-                next_item["plus_cdk"] = None
-                next_item["plus_cdk_type"] = None
-                next_item["plus_task_id"] = None
-                next_item["plus_last_message"] = None
                 account = self._normalize_account(next_item)
                 if account is None:
+                    skipped += 1
                     continue
+                account["last_activation_audit_id"] = None
                 self._accounts[resolved] = account
+                revoked_tokens.append(resolved)
                 updated += 1
             if updated:
                 self._save_accounts()
-                log_service.add(LOG_TYPE_ACCOUNT, "撤销账号激活（危险操作）", {"count": updated})
-        return {"updated": updated, "items": self.list_accounts()}
+        cdk_revoked = cdk_service.revoke_use(cdks_to_revoke) if revoke_cdk and cdks_to_revoke else 0
+        if updated:
+            try:
+                from services.activation_audit_service import activation_audit_service
+
+                activation_audit_service.delete_by_access_tokens(revoked_tokens)
+            except Exception:
+                pass
+            log_service.add(
+                LOG_TYPE_ACCOUNT,
+                "撤销激活：复位为免费可激活",
+                {"count": updated, "cdk_revoked": cdk_revoked, "revoke_cdk": revoke_cdk},
+            )
+        return {
+            "updated": updated,
+            "cdk_revoked": cdk_revoked,
+            "skipped": skipped,
+            "items": self.list_accounts(),
+        }
 
     def update_account(self, access_token: str, updates: dict, quiet: bool = False) -> dict | None:
         if not access_token:
@@ -1440,7 +1646,7 @@ class AccountService:
         access_tokens = list(dict.fromkeys(token for token in access_tokens if token))
         if not access_tokens:
             items = self.list_accounts()
-            result = {"refreshed": 0, "errors": [], "items": items, "relogined": 0}
+            result = {"refreshed": 0, "errors": [], "items": items}
             if progress_id:
                 self.finish_refresh_progress(progress_id, result)
             return result
@@ -1484,33 +1690,10 @@ class AccountService:
         else:
             executor.shutdown(wait=True, cancel_futures=True)
 
-        # 自动重新登录异常账号（仅当配置开启时）
-        relogined = 0
-        if config.auto_relogin_after_refresh:
-            for token in access_tokens:
-                account = self.get_account(token)
-                if not account:
-                    continue
-                status = str(account.get("status") or "").strip()
-                if status != "异常":
-                    continue
-                email = str(account.get("email") or "").strip()
-                password = str(account.get("password") or "").strip()
-                if not email or not password:
-                    continue
-                t = Thread(
-                    target=self._password_re_login_thread,
-                    args=(token, email, password, "auto_relogin_after_refresh"),
-                    daemon=True,
-                )
-                t.start()
-                relogined += 1
-
         result = {
             "refreshed": refreshed,
             "errors": errors,
             "items": self.list_accounts(),
-            "relogined": relogined,
         }
 
         if progress_id:

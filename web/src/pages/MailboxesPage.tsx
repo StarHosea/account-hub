@@ -15,18 +15,19 @@ import {
   Checkbox,
   Pagination,
 } from "@douyinfe/semi-ui-19";
-import { IconRefresh, IconUpload, IconDownload, IconDelete, IconCopy, IconSearch, IconLink, IconTick, IconClose } from "@douyinfe/semi-icons";
+import { IconRefresh, IconUpload, IconDownload, IconDelete, IconCopy, IconSearch, IconMail, IconTick, IconClose } from "@douyinfe/semi-icons";
 import type { ColumnProps } from "@douyinfe/semi-ui-19/lib/es/table";
 
 import { fetchMailboxes, importMailboxes, deleteMailboxes, markMailboxes, fetchMailboxesExportText, type Mailbox, type MailboxStats, type MailboxListParams } from "@/lib/api";
 import { copyToClipboard as copy } from "@/lib/clipboard";
 import { useDebouncedValue } from "@/lib/use-debounced-value";
 import { useIsMobile } from "@/lib/use-is-mobile";
-import { MAX_IMPORT_ROWS, countImportRows } from "@/lib/utils";
+import { MAX_IMPORT_ROWS } from "@/lib/utils";
+import { importSubmitGuard, validateMailboxImport } from "@/lib/import-validation";
 import { StatCards } from "@/components/StatCards";
 import { MobileFilters } from "@/components/MobileFilters";
-
-const { Title, Text } = Typography;
+import ImportCountHint from "@/components/ImportCountHint";
+const { Text } = Typography;
 
 const PAGE_SIZE = 10;
 const EMPTY_STATS: MailboxStats = { total: 0, used: 0, unused: 0, in_use: 0 };
@@ -86,12 +87,15 @@ export default function MailboxesPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [debouncedQuery, statusFilter, page]);
 
+  const importValidation = useMemo(() => validateMailboxImport(importText), [importText]);
+
   const handleImport = async () => {
-    if (!importText.trim()) {
-      Toast.warning("请粘贴邮箱");
+    const blockMsg = importSubmitGuard(importValidation, "请粘贴邮箱");
+    if (blockMsg) {
+      Toast.warning(blockMsg);
       return;
     }
-    const rows = countImportRows(importText);
+    const rows = importValidation.validCount;
     if (rows > MAX_IMPORT_ROWS) {
       Toast.warning(`单次最多导入 ${MAX_IMPORT_ROWS} 条，当前 ${rows} 条，请分批导入`);
       return;
@@ -195,16 +199,9 @@ export default function MailboxesPage() {
       render: (url: string) =>
         url ? (
           <Space>
-            <Text ellipsis={{ showTooltip: true }} style={{ maxWidth: 210, fontFamily: "monospace", fontSize: 12 }}>
+            <Text ellipsis={{ showTooltip: true }} style={{ maxWidth: 230, fontFamily: "monospace", fontSize: 12 }}>
               {url}
             </Text>
-            <Button
-              size="small"
-              theme="borderless"
-              icon={<IconLink />}
-              title="打开接码地址"
-              onClick={() => window.open(url, "_blank", "noopener")}
-            />
             <Button size="small" theme="borderless" icon={<IconCopy />} onClick={() => copy(url, "接码地址")} />
           </Space>
         ) : (
@@ -223,12 +220,22 @@ export default function MailboxesPage() {
     },
     {
       title: "操作",
-      width: 80,
+      width: 100,
       fixed: "right",
       render: (_: unknown, m: Mailbox) => (
-        <Popconfirm title="删除该邮箱？" onConfirm={() => void handleDelete([m.email])}>
-          <Button size="small" theme="borderless" type="danger" icon={<IconDelete />} />
-        </Popconfirm>
+        <Space spacing={2}>
+          <Button
+            size="small"
+            theme="borderless"
+            icon={<IconMail />}
+            title={m.fetch_url ? "收邮件（打开邮箱链接）" : "无邮箱链接"}
+            disabled={!m.fetch_url}
+            onClick={() => m.fetch_url && window.open(m.fetch_url, "_blank", "noopener")}
+          />
+          <Popconfirm title="删除该邮箱？" onConfirm={() => void handleDelete([m.email])}>
+            <Button size="small" theme="borderless" type="danger" icon={<IconDelete />} title="删除" />
+          </Popconfirm>
+        </Space>
       ),
     },
   ];
@@ -273,20 +280,35 @@ export default function MailboxesPage() {
 
   return (
     <div>
-      <div
-        style={{
-          display: "flex",
-          flexDirection: isMobile ? "column" : "row",
-          alignItems: isMobile ? "stretch" : "center",
-          justifyContent: "space-between",
-          gap: 12,
-          marginBottom: 16,
-        }}
-      >
-        <Title heading={isMobile ? 4 : 3} style={{ margin: 0 }}>
-          邮箱管理
-        </Title>
-        <Space spacing={8} style={{ flexWrap: "wrap" }}>
+      <StatCards mobile={isMobile} items={cards} />
+
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 12, marginBottom: 16, alignItems: "center", justifyContent: "space-between" }}>
+        {isMobile ? (
+          <div style={{ width: "100%" }}>
+            <MobileFilters activeCount={activeFilterCount}>{filterControls}</MobileFilters>
+          </div>
+        ) : (
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 12, alignItems: "center" }}>{filterControls}</div>
+        )}
+
+        <Space spacing={8} wrap>
+          {selected.length > 0 ? (
+            <>
+              <Text type="tertiary">已选 {selected.length} 项</Text>
+              <Button size="small" icon={<IconTick />} onClick={() => void handleMark(selected, true)} loading={busy}>
+                标记已注册
+              </Button>
+              <Button size="small" icon={<IconClose />} onClick={() => void handleMark(selected, false)} loading={busy}>
+                标记待注册
+              </Button>
+              <Popconfirm title={`删除选中的 ${selected.length} 个？`} onConfirm={() => void handleDelete(selected)}>
+                <Button size="small" type="danger" icon={<IconDelete />}>
+                  删除选中
+                </Button>
+              </Popconfirm>
+              <span style={{ width: 1, height: 18, background: "var(--semi-color-border)", display: "inline-block" }} />
+            </>
+          ) : null}
           <Button icon={<IconRefresh />} onClick={() => void load()} loading={loading}>
             刷新
           </Button>
@@ -298,33 +320,6 @@ export default function MailboxesPage() {
           </Button>
         </Space>
       </div>
-
-      <StatCards mobile={isMobile} items={cards} />
-
-      {isMobile ? (
-        <MobileFilters activeCount={activeFilterCount}>{filterControls}</MobileFilters>
-      ) : (
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 12, marginBottom: 16 }}>{filterControls}</div>
-      )}
-
-      {selected.length > 0 ? (
-        <div style={{ marginBottom: 12 }}>
-          <Space style={{ flexWrap: "wrap" }}>
-            <Text type="tertiary">已选 {selected.length} 项</Text>
-            <Button size="small" icon={<IconTick />} onClick={() => void handleMark(selected, true)} loading={busy}>
-              标记已注册
-            </Button>
-            <Button size="small" icon={<IconClose />} onClick={() => void handleMark(selected, false)} loading={busy}>
-              标记待注册
-            </Button>
-            <Popconfirm title={`删除选中的 ${selected.length} 个？`} onConfirm={() => void handleDelete(selected)}>
-              <Button size="small" type="danger" icon={<IconDelete />}>
-                删除选中
-              </Button>
-            </Popconfirm>
-          </Space>
-        </div>
-      ) : null}
 
       {isMobile ? (
         <MobileList
@@ -365,8 +360,11 @@ export default function MailboxesPage() {
         maskClosable={false}
         fullScreen={isMobile}
       >
-        <Text type="tertiary">按邮箱池约定格式粘贴，一行一个 <Text code>邮箱---收件地址</Text>（兼容旧 <Text code>----</Text> 分隔）。</Text>
-        <TextArea value={importText} onChange={setImportText} rows={isMobile ? 12 : 10} style={{ marginTop: 8, fontFamily: "monospace" }} placeholder={"一行一个邮箱..."} />
+        <Text type="tertiary">
+          一行一个 <Text code>邮箱----接码URL</Text>，分隔符至少 <Text code>--</Text>，URL 须 http/https。
+        </Text>
+        <TextArea value={importText} onChange={setImportText} rows={isMobile ? 12 : 10} style={{ marginTop: 8, fontFamily: "monospace" }} placeholder={"user@example.com----https://..."} />
+        <ImportCountHint count={importValidation.validCount} issues={importValidation.issues} maxRows={MAX_IMPORT_ROWS} />
       </Modal>
     </div>
   );
@@ -453,19 +451,21 @@ function MobileList({
                       {m.fetch_url}
                     </Text>
                     <Button size="small" theme="borderless" icon={<IconCopy />} onClick={() => copy(m.fetch_url, "接码地址")} />
-                    <Button
-                      size="small"
-                      theme="borderless"
-                      icon={<IconLink />}
-                      onClick={() => window.open(m.fetch_url, "_blank", "noopener")}
-                    />
                   </>
                 ) : (
                   <Text type="tertiary">—</Text>
                 )}
               </div>
 
-              <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+              <div style={{ display: "flex", gap: 8, marginTop: 12, justifyContent: "space-between" }}>
+                <Button
+                  size="small"
+                  theme="borderless"
+                  icon={<IconMail />}
+                  disabled={!m.fetch_url}
+                  title={m.fetch_url ? "收邮件" : "无邮箱链接"}
+                  onClick={() => m.fetch_url && window.open(m.fetch_url, "_blank", "noopener")}
+                />
                 <Button
                   size="small"
                   icon={m.used ? <IconClose /> : <IconTick />}

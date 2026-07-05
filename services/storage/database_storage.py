@@ -7,7 +7,7 @@ from sqlalchemy import Column, String, Text, create_engine, Integer, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
-from services.storage.base import StorageBackend
+from services.storage.base import PLATFORM_CONFIG_STATE_KEY, StorageBackend
 
 Base = declarative_base()
 
@@ -17,7 +17,7 @@ class AccountModel(Base):
     __tablename__ = "accounts"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    access_token = Column(String(2048), unique=True, nullable=False, index=True)
+    access_token = Column(Text, unique=True, nullable=False, index=True)
     data = Column(Text, nullable=False)  # JSON 格式存储完整账号数据
 
 
@@ -62,6 +62,14 @@ class PhoneModel(Base):
     data = Column(Text, nullable=False)
 
 
+class RegisterAbnormalModel(Base):
+    """注册异常账号清单"""
+    __tablename__ = "register_abnormal"
+
+    email = Column(String(512), primary_key=True)
+    data = Column(Text, nullable=False)
+
+
 class StateModel(Base):
     """命名状态块数据模型（register / activation / run / 种子标志等，单键 JSON）"""
     __tablename__ = "task_state"
@@ -78,11 +86,12 @@ _COLLECTION_MODELS: dict[str, tuple[type, str]] = {
     "cdks": (CdkModel, "cdk"),
     "mailboxes": (MailboxModel, "email"),
     "phones": (PhoneModel, "phone"),
+    "register_abnormal": (RegisterAbnormalModel, "email"),
 }
 
 
 class DatabaseStorageBackend(StorageBackend):
-    """数据库存储后端（支持 SQLite、PostgreSQL、MySQL 等）"""
+    """数据库存储后端（PostgreSQL）"""
 
     def __init__(self, database_url: str):
         self.database_url = database_url
@@ -92,7 +101,18 @@ class DatabaseStorageBackend(StorageBackend):
             pool_recycle=3600,   # 1小时回收连接
         )
         Base.metadata.create_all(self.engine)
+        self._upgrade_schema()
         self.Session = sessionmaker(bind=self.engine)
+
+    def _upgrade_schema(self) -> None:
+        """兼容旧库：access_token 列扩为 TEXT（JWT 可超 2048）。"""
+        if "postgresql" not in self.database_url and "postgres" not in self.database_url:
+            return
+        try:
+            with self.engine.begin() as conn:
+                conn.execute(text("ALTER TABLE accounts ALTER COLUMN access_token TYPE TEXT"))
+        except Exception:
+            pass
 
     def load_accounts(self) -> list[dict[str, Any]]:
         """从数据库加载账号数据"""
@@ -122,8 +142,21 @@ class DatabaseStorageBackend(StorageBackend):
         """保存鉴权密钥数据到数据库"""
         self._save_rows(AuthKeyModel, auth_keys, "id", "key_id")
 
-    def load_settings(self) -> dict[str, Any] | None:
-        """从数据库加载平台配置（无记录时返回 None，表示尚未迁移）"""
+    def load_state(self, key: str) -> dict[str, Any] | None:
+        """加载命名状态块（无记录返回 None）。平台配置走 settings 表。"""
+        if key == PLATFORM_CONFIG_STATE_KEY:
+            return self._load_platform_config()
+        data = self._get_state_raw(key)
+        return data if isinstance(data, dict) else None
+
+    def save_state(self, key: str, data: dict[str, Any]) -> None:
+        """保存命名状态块（单键 upsert）。平台配置走 settings 表。"""
+        if key == PLATFORM_CONFIG_STATE_KEY:
+            self._save_platform_config(data)
+            return
+        self._set_state_raw(key, data or {})
+
+    def _load_platform_config(self) -> dict[str, Any] | None:
         session = self.Session()
         try:
             row = session.get(SettingModel, SETTINGS_ROW_KEY)
@@ -137,8 +170,7 @@ class DatabaseStorageBackend(StorageBackend):
         finally:
             session.close()
 
-    def save_settings(self, settings: dict[str, Any]) -> None:
-        """保存平台配置到数据库（单行 upsert）"""
+    def _save_platform_config(self, settings: dict[str, Any]) -> None:
         session = self.Session()
         try:
             payload = json.dumps(settings or {}, ensure_ascii=False)
@@ -154,7 +186,7 @@ class DatabaseStorageBackend(StorageBackend):
         finally:
             session.close()
 
-    # ----------------------------- 命名集合（cdks/mailboxes/phones） ----------------------------- #
+    # ----------------------------- 命名集合（cdks/mailboxes/phones/register_abnormal） ----------------------------- #
 
     def load_collection(self, name: str) -> list[dict[str, Any]] | None:
         """加载命名集合。空表且未打过种子标志 → 返回 None（触发种子迁移）；否则返回列表。"""
@@ -178,15 +210,6 @@ class DatabaseStorageBackend(StorageBackend):
             return  # 未注册 collection：暂不持久化
         self._save_rows(model, items, key_field)
         self._set_state_raw(self._seeded_key(name), {"seeded": True})
-
-    def load_state(self, key: str) -> dict[str, Any] | None:
-        """加载命名状态块（无记录返回 None）。"""
-        data = self._get_state_raw(key)
-        return data if isinstance(data, dict) else None
-
-    def save_state(self, key: str, data: dict[str, Any]) -> None:
-        """保存命名状态块（单键 upsert）。"""
-        self._set_state_raw(key, data or {})
 
     @staticmethod
     def _collection_model(name: str) -> tuple[type, str]:

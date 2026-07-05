@@ -12,6 +12,10 @@ from services.register_abnormal_service import register_abnormal_service
 from services.register_service import register_service
 
 
+class RegisterStartRequest(BaseModel):
+    emails: list[str] = []
+
+
 class RegisterConfigRequest(BaseModel):
     mail: dict | None = None
     proxy: str | None = None
@@ -26,6 +30,9 @@ class RegisterConfigRequest(BaseModel):
     headless: bool | None = None
     register_timeout: int | None = None
     node_bin: str | None = None
+    static_cache_enabled: bool | None = None
+    static_cache_max_age_days: int | None = None
+    static_cache_dir: str | None = None
 
 
 class RegisterAbnormalDeleteRequest(BaseModel):
@@ -51,9 +58,10 @@ def create_router() -> APIRouter:
         return {"register": register_service.update(body.model_dump(exclude_none=True))}
 
     @router.post("/api/register/start")
-    async def start_register(authorization: str | None = Header(default=None)):
+    async def start_register(body: RegisterStartRequest | None = None, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        return {"register": register_service.start()}
+        emails = body.emails if body else []
+        return {"register": register_service.start(emails)}
 
     @router.post("/api/register/stop")
     async def stop_register(authorization: str | None = Header(default=None)):

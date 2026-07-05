@@ -40,7 +40,7 @@ test('分格验证码正常填入 → 读回校验通过', async () => {
   const logs = [];
   await fillCode(page, '901755', (m) => logs.push(m));
   assert.equal(page._value(), '901755');
-  assert.match(logs.join('\n'), /读回校验通过/);
+  assert.match(logs.join('\n'), /验证码填写完成/);
 });
 
 test('首轮丢字符（901755→90755）被读回校验发现并自动重填修正', async () => {
@@ -48,8 +48,8 @@ test('首轮丢字符（901755→90755）被读回校验发现并自动重填修
   const logs = [];
   await fillCode(page, '901755', (m) => logs.push(m));
   assert.equal(page._value(), '901755', '重填后应为完整 6 位验证码');
-  assert.match(logs.join('\n'), /校验不符/);
-  assert.match(logs.join('\n'), /填入「90755」/);
+  assert.match(logs.join('\n'), /验证码填写不完整/);
+  assert.match(logs.join('\n'), /实际 90755/);
 });
 
 test('空验证码 → 跳过填码、不抛异常', async () => {

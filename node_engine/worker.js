@@ -16,6 +16,7 @@ import { launchSession } from './cloakbrowser.js';
 import { sleep } from './utils.js';
 import { registerChatGPT, secureExistingChatGPT, loginChatGPT } from './flows/openai/register.js';
 import { createRecorder } from './flows/openai/dom-recorder.js';
+import { attachStaticCache } from './static-cache.js';
 
 // DOM 记录目录：设了 REG_RECORD_DIR（或退化用 REG_DIAG_DIR/recordings）才开记录，每账号一子目录。
 // 未设则 createRecorder 返回 no-op，对流程零副作用。keep 由 REG_RECORD_KEEP 控制（默认 fail=成功即删）。
@@ -38,7 +39,12 @@ function attachUrlLogger(page, log) {
     try { url = page.url(); } catch { return; }
     if (!url || url === 'about:blank' || url === last) return;
     last = url;
-    log(`[URL] ${url}`);
+    try {
+      const u = new URL(url);
+      log(`[页面] ${u.pathname}${u.search}`);
+    } catch {
+      log(`[页面] ${url}`);
+    }
   };
   page.on('framenavigated', (frame) => { if (frame === page.mainFrame()) emitIfChanged(); });
   const timer = setInterval(emitIfChanged, 500);
@@ -99,6 +105,7 @@ async function runReal(job) {
   const timeoutMs = Number(job.timeoutMs) > 0 ? Number(job.timeoutMs) : 300000;
   let session = null;
   let recorder = null;
+  let staticCache = null;
   let tracing = false;
   const recDir = recordDirFor(job); // DOM 记录 + Playwright Trace 同目录（存一次，避免 Date.now 漂移）
   onStop(() => { if (session) session.close().catch(() => {}); });
@@ -121,6 +128,10 @@ async function runReal(job) {
     }
     const page = await session.context.newPage();
     page.setDefaultTimeout(45000);
+    staticCache = await attachStaticCache(session.context, {
+      log: (m, level) => log(m, level),
+      config: job.staticCache,
+    });
     attachUrlLogger(page, (m) => log(m)); // 地址一变就单独打一行 [URL]，覆盖 register/login/existing 全流程
 
     recorder = createRecorder({
@@ -162,7 +173,7 @@ async function runReal(job) {
       // 默认走注册；若邮箱已注册，自动切换到老账号加固流程
       const reg = await registerChatGPT(common);
       if (reg && reg.emailExists) {
-        log('邮箱已注册，切换到老账号（登录 → 设密码 → 2FA）流程');
+        log('该邮箱已注册，改为登录并加固账号');
         data = await secureExistingChatGPT({
           ...common,
           loginPassword: job.loginPassword || '',
@@ -210,6 +221,7 @@ async function runReal(job) {
     if (recorder) await recorder.finalize({ success: false }).catch(() => {});
     emit({ type: 'error', message: String(err?.message || err), partial: err?._partial || {} });
   } finally {
+    if (staticCache) await staticCache.logSummary().catch(() => {});
     if (session) { try { await session.close(); } catch { /* ignore */ } }
   }
 }

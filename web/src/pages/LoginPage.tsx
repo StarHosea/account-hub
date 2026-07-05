@@ -54,9 +54,9 @@ export default function LoginPage() {
       <Card style={{ width: 380 }} bodyStyle={{ padding: 28 }}>
         <div style={{ marginBottom: 20 }}>
           <Title heading={3} style={{ margin: 0 }}>
-            🐬 小海豚
+            🐋 小鲸鱼
           </Title>
-          <Text type="tertiary">输入密钥后继续使用账号管理与生产工具。</Text>
+          <Text type="tertiary">输入密钥登录，管理账号与自动化任务。</Text>
         </div>
         <Form onSubmit={handleSubmit}>
           <Form.Input

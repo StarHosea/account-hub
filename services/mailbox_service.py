@@ -25,8 +25,12 @@ def _norm_email(email: str) -> str:
     return str(email or "").strip().lower()
 
 
+def _is_http_url(url: str) -> bool:
+    return bool(re.match(r"^https?://", str(url or "").strip(), flags=re.IGNORECASE))
+
+
 def parse_mailbox_lines(text: str) -> list[dict[str, str]]:
-    """解析批量导入文本，每行格式 `邮箱---收件地址`（兼容旧 `----` 分隔）。
+    """解析批量导入文本，每行格式 `邮箱---收件地址`（分隔符至少两个连字符 `-`）。
 
     忽略空行与 `#` 注释行；按邮箱去重（后者覆盖前者）。
     """
@@ -35,13 +39,12 @@ def parse_mailbox_lines(text: str) -> list[dict[str, str]]:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        # 分隔符统一按「3 个及以上连字符」切分，同时兼容新格式 `---` 与旧格式 `----`。
-        parts = re.split(r"-{3,}", line, maxsplit=1)
+        parts = re.split(r"-{2,}", line, maxsplit=1)
         if len(parts) != 2:
             continue
         email = parts[0].strip()
         fetch_url = parts[1].strip()
-        if not email or not fetch_url:
+        if not email or not fetch_url or not _is_http_url(fetch_url):
             continue
         parsed[_norm_email(email)] = {"email": email, "fetch_url": fetch_url}
     return list(parsed.values())

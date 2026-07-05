@@ -12,10 +12,11 @@ from __future__ import annotations
 
 import json
 import threading
-from datetime import datetime
+
 from urllib.parse import quote, unquote
 
 from services.register import mail_provider
+from services.register import mail_code
 from services.register import openai_register as reg
 from services.register.fingerprint import parse_proxy
 
@@ -55,7 +56,7 @@ def _account_mail_ctx(email: str):
         return None, None
     mail_config = {
         "request_timeout": 30,
-        "wait_timeout": 90,
+        "wait_timeout": 300,
         "wait_interval": 3,
         "providers": [{"type": mail_provider.API_MAILBOX_TYPE, "enable": True}],
         "proxy": "",
@@ -93,16 +94,16 @@ def run_browser_login(
         "chatgptUrl": reg.chatgpt_url,
         "timeoutMs": timeout_s * 1000,
         "locale": locale or "en-US",
+        "staticCache": reg.static_cache_job_options(),
     }
 
     mail_config, mailbox = _account_mail_ctx(email)
-    baseline = mail_provider.peek_received_at(mail_config, mailbox) if mailbox else None
 
     with _login_sem:
-        return _drive_worker(job, mail_config, mailbox, baseline, log)
+        return _drive_worker(job, mail_config, mailbox, log)
 
 
-def _drive_worker(job: dict, mail_config, mailbox, baseline, log) -> dict:
+def _drive_worker(job: dict, mail_config, mailbox, log) -> dict:
     timeout_s = int(reg.config.get("register_timeout") or 300)
     proc = reg._spawn_worker(job)
     with reg._active_lock:
@@ -127,13 +128,19 @@ def _drive_worker(job: dict, mail_config, mailbox, baseline, log) -> dict:
             if etype == "log":
                 log(str(evt.get("message") or ""))
             elif etype == "need_code":
+                purpose = str(evt.get("purpose") or "login")
+                label = reg._code_purpose_label(purpose)
+                log(f"正在等待{label}验证码…")
                 code = None
                 if mailbox:
-                    code = mail_provider.wait_for_code(mail_config, mailbox, after_received_at=baseline)
-                    newb = mail_provider.peek_received_at(mail_config, mailbox)
-                    if isinstance(newb, datetime):
-                        baseline = newb
+                    code = mail_code.fulfill_need_code(
+                        mail_config, mailbox, ts=evt.get("ts"), purpose=purpose,
+                    )
                 reg._send_line(proc, {"type": "code", "code": code or ""})
+                if code:
+                    log(f"收到{label}验证码：{code}")
+                else:
+                    log("等待验证码超时，邮箱中未收到新邮件")
             elif etype == "result":
                 data = evt.get("data") or {}
                 break

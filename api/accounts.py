@@ -15,6 +15,18 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from api.support import require_admin
+from services.account_lifecycle import (
+    STAGE_ACTIVATING,
+    STAGE_PLUS_ACTIVATED,
+    STAGE_PLUS_REVIEW,
+    STAGE_REGISTERED,
+    STAGE_REGISTERING,
+    STAGE_UNREGISTERED,
+    filter_accounts,
+    is_dispatchable,
+    is_exportable_pool,
+    summary_for_view,
+)
 from services.account_service import account_service
 from services.mailbox_service import mailbox_service
 
@@ -52,19 +64,19 @@ class AccountMarkUsedRequest(BaseModel):
     meta_by_token: dict[str, dict[str, str]] = Field(default_factory=dict)
 
 
-class AccountPlusAvailabilityRequest(BaseModel):
-    access_tokens: list[str] = Field(default_factory=list)
-    available: bool = True
-
-
 class AccountRevokeActivationRequest(BaseModel):
     access_tokens: list[str] = Field(default_factory=list)
+    revoke_cdk: bool = True
 
 
 class AccountCredentialsExportRequest(BaseModel):
     access_tokens: list[str] = Field(default_factory=list)
+    view: str | None = None
+    stage: str | None = None
     only_unused: bool = False
+    only_undispatched: bool = True
     mark_used: bool = False
+    mark_dispatched: bool = False
 
 
 def _account_payload_token(item: dict[str, Any]) -> str:
@@ -84,6 +96,48 @@ def _paginate(seq: list[Any], page: int, page_size: int) -> list[Any]:
     """按 1-based page 切片；page/page_size 已由 Query 约束为 >=1。"""
     start = (page - 1) * page_size
     return seq[start : start + page_size]
+
+
+def _attach_mail_link(items: list[dict[str, Any]]) -> None:
+    for item in items:
+        email = str(item.get("email") or "").strip()
+        fetch_url = str(item.get("fetch_url") or "").strip()
+        item["mail_link"] = fetch_url or mailbox_service.get_fetch_url(email) or None
+
+
+def _export_pool_accounts(body: AccountCredentialsExportRequest) -> tuple[list[str], list[str]]:
+    tokens = _unique_tokens(body.access_tokens)
+    accounts = account_service.list_accounts()
+    view = str(body.view or "").strip().lower() or None
+    stage = str(body.stage or "").strip() or None
+    if tokens:
+        wanted = {account_service.resolve_access_token(t) for t in tokens}
+        accounts = [a for a in accounts if str(a.get("access_token") or "") in wanted]
+    else:
+        accounts = filter_accounts(
+            accounts,
+            view=view,
+            stage=stage,
+            dispatched=False if body.only_undispatched else None,
+        )
+    if body.only_unused or body.only_undispatched:
+        accounts = [a for a in accounts if not a.get("dispatch", {}).get("dispatched")]
+    if view:
+        accounts = [a for a in accounts if is_exportable_pool(a, view)]
+    lines: list[str] = []
+    exported_tokens: list[str] = []
+    for acc in accounts:
+        if not is_exportable_pool(acc, view or ("plus" if str(acc.get("plan")) == "plus" else "free")):
+            continue
+        email = str(acc.get("email") or "").strip()
+        password = str(acc.get("password") or "").strip()
+        totp = str(acc.get("totp_secret") or "").strip()
+        access_token = str(acc.get("access_token") or "").strip()
+        if access_token.startswith("manual::") or access_token.startswith("email::"):
+            access_token = ""
+        lines.append(f"{email}---{password}---{totp}--{access_token}")
+        exported_tokens.append(str(acc.get("access_token") or ""))
+    return lines, exported_tokens
 
 
 def _download_timestamp() -> str:
@@ -122,77 +176,56 @@ def create_router() -> APIRouter:
     async def get_accounts(
         authorization: str | None = Header(default=None),
         q: str | None = Query(default=None),
-        status: str | None = Query(default=None),
+        view: str | None = Query(default=None),
+        stage: str | None = Query(default=None),
         plan: str | None = Query(default=None),
+        status: str | None = Query(default=None),
         avail: str | None = Query(default=None),
         activation: str | None = Query(default=None),
         used: bool | None = Query(default=None),
+        dispatched: bool | None = Query(default=None),
         page: int = Query(default=1, ge=1),
         page_size: int = Query(default=10, ge=1, le=200),
     ):
         require_admin(authorization)
-        items = account_service.list_accounts()
-        for item in items:
-            item["mail_link"] = mailbox_service.get_fetch_url(str(item.get("email") or "")) or None
+        all_items = account_service.list_accounts()
+        resolved_view = str(view or "").strip().lower() or None
+        if not resolved_view and plan in ("free", "plus"):
+            resolved_view = plan
 
-        # 全库统计（过滤前），始终反映整库口径。
-        summary = {
-            "total": len(items),
-            "alive": sum(1 for a in items if a.get("status") in ("正常", "限流")),
-            "dead": sum(1 for a in items if a.get("status") in ("异常", "禁用")),
-            "activated": sum(1 for a in items if a.get("plus_status") == "已激活"),
-            # 待激活口径按 plus_status（激活流程剩余量），与「真实档位是否 Plus」分开。
-            "pending": sum(1 for a in items if a.get("plus_status", "未激活") == "未激活"),
-            # 不一致告警：plus_status=已激活 但真实档位仍非 Plus（如 CDK「假成功」），需人工核查。
-            "needs_review": sum(
-                1 for a in items
-                if a.get("plus_status") == "已激活"
-                and str(a.get("type") or "").strip().lower() != "plus"
-            ),
-            "unused": sum(1 for a in items if not a.get("used")),
-        }
+        summary = summary_for_view(all_items, resolved_view) if resolved_view else summary_for_view(all_items, "free")
 
-        # 过滤：支持按 邮箱 / 密码 / 激活用的 CDK / access_token(Token) 模糊匹配。
-        keyword = (q or "").strip().lower()
-        if keyword:
-            items = [
-                a
-                for a in items
-                if keyword in str(a.get("email") or "").lower()
-                or keyword in str(a.get("password") or "").lower()
-                or keyword in str(a.get("plus_cdk") or "").lower()
-                or keyword in str(a.get("access_token") or "").lower()
-            ]
+        items = filter_accounts(
+            all_items,
+            view=resolved_view,
+            stage=str(stage or "").strip() or None,
+            q=q,
+            dispatched=dispatched,
+        )
+
+        # legacy filters kept for activator/other callers
         if status == "alive":
             items = [a for a in items if a.get("status") in ("正常", "限流")]
         elif status == "dead":
             items = [a for a in items if a.get("status") in ("异常", "禁用")]
-        if plan == "plus":
-            items = [a for a in items if str(a.get("type") or "").strip().lower() == "plus"]
-        elif plan == "free":
-            items = [a for a in items if str(a.get("type") or "").strip().lower() in ("", "free")]
         if avail == "available":
             items = [a for a in items if not a.get("plus_unavailable")]
         elif avail == "unavailable":
             items = [a for a in items if a.get("plus_unavailable")]
-        # 激活流程状态筛选（按 plus_status）；review = 档位与 plus_status 不一致，需人工核查。
         if activation == "pending":
-            items = [a for a in items if a.get("plus_status", "未激活") == "未激活"]
+            items = [a for a in items if a.get("stage") == STAGE_REGISTERED]
         elif activation == "activated":
-            items = [a for a in items if a.get("plus_status") == "已激活"]
+            items = [a for a in items if a.get("stage") == STAGE_PLUS_ACTIVATED]
         elif activation == "activating":
-            items = [a for a in items if a.get("plus_status") in ("排队中", "激活中")]
+            items = [a for a in items if a.get("stage") == STAGE_ACTIVATING]
         elif activation == "failed":
             items = [a for a in items if a.get("plus_status") == "激活失败"]
         elif activation == "review":
-            items = [
-                a for a in items
-                if a.get("plus_status") == "已激活"
-                and str(a.get("type") or "").strip().lower() != "plus"
-            ]
+            items = [a for a in items if a.get("stage") == STAGE_PLUS_REVIEW]
         if used is not None:
-            items = [a for a in items if bool(a.get("used")) == used]
+            items = [a for a in items if bool(a.get("dispatch", {}).get("dispatched")) == used]
 
+        _attach_mail_link(items)
         total = len(items)
         return {
             "items": _paginate(items, page, page_size),
@@ -331,25 +364,29 @@ def create_router() -> APIRouter:
 
     @router.post("/api/accounts/export-credentials")
     async def export_credentials(body: AccountCredentialsExportRequest, authorization: str | None = Header(default=None)):
-        """导出账号凭据：每行 `邮箱----接码地址----密码----2FA密钥`。接码地址取自绑定邮箱的 fetch_url。"""
+        """导出账号凭据：每行 `邮箱----接码地址----密码----2FA密钥`。"""
         require_admin(authorization)
         tokens = _unique_tokens(body.access_tokens)
         accounts = account_service.list_accounts()
+        view = str(body.view or "").strip().lower() or None
+        stage = str(body.stage or "").strip() or None
         if tokens:
             wanted = {account_service.resolve_access_token(t) for t in tokens}
             accounts = [a for a in accounts if str(a.get("access_token") or "") in wanted]
-        if body.only_unused:
-            accounts = [a for a in accounts if not a.get("used")]
+        else:
+            accounts = filter_accounts(accounts, view=view, stage=stage, dispatched=False if body.only_undispatched else None)
+        if body.only_unused or body.only_undispatched:
+            accounts = [a for a in accounts if not a.get("dispatch", {}).get("dispatched")]
         lines: list[str] = []
         exported_tokens: list[str] = []
         for acc in accounts:
             email = str(acc.get("email") or "").strip()
-            fetch_url = (mailbox_service.get_fetch_url(email) or "") if email else ""
+            fetch_url = str(acc.get("fetch_url") or "").strip() or (mailbox_service.get_fetch_url(email) or "")
             password = str(acc.get("password") or "").strip()
             totp = str(acc.get("totp_secret") or "").strip()
             lines.append("----".join([email, fetch_url, password, totp]))
             exported_tokens.append(str(acc.get("access_token") or ""))
-        if body.mark_used and exported_tokens:
+        if (body.mark_used or body.mark_dispatched) and exported_tokens:
             account_service.mark_used(exported_tokens, True)
         text = "\n".join(lines) + ("\n" if lines else "")
         timestamp = _download_timestamp()
@@ -363,26 +400,8 @@ def create_router() -> APIRouter:
     async def export_pool(body: AccountCredentialsExportRequest, authorization: str | None = Header(default=None)):
         """账号管理导出：每行 `邮箱---密码---2FA--Accesstoken`（与导入格式一致，可回环）。"""
         require_admin(authorization)
-        tokens = _unique_tokens(body.access_tokens)
-        accounts = account_service.list_accounts()
-        if tokens:
-            wanted = {account_service.resolve_access_token(t) for t in tokens}
-            accounts = [a for a in accounts if str(a.get("access_token") or "") in wanted]
-        if body.only_unused:
-            accounts = [a for a in accounts if not a.get("used")]
-        lines: list[str] = []
-        exported_tokens: list[str] = []
-        for acc in accounts:
-            email = str(acc.get("email") or "").strip()
-            password = str(acc.get("password") or "").strip()
-            totp = str(acc.get("totp_secret") or "").strip()
-            access_token = str(acc.get("access_token") or "").strip()
-            # 合成主键（manual::...）不是真实 token，导出留空占位，避免污染回环导入。
-            if access_token.startswith("manual::"):
-                access_token = ""
-            lines.append(f"{email}---{password}---{totp}--{access_token}")
-            exported_tokens.append(str(acc.get("access_token") or ""))
-        if body.mark_used and exported_tokens:
+        lines, exported_tokens = _export_pool_accounts(body)
+        if (body.mark_used or body.mark_dispatched) and exported_tokens:
             account_service.mark_used(exported_tokens, True)
         text = "\n".join(lines) + ("\n" if lines else "")
         timestamp = _download_timestamp()
@@ -400,22 +419,14 @@ def create_router() -> APIRouter:
             raise HTTPException(status_code=400, detail={"error": "access_tokens is required"})
         return account_service.mark_used(tokens, bool(body.used), body.meta_by_token)
 
-    @router.post("/api/accounts/mark-plus-available")
-    async def mark_plus_available(body: AccountPlusAvailabilityRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        tokens = _unique_tokens(body.access_tokens)
-        if not tokens:
-            raise HTTPException(status_code=400, detail={"error": "access_tokens is required"})
-        return account_service.set_plus_availability(tokens, bool(body.available))
-
     @router.post("/api/accounts/revoke-activation")
     async def revoke_activation(body: AccountRevokeActivationRequest, authorization: str | None = Header(default=None)):
-        """危险操作：批量撤销账号激活状态（复位为未激活）。仅供程序误标激活时人工纠正。"""
+        """撤销激活：将 plus_review 账号复位为免费可激活态，可选同步撤销 CDK 使用。"""
         require_admin(authorization)
         tokens = _unique_tokens(body.access_tokens)
         if not tokens:
             raise HTTPException(status_code=400, detail={"error": "access_tokens is required"})
-        return account_service.revoke_activation(tokens)
+        return account_service.revoke_activation(tokens, revoke_cdk=bool(body.revoke_cdk))
 
     @router.post("/api/accounts/update")
     async def update_account(body: AccountUpdateRequest, authorization: str | None = Header(default=None)):

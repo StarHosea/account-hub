@@ -1,4 +1,5 @@
 import { clsx, type ClassValue } from "clsx";
+import { validateAccountImport } from "@/lib/import-validation";
 
 export function cn(...inputs: ClassValue[]) {
   return clsx(inputs);
@@ -13,4 +14,9 @@ export function countImportRows(text: string): number {
     .split("\n")
     .map((line) => line.trim())
     .filter((line) => line && !line.startsWith("#")).length;
+}
+
+/** 统计账号导入文本中的条目数（JSON / 账号池 / access_token 逐行）。 */
+export function countAccountImportItems(text: string): number {
+  return validateAccountImport(text).validCount;
 }

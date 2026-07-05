@@ -1,30 +1,26 @@
 import { useState } from "react";
 import { Outlet, useLocation, useNavigate } from "react-router-dom";
-import { Layout, Nav, Button, Spin, Typography, SideSheet } from "@douyinfe/semi-ui-19";
-import { IconMoon, IconSun, IconExit, IconMenu } from "@douyinfe/semi-icons";
+import { Layout, Nav, Button, Spin, Typography, SideSheet, Tooltip } from "@douyinfe/semi-ui-19";
+import { IconMoon, IconSun, IconExit, IconMenu, IconIndentLeft, IconIndentRight } from "@douyinfe/semi-icons";
 
 import { useAuthGuard } from "@/lib/use-auth-guard";
 import { getTheme, toggleTheme } from "@/lib/theme";
+import { getSidebarCollapsed, setSidebarCollapsed } from "@/lib/sidebar";
 import { clearStoredAuthSession } from "@/store/auth";
-import { LogButton, LogPanel } from "@/components/LogPanel";
+import { useSettingsStore } from "@/store/settings";
+import RegisterRunningBanner from "@/components/RegisterRunningBanner";
 import { useRegisterStream } from "@/lib/use-register-stream";
 import { useIsMobile } from "@/lib/use-is-mobile";
+import { NAV_ITEMS } from "@/constants/nav";
+import { NAV_MENU_ITEMS } from "@/constants/nav-items";
 
-const { Header, Content } = Layout;
+const { Header, Content, Sider } = Layout;
 const { Text } = Typography;
 
-const NAV_ITEMS = [
-  { itemKey: "/register", text: "注册机" },
-  { itemKey: "/activator", text: "激活器" },
-  { itemKey: "/accounts", text: "账号管理" },
-  { itemKey: "/mailboxes", text: "邮箱管理" },
-  { itemKey: "/cdks", text: "CDK管理" },
-  { itemKey: "/phones", text: "手机号管理" },
-  { itemKey: "/dispatch", text: "出库管理" },
-  { itemKey: "/settings", text: "设置" },
-];
+const SIDEBAR_WIDTH_EXPANDED = 156;
+const SIDEBAR_WIDTH_COLLAPSED = 56;
 
-const BRAND = { text: "小海豚", logo: <span style={{ fontSize: 22, marginRight: 4 }}>🐬</span> };
+const BRAND = { text: "小鲸鱼", logo: <span style={{ fontSize: 22, marginRight: 4 }}>🐋</span> };
 
 export default function AppLayout() {
   const navigate = useNavigate();
@@ -33,7 +29,9 @@ export default function AppLayout() {
   const { isCheckingAuth, session } = useAuthGuard();
   const [dark, setDark] = useState(() => getTheme() === "dark");
   const [menuOpen, setMenuOpen] = useState(false);
-  // 全局订阅注册机 SSE：更新 store + 把日志转发到侧边面板（注册机页已拆除）。
+  const [sidebarCollapsed, setSidebarCollapsedState] = useState(() => getSidebarCollapsed());
+  const registerRunning = useSettingsStore((s) => s.registerConfig?.enabled);
+  // 全局订阅注册机 SSE：更新 store。
   useRegisterStream();
 
   if (isCheckingAuth || !session) {
@@ -58,6 +56,11 @@ export default function AppLayout() {
     setMenuOpen(false);
   };
 
+  const handleSidebarCollapse = (collapsed: boolean) => {
+    setSidebarCollapsedState(collapsed);
+    setSidebarCollapsed(collapsed);
+  };
+
   const themeButton = (
     <Button
       theme="borderless"
@@ -68,76 +71,124 @@ export default function AppLayout() {
     />
   );
 
+  const headerActions = (
+    <>
+      {registerRunning ? <RegisterRunningBanner compact /> : null}
+      {themeButton}
+      <Text type="tertiary">{session.name || session.role}</Text>
+      <Button theme="borderless" type="tertiary" icon={<IconExit />} onClick={() => void handleLogout()}>
+        退出
+      </Button>
+    </>
+  );
+
+  const sidebarToggleButton = (
+    <Tooltip content={sidebarCollapsed ? "展开侧栏" : "收起侧栏"}>
+      <Button
+        theme="borderless"
+        type="tertiary"
+        icon={sidebarCollapsed ? <IconIndentRight /> : <IconIndentLeft />}
+        onClick={() => handleSidebarCollapse(!sidebarCollapsed)}
+        aria-label={sidebarCollapsed ? "展开侧栏" : "收起侧栏"}
+      />
+    </Tooltip>
+  );
+
+  const pad = isMobile ? 12 : 24;
+  const isSettings = location.pathname.startsWith("/settings");
+
   return (
     <Layout style={{ height: "100vh" }}>
-      <Header style={{ backgroundColor: "var(--semi-color-bg-1)" }}>
-        {isMobile ? (
-          // 手机端：品牌 + 当前页名 + 日志/主题 + 汉堡菜单（Cloudflare 式抽屉导航）
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: 8,
-              height: 56,
-              padding: "0 12px",
-            }}
-          >
-            <span style={{ fontSize: 22 }}>🐬</span>
-            <Text strong style={{ flex: 1, fontSize: 16 }} ellipsis={{ showTooltip: false }}>
-              {currentTitle || BRAND.text}
-            </Text>
-            <LogButton />
-            {themeButton}
-            <Button
-              theme="borderless"
-              type="tertiary"
-              icon={<IconMenu />}
-              onClick={() => setMenuOpen(true)}
-              aria-label="菜单"
-            />
-          </div>
-        ) : (
+      {!isMobile && (
+        <Sider
+          className="app-sider"
+          style={{
+            width: sidebarCollapsed ? SIDEBAR_WIDTH_COLLAPSED : SIDEBAR_WIDTH_EXPANDED,
+            flex: `0 0 ${sidebarCollapsed ? SIDEBAR_WIDTH_COLLAPSED : SIDEBAR_WIDTH_EXPANDED}px`,
+            backgroundColor: "var(--semi-color-bg-1)",
+            borderRight: "1px solid var(--semi-color-border)",
+            overflow: "hidden",
+          }}
+        >
           <Nav
-            mode="horizontal"
+            mode="vertical"
+            className="app-sider-nav"
+            style={{ width: "100%", height: "100%" }}
+            bodyStyle={{ flex: 1, overflow: "auto" }}
+            isCollapsed={sidebarCollapsed}
+            onCollapseChange={handleSidebarCollapse}
             selectedKeys={[selected]}
-            items={NAV_ITEMS}
+            items={NAV_MENU_ITEMS}
             onSelect={({ itemKey }) => navigate(String(itemKey))}
             header={BRAND}
-            footer={
-              <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-                <LogButton />
-                {themeButton}
-                <Text type="tertiary">{session.name || session.role}</Text>
-                <Button theme="borderless" type="tertiary" icon={<IconExit />} onClick={() => void handleLogout()}>
-                  退出
-                </Button>
-              </div>
-            }
+            footer={{ collapseButton: true }}
           />
-        )}
-      </Header>
+        </Sider>
+      )}
 
-      <Content
-        style={{
-          padding: isMobile ? 12 : 24,
-          overflow: "auto",
-          backgroundColor: "var(--semi-color-bg-0)",
-        }}
-      >
-        <Outlet />
-      </Content>
+      <Layout>
+        <Header
+          style={{
+            backgroundColor: "var(--semi-color-bg-1)",
+            borderBottom: "1px solid var(--semi-color-border)",
+            height: isMobile ? 56 : 48,
+            lineHeight: isMobile ? "56px" : "48px",
+            padding: isMobile ? "0 12px" : "0 24px",
+          }}
+        >
+          {isMobile ? (
+            <div style={{ display: "flex", alignItems: "center", gap: 8, height: "100%" }}>
+              <span style={{ fontSize: 22 }}>🐋</span>
+              <Text strong style={{ flex: 1, fontSize: 16 }} ellipsis={{ showTooltip: false }}>
+                {currentTitle || BRAND.text}
+              </Text>
+              {themeButton}
+              <Button
+                theme="borderless"
+                type="tertiary"
+                icon={<IconMenu />}
+                onClick={() => setMenuOpen(true)}
+                aria-label="菜单"
+              />
+            </div>
+          ) : (
+            <div style={{ display: "flex", alignItems: "center", gap: 12, height: "100%" }}>
+              {sidebarToggleButton}
+              <Text strong style={{ fontSize: 16 }}>
+                {currentTitle}
+              </Text>
+              <div style={{ flex: 1 }} />
+              {headerActions}
+            </div>
+          )}
+        </Header>
+
+        <Content
+          className={`app-content-scroll${isSettings ? " app-content-scroll--settings" : ""}`}
+          style={{
+            paddingTop: isSettings ? 0 : pad,
+            paddingRight: pad,
+            paddingBottom: pad,
+            paddingLeft: pad,
+            overflow: "auto",
+            backgroundColor: "var(--semi-color-bg-0)",
+          }}
+        >
+          <Outlet />
+        </Content>
+      </Layout>
 
       {/* 手机端抽屉导航 */}
       <SideSheet
         title={BRAND.text}
         visible={isMobile && menuOpen}
         onCancel={() => setMenuOpen(false)}
-        placement="right"
+        placement="left"
         width="76%"
         bodyStyle={{ padding: 0, display: "flex", flexDirection: "column" }}
       >
         <nav style={{ flex: 1, paddingTop: 8 }}>
-          {NAV_ITEMS.map((item) => {
+          {NAV_MENU_ITEMS.map((item) => {
             const active = item.itemKey === selected;
             return (
               <button
@@ -146,6 +197,7 @@ export default function AppLayout() {
                 style={{
                   display: "flex",
                   alignItems: "center",
+                  gap: 10,
                   width: "100%",
                   padding: "14px 20px",
                   border: "none",
@@ -158,6 +210,7 @@ export default function AppLayout() {
                   cursor: "pointer",
                 }}
               >
+                <span style={{ display: "inline-flex", fontSize: 18 }}>{item.icon}</span>
                 {item.text}
               </button>
             );
@@ -172,8 +225,6 @@ export default function AppLayout() {
           </Button>
         </div>
       </SideSheet>
-
-      <LogPanel />
     </Layout>
   );
 }

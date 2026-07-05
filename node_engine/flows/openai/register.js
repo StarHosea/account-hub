@@ -1,5 +1,6 @@
 import { sleep, generateRandomName, generateRandomBirthday, generatePassword, generateTotpNow } from '../../utils.js';
 import * as S from './selectors.js';
+import { detectInvalidCode } from './code-errors.js';
 import { detectAuthState, PAGE_STATE } from './auth-state.js';
 
 // 未开启 DOM 记录时的空记录器（record/finalize 均无副作用，保证生产零开销）。
@@ -9,7 +10,7 @@ const NOOP_RECORDER = { enabled: false, async record() {}, async finalize() { re
 // ChatGPT 注册/登录/账号加固流程（Playwright/CloakBrowser 版）
 // 移植自 browserregister src/flows/openai/register.js，主要改动：
 //   1) 验证码不再由本进程轮询邮箱，而是通过注入的 requestCode(purpose) 向 Python 请求；
-//      Python（mail_provider）持有邮箱池并负责新鲜度（baseline）判定。
+//      Python（mail_code + mail_provider）按 need_code.ts 过滤旧码并轮询取新验证码。
 //   2) 「邮箱已注册」不再 throw，而是 registerChatGPT 返回 { emailExists:true }，
 //      由 worker 分流到 secureExistingChatGPT（OTP 登录 → 设新密码 → 开 2FA → 取 token）。
 //   3) enable2fa=false 时 step8 只设密码、跳过 2FA。
@@ -24,8 +25,39 @@ const OAUTH_EXCLUDE = [
 
 const DIAG_DIR = process.env.REG_DIAG_DIR || '';
 
+/** 表单提交前等待页面资源加载完毕（readyState=complete + load；对标浏览器标签不再转圈）。超时 60s 则刷新。 */
+const FORM_SUBMIT_PAGE_LOAD_MS = 60000;
+
+async function waitForPageFullyLoaded(page, { timeoutMs = FORM_SUBMIT_PAGE_LOAD_MS, log } = {}) {
+  const deadline = Date.now() + timeoutMs;
+
+  const waitOnce = async () => {
+    const remain = () => Math.max(500, deadline - Date.now());
+    if (remain() <= 500) return false;
+    try {
+      await page.waitForLoadState('domcontentloaded', { timeout: remain() });
+      await page.waitForFunction(() => document.readyState === 'complete', { timeout: remain() });
+      await page.waitForLoadState('load', { timeout: remain() });
+      await page.waitForLoadState('networkidle', { timeout: Math.min(remain(), 8000) }).catch(() => {});
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  if (await waitOnce()) return;
+
+  log?.(`页面资源加载超过 ${Math.round(timeoutMs / 1000)}s，刷新浏览器`, 'warn');
+  await page.reload({ waitUntil: 'load', timeout: 60000 }).catch(() => {});
+  await sleep(800);
+  if (!(await waitOnce())) {
+    log?.('刷新后页面仍未完全加载，继续尝试提交', 'warn');
+  }
+}
+
 // 在按钮/链接里按文案找可点击元素，然后用 Playwright 真实（humanize）点击。
-async function humanClickByText(page, texts, { timeout = 15000, poll = 400, exclude = [] } = {}) {
+// 命中 form 内按钮或 type=submit 时，点击前自动 waitForPageFullyLoaded（可用 awaitPageLoad 强制/跳过）。
+async function humanClickByText(page, texts, { timeout = 15000, poll = 400, exclude = [], awaitPageLoad, log } = {}) {
   const lower = texts.map((t) => t.toLowerCase());
   const ex = exclude.map((t) => t.toLowerCase());
   const deadline = Date.now() + timeout;
@@ -53,7 +85,22 @@ async function humanClickByText(page, texts, { timeout = 15000, poll = 400, excl
 
     if (found) {
       try {
-        await page.click(`[${MARK}="1"]`, { timeout: 5000 });
+        const loc = page.locator(`[${MARK}="1"]`);
+        const needsLoadWait = awaitPageLoad !== false && (awaitPageLoad === true || await page.evaluate((mark) => {
+          const el = document.querySelector(`[${mark}="1"]`);
+          if (!el) return false;
+          const type = (el.getAttribute('type') || '').toLowerCase();
+          if (type === 'submit') return true;
+          const form = el.closest('form');
+          if (!form) return false;
+          const tag = el.tagName;
+          return tag === 'BUTTON' || tag === 'INPUT' || el.getAttribute('role') === 'button';
+        }, MARK));
+        if (needsLoadWait) {
+          await waitForPageFullyLoaded(page, { log });
+        }
+        await loc.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
+        await loc.click({ timeout: 5000 });
         await page.evaluate((mark) => document.querySelectorAll('[' + mark + ']').forEach((e) => e.removeAttribute(mark)), MARK);
         return found;
       } catch {
@@ -74,6 +121,145 @@ async function firstVisible(page, selector, { timeout = 15000 } = {}) {
   } catch {
     return null;
   }
+}
+
+/** 步骤级时间预算：避免单步长轮询把整轮注册拖到 register_timeout 才失败。 */
+function remainingMs(deadline) {
+  return Math.max(0, deadline - Date.now());
+}
+function capTimeout(ms, deadline) {
+  return Math.min(ms, remainingMs(deadline));
+}
+
+// 单步时间预算：避免「按钮未命中仍长等弹窗」把整轮注册拖到 register_timeout。
+const STEP_BUDGETS_MS = {
+  enterAuth: 90000,
+  postEmail: 120000,
+  codePage: 120000,
+};
+
+function capByDeadline(requestedMs, deadline) {
+  return Math.min(requestedMs, Math.max(0, deadline - Date.now()));
+}
+
+function isPastDeadline(deadline) {
+  return Date.now() >= deadline;
+}
+
+// chatgpt.com 首页点「登录/免费注册」后，等弹窗或邮箱框真正出现（代理慢时不能只点完就查）。
+async function waitForAuthEntryOpen(page, { timeout = 10000 } = {}) {
+  try {
+    await page.locator('[role=dialog]').first().waitFor({ state: 'visible', timeout });
+    return true;
+  } catch { /* fall through */ }
+  return !!(await firstVisible(page, S.EMAIL_INPUT, { timeout: Math.min(timeout, 3000) }));
+}
+
+// 等 chatgpt.com 首页 hydrate（按钮可见但 onClick 未绑定时，只会高亮焦点、弹窗不出）。
+async function waitForHomeReady(page, { timeout = 20000 } = {}) {
+  await page.waitForFunction(
+    () => {
+      try {
+        return document.styleSheets.length > 0 && document.readyState !== 'loading';
+      } catch { return false; }
+    },
+    { timeout },
+  ).catch(() => {});
+  try {
+    await page.locator(
+      `[data-testid="${S.SIGNUP_BUTTON_TESTID}"], [data-testid="${S.LOGIN_BUTTON_TESTID}"], [data-testid="${S.NO_AUTH_RIGHT_LOGIN_PANEL_TESTID}"]`,
+    ).first().waitFor({ state: 'visible', timeout: Math.min(timeout, 15000) });
+  } catch { /* 可能已在 auth 子域或弹窗内 */ }
+  await page.waitForLoadState('networkidle', { timeout: Math.min(timeout, 12000) }).catch(() => {});
+  await sleep(800);
+}
+
+function homeSideAuthPanelSel() {
+  return `[data-testid="${S.NO_AUTH_RIGHT_LOGIN_PANEL_TESTID}"]`;
+}
+
+// 右侧内嵌「注册或登录」面板（无中央 signup 按钮时直接有邮箱框）。
+async function waitForHomeSideAuthEmailInput(page, { timeout = 12000 } = {}) {
+  const panel = homeSideAuthPanelSel();
+  if (!await page.locator(panel).first().isVisible({ timeout: Math.min(timeout, 5000) }).catch(() => false)) {
+    return null;
+  }
+  const emailInPanel = S.EMAIL_INPUT.split(', ').map((s) => `${panel} ${s.trim()}`).join(', ');
+  return firstVisible(page, emailInPanel, { timeout });
+}
+
+async function isEmailInHomeSideAuthPanel(emailInput) {
+  if (!emailInput) return false;
+  return emailInput.evaluate(
+    (el, panelTestId) => !!el.closest(`[data-testid="${panelTestId}"]`),
+    S.NO_AUTH_RIGHT_LOGIN_PANEL_TESTID,
+  ).catch(() => false);
+}
+
+async function clickHomeSideAuthContinue(page, log) {
+  await waitForPageFullyLoaded(page, { log });
+  const panel = homeSideAuthPanelSel();
+  const submit = page.locator(`${panel} button[type="submit"]`).first();
+  if (await submit.isVisible({ timeout: 3000 }).catch(() => false)) {
+    await submit.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
+    await submit.click({ timeout: 5000 });
+    return '继续';
+  }
+  return humanClickByText(page, S.CONTINUE_TEXTS, { timeout: 8000, exclude: OAUTH_EXCLUDE, awaitPageLoad: true, log });
+}
+
+// 填邮箱并点继续；若在右侧面板内则限定在面板 scope 点击。
+async function fillAuthEmailAndContinue(page, emailInput, email, log) {
+  await humanType(emailInput, email);
+  log(`正在填写邮箱：${email}`);
+  const inSidePanel = await isEmailInHomeSideAuthPanel(emailInput);
+  if (inSidePanel) {
+    log('右侧登录/注册面板：点击「继续」…');
+    await clickHomeSideAuthContinue(page, log);
+  } else {
+    await humanClickByText(page, S.CONTINUE_TEXTS, { timeout: 12000, exclude: OAUTH_EXCLUDE, awaitPageLoad: true, log });
+  }
+}
+
+// 优先取弹窗内的邮箱框（新版首页注册弹窗把 input 放在 role=dialog 里）。
+async function waitForAuthEmailInput(page, { timeout = 22000 } = {}) {
+  const inSidePanel = await waitForHomeSideAuthEmailInput(page, { timeout: Math.min(timeout, 8000) });
+  if (inSidePanel) return inSidePanel;
+  const dialogEmailSel = S.EMAIL_INPUT.split(', ').map((s) => `[role=dialog] ${s.trim()}`).join(', ');
+  const inDialog = await firstVisible(page, dialogEmailSel, { timeout: Math.min(timeout, 12000) });
+  if (inDialog) return inDialog;
+  return firstVisible(page, S.EMAIL_INPUT, { timeout });
+}
+
+// 首页登录/注册入口：等 hydrate → testid 多策略点击（locator/Enter/原生 click）→ 文案兜底。
+// 点击成功与弹窗出现解耦：按钮高亮但弹窗慢时仍返回命中文案，由外层长轮询等邮箱框。
+async function clickHomeAuthButton(page, { testId, texts, exclude = [] } = {}) {
+  await waitForHomeReady(page).catch(() => {});
+
+  const tryTestId = async () => {
+    if (!testId) return null;
+    const btn = page.locator(`[data-testid="${testId}"]`).first();
+    if (!await btn.isVisible({ timeout: 3000 }).catch(() => false)) return null;
+    await btn.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
+    const attempts = [
+      () => btn.click({ timeout: 5000 }),
+      async () => { await btn.focus({ timeout: 3000 }); await page.keyboard.press('Enter'); },
+      () => page.evaluate((id) => document.querySelector(`[data-testid="${id}"]`)?.click(), testId),
+    ];
+    for (const run of attempts) {
+      try {
+        await run();
+        await sleep(400);
+        if (await waitForAuthEntryOpen(page, { timeout: 2500 })) return testId;
+      } catch { /* 换下一策略 */ }
+    }
+    // 策略都试过：仍算点中（用户可见高亮），弹窗由外层继续等
+    return testId;
+  };
+
+  const hit = await tryTestId()
+    || await humanClickByText(page, texts, { timeout: 8000, exclude });
+  return hit || null;
 }
 
 // 按 data-testid 真实点击。OpenAI 设置面板每个 tab 都带稳定 testid（如 security-tab），
@@ -144,7 +330,7 @@ async function waitForPostEmailLanding(page, log, { timeoutMs = 120000, poll = 1
 
     if (state === 'code') { log('已跳转到验证码页'); return 'code'; }
     if (state === 'password') { log('已跳转到密码页'); return 'password'; }
-    if (!logged) { log('「继续」处理中（loading/跳转中），等待验证码页…'); logged = true; }
+    if (!logged) { log('正在加载，等待跳转到验证码页…'); logged = true; }
     await sleep(poll);
   }
   log('等待跳转超时，按未知状态继续尝试');
@@ -177,6 +363,46 @@ async function isOnCodePage(page) {
   } catch {
     return false;
   }
+}
+
+// 单轮邮箱取码最长等待（秒），与 Python mail_code.ROUND_WAIT_TIMEOUT 对齐。
+const CODE_POLL_ROUND_SEC = 90;
+const CODE_POLL_MAX_ROUNDS = 4;
+
+const RESEND_CODE_TEXTS = [
+  '重新发送电子邮件', '重新发送', '重新发送邮件', '重新发送验证码',
+  'resend email', 'resend', 'send again', "didn't get", '未收到',
+];
+
+/** 在收码页点击「重新发送」类按钮。 */
+async function clickResendVerificationCode(page, log) {
+  const clicked = await humanClickByText(page, RESEND_CODE_TEXTS, { timeout: 8000, exclude: OAUTH_EXCLUDE }).catch(() => null);
+  if (clicked) log(`已点击重新发送验证码：${clicked}`);
+  else log('未找到重新发送按钮，继续等待新邮件', 'warn');
+  return Boolean(clicked);
+}
+
+/**
+ * 向 Python 请求验证码；单轮超时（约 90s）未收到则在页面上点「重新发送」再开下一轮。
+ * 最多 CODE_POLL_MAX_ROUNDS 轮，覆盖注册/登录/2FA/设密码等所有收码步骤。
+ */
+async function requestCodeWithResend(page, requestCode, log, { purpose = 'register', maxRounds = CODE_POLL_MAX_ROUNDS } = {}) {
+  if (typeof requestCode !== 'function') throw new Error('requestCode 未注入');
+  let lastErr = null;
+  for (let round = 1; round <= maxRounds; round += 1) {
+    if (round > 1) {
+      log(`等待验证码超过 ${CODE_POLL_ROUND_SEC} 秒，触发页面重新发送，第 ${round - 1} 次`);
+      await clickResendVerificationCode(page, log);
+      await sleep(2500);
+    }
+    try {
+      return await requestCode(purpose);
+    } catch (e) {
+      lastErr = e;
+      if (round >= maxRounds) break;
+    }
+  }
+  throw lastErr || new Error(`已重新发送 ${maxRounds - 1} 次，仍未收到验证码`);
 }
 
 // 注册成功的 URL 判定：https + host∈chatgpt.com 且 path 不在 auth/create-account/email-verification/log-in/add-phone。
@@ -224,7 +450,7 @@ async function openWithRetry(page, url, log, { attempts = 3 } = {}) {
         log(`已打开页面（第 ${i} 次），标题：${await page.title().catch(() => '')}`);
         return true;
       }
-      log(`页面内容过少，重试打开…（第 ${i} 次）`);
+      log(`页面内容过少，第 ${i} 次重新打开`);
     } catch (err) {
       lastErr = err;
       log(`打开页面失败（第 ${i}/${attempts} 次）：${err?.message || err}`);
@@ -332,7 +558,7 @@ async function fillBirthday(page, { year, month, day }, log) {
       }
       return { ok: true };
     }, { y: year, m: month, d: day });
-    if (ok?.ok) { log(`已选择生日 ${year}-${month}-${day}（react-aria 下拉）`); return true; }
+    if (ok?.ok) { log(`已选择生日 ${year}-${month}-${day}`); return true; }
     log(`生日下拉填写失败：${ok?.reason || '未知'}`);
     return false;
   }
@@ -351,7 +577,7 @@ async function fillBirthday(page, { year, month, day }, log) {
         await sleep(200);
       }
     }
-    log(`已键入生日 ${year}-${month}-${day}（spinbutton）`);
+    log(`已填写生日 ${year}-${month}-${day}`);
     return true;
   }
 
@@ -383,7 +609,8 @@ async function waitForAuthReady(page, { timeout = 12000 } = {}) {
 // 原生 locator 派发真实指针事件 + 滚动入视图 + 多次重试 + 等待导航；
 // 兜底 form.requestSubmit；仍不动可 reload 重新 hydrate。同时匹配 button/a/[role=button]
 // （"忘记了密码？"是 <a> 链接）。移植自 browserregister clickButtonRobust。
-async function clickButtonRobust(page, textRe, { timeout = 10000, tries = 3, reloadOnFail = false } = {}) {
+async function clickButtonRobust(page, textRe, { timeout = 10000, tries = 3, reloadOnFail = false, log } = {}) {
+  await waitForPageFullyLoaded(page, { log });
   await waitForAuthReady(page);
   const before = page.url();
   for (let i = 0; i < tries; i += 1) {
@@ -420,17 +647,18 @@ async function clickButtonRobust(page, textRe, { timeout = 10000, tries = 3, rel
 // 移植自 browserregister forgotPasswordFlow，改动：取码走注入的 requestCode('login')（Python 持邮箱池）。
 async function forgotPasswordFlow({ page, email, requestCode, log, recorder = NOOP_RECORDER }) {
   const newPassword = generatePassword();
+  log(`重设密码 · 已生成新密码：${newPassword}`);
   const mark = (id, note) => recorder.record(id, { note }).catch(() => {});
   // 1) 点"忘记了密码？"
-  const moved1 = await clickButtonRobust(page, /忘记了密码|忘记密码|forgot/i, { timeout: 8000 });
-  log(`忘记密码1：点击"忘记密码"→${moved1 ? '已跳转' : '未跳转'}，URL=${page.url()}`);
+  const moved1 = await clickButtonRobust(page, /忘记了密码|忘记密码|forgot/i, { timeout: 8000, log });
+  log(`重设密码 · 点击忘记密码，${moved1 ? '页面已跳转' : '页面未变化'}`);
   await sleep(2000);
   await snapshot(page, 'forgot-01-after-click', log);
 
   // 2) 重置密码确认页："点击继续以重置 X 的密码" → 点"继续"发送重置码
   if (/reset-password/i.test(page.url())) {
-    const moved2 = await clickButtonRobust(page, /继续|continue|发送|send/i, { timeout: 12000, tries: 4, reloadOnFail: true });
-    log(`忘记密码1b：点重置确认"继续"→${moved2 ? '已跳转' : '未跳转'}，URL=${page.url()}`);
+    const moved2 = await clickButtonRobust(page, /继续|continue|发送|send/i, { timeout: 12000, tries: 4, reloadOnFail: true, log });
+    log(`重设密码 · 点击继续发送重置邮件，${moved2 ? '页面已跳转' : '页面未变化'}`);
     await sleep(2500);
     await snapshot(page, 'forgot-02-after-continue', log);
   }
@@ -438,15 +666,15 @@ async function forgotPasswordFlow({ page, email, requestCode, log, recorder = NO
   // 3) 收码页 → 向 Python 请求重置码填码
   const codeReady = await firstVisible(page, `${S.CODE_INPUT}, ${S.CODE_INPUT_SEGMENTED}`, { timeout: 40000 });
   if (codeReady) {
-    log('忘记密码2：收码页就绪，取重置码');
-    const code = await requestCode('login');
+    log('重设密码 · 等待邮箱验证码');
+    const code = await requestCodeWithResend(page, requestCode, log, { purpose: 'login' });
     await fillCode(page, code, log);
     await submitCodeForm(page, log, { code });
     await sleep(3500);
     await snapshot(page, 'forgot-03-after-code', log);
     await mark('forgot-03-code', '忘记密码：重置码已提交');
   } else {
-    log(`忘记密码2：未见收码页，URL=${page.url()}`);
+    log('重设密码 · 未出现验证码输入页，继续尝试');
     await snapshot(page, 'forgot-02b-no-code', log);
   }
 
@@ -467,11 +695,12 @@ async function forgotPasswordFlow({ page, email, requestCode, log, recorder = NO
   const n = await all.count();
   await humanType(all.nth(0), newPassword);
   if (n > 1) await humanType(all.nth(1), newPassword);
-  log(`忘记密码3：已填新密码（${n} 个密码框），提交`);
+  log(`重设密码 · 填写新密码：${newPassword}`);
   const beforeSet = page.url();
+  await waitForPageFullyLoaded(page, { log });
   await all.nth(Math.max(0, n - 1)).press('Enter').catch(() => {});
   await page.waitForFunction((u) => location.href !== u, beforeSet, { timeout: 5000 }).catch(() => {});
-  if (page.url() === beforeSet) await clickButtonRobust(page, /继续|保存|重置|确认|continue|save|reset|confirm/i, { timeout: 8000 });
+  if (page.url() === beforeSet) await clickButtonRobust(page, /继续|保存|重置|确认|continue|save|reset|confirm/i, { timeout: 8000, log });
   await sleep(3500);
   await snapshot(page, 'forgot-04-after-set', log);
 
@@ -481,8 +710,8 @@ async function forgotPasswordFlow({ page, email, requestCode, log, recorder = NO
   const onResetDone = /reset-password\/success/i.test(page.url())
     || await page.evaluate(() => /重置.*成功|密码.*(已|修改|重置).*成功|password.*(reset|changed|updated)/i.test(document.body?.innerText || '')).catch(() => false);
   if (onResetDone || /reset-password/i.test(page.url())) {
-    log(`忘记密码4：密码已重设（${page.url()}），点"登录"回到登录页`);
-    const movedLogin = await clickButtonRobust(page, /^登录$|登 ?录|log ?in|sign ?in/i, { timeout: 8000, tries: 3 });
+    log('重设密码 · 密码已更新，返回登录页');
+    const movedLogin = await clickButtonRobust(page, /^登录$|登 ?录|log ?in|sign ?in/i, { timeout: 8000, tries: 3, log });
     if (!movedLogin || !/\/log-in/i.test(page.url())) {
       // 兜底：直接点 href 指向 /log-in 的链接
       await page.evaluate(() => {
@@ -499,13 +728,14 @@ async function forgotPasswordFlow({ page, email, requestCode, log, recorder = NO
   if (/\/log-in\/password/i.test(page.url())) {
     const pwd = await firstVisible(page, S.PASSWORD_INPUT, { timeout: 12000 });
     if (pwd) {
-      log('忘记密码5：登录页用新密码登录');
+      log(`重设密码 · 使用新密码登录：${newPassword}`);
       await humanType(pwd, newPassword);
       const beforeLogin = page.url();
+      await waitForPageFullyLoaded(page, { log });
       await pwd.press('Enter').catch(() => {});
       await page.waitForFunction((u) => location.href !== u, beforeLogin, { timeout: 8000 }).catch(() => {});
       if (page.url() === beforeLogin) {
-        await humanClickByText(page, ['继续', 'continue', '登录', 'log in', 'sign in'], { timeout: 6000, exclude: OAUTH_EXCLUDE }).catch(() => {});
+        await humanClickByText(page, ['继续', 'continue', '登录', 'log in', 'sign in'], { timeout: 6000, exclude: OAUTH_EXCLUDE, awaitPageLoad: true, log }).catch(() => {});
         await page.waitForFunction((u) => location.href !== u, beforeLogin, { timeout: 8000 }).catch(() => {});
       }
       await sleep(2500);
@@ -515,13 +745,14 @@ async function forgotPasswordFlow({ page, email, requestCode, log, recorder = NO
     const emailInput = await firstVisible(page, S.EMAIL_INPUT, { timeout: 8000 });
     if (emailInput) {
       await humanType(emailInput, email);
-      await humanClickByText(page, S.CONTINUE_TEXTS, { timeout: 8000, exclude: OAUTH_EXCLUDE }).catch(() => {});
+      await humanClickByText(page, S.CONTINUE_TEXTS, { timeout: 8000, exclude: OAUTH_EXCLUDE, awaitPageLoad: true, log }).catch(() => {});
       await waitForAuthReady(page);
       const pwd2 = await firstVisible(page, S.PASSWORD_INPUT, { timeout: 12000 });
       if (pwd2) {
-        log('忘记密码5b：重填邮箱后用新密码登录');
+        log(`重设密码 · 重新填写邮箱后登录，密码：${newPassword}`);
         await humanType(pwd2, newPassword);
         const b2 = page.url();
+        await waitForPageFullyLoaded(page, { log });
         await pwd2.press('Enter').catch(() => {});
         await page.waitForFunction((u) => location.href !== u, b2, { timeout: 8000 }).catch(() => {});
         await sleep(2500);
@@ -531,6 +762,48 @@ async function forgotPasswordFlow({ page, email, requestCode, log, recorder = NO
   await snapshot(page, 'forgot-06-after-relogin', log);
   await mark('forgot-06-relogin', '忘记密码：已用新密码重登');
   return newPassword;
+}
+
+// 登录密码页是否已明确报错（邮箱/密码错误）——命中后应直接走忘记密码，不再 reload 重试。
+async function isLoginPasswordRejected(page) {
+  const pattern = S.WRONG_LOGIN_PASSWORD_PATTERN.source;
+  return page.evaluate((reSrc) => {
+    const re = new RegExp(reSrc, 'i');
+    const pwd = document.querySelector(
+      'input[type="password"][name="current-password"], input[type="password"][autocomplete*="current-password"], input[type="password"]',
+    );
+    if (pwd) {
+      if (pwd.getAttribute('aria-invalid') === 'true' || pwd.getAttribute('data-invalid') === 'true') {
+        return true;
+      }
+    }
+    const errNodes = document.querySelectorAll(
+      '.react-aria-FieldError, [slot="errorMessage"], [class*="_error_"], li[class*="_error_"]',
+    );
+    for (const el of errNodes) {
+      const t = (el.innerText || el.textContent || '').trim();
+      if (t && re.test(t)) return true;
+    }
+    return re.test(document.body?.innerText || '');
+  }, pattern).catch(() => false);
+}
+
+// 提交密码后短轮询：页面跳转成功 / 明确密码错误 / 超时仍停在原页。
+async function waitForLoginPasswordOutcome(page, beforeUrl, { timeoutMs = 8000, pollMs = 250 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      if (page.url() !== beforeUrl) return 'navigated';
+    } catch { /* page closed */ }
+    if (await isLoginPasswordRejected(page)) return 'rejected';
+    await sleep(pollMs);
+  }
+  if (await isLoginPasswordRejected(page)) return 'rejected';
+  try {
+    return page.url() !== beforeUrl ? 'navigated' : 'unchanged';
+  } catch {
+    return 'unchanged';
+  }
 }
 
 // 老账号登录（OTP 收码登录）。验证码通过 requestCode('login') 向 Python 请求。
@@ -545,37 +818,51 @@ export async function loginChatGPT({ page, email, chatgptUrl = 'https://chatgpt.
     await waitForAuthReady(page); // 等页面 hydrate 完成再判定/操作，稳定性
     const pwdReady = await firstVisible(page, S.PASSWORD_INPUT, { timeout: 3000 });
     if (pwdReady) {
-      log('登录1：已在登录密码页（承接注册流程），跳过重开官网/重填邮箱，直接填密码');
+      log('登录 · 已在密码页，直接填写密码');
       landing = 'password';
     }
   }
 
   if (landing === null) {
-    log('登录1：打开 ChatGPT 官网');
+    log('登录 · 打开 ChatGPT 官网');
     await openWithRetry(page, chatgptUrl, log);
     await sleep(2500);
 
     if (isLoggedInUrl(page.url())) {
       const t0 = await readAccessToken(page);
-      if (t0.accessToken) { log('登录：已是登录态'); return { accessToken: t0.accessToken, user: t0.user, expires: t0.expires }; }
+      if (t0.accessToken) { log('登录 · 当前已是登录状态'); return { accessToken: t0.accessToken, user: t0.user, expires: t0.expires }; }
     }
 
-    log('登录2：进入登录入口');
-    let emailInput = await firstVisible(page, S.EMAIL_INPUT, { timeout: 2500 });
-    for (let attempt = 1; attempt <= 3 && !emailInput; attempt += 1) {
-      const clicked = await humanClickByText(page, ['登录', 'log in', 'login', 'sign in', 'ログイン'], { timeout: 15000, exclude: OAUTH_EXCLUDE });
-      log(`登录2：点击登录入口「${clicked || '未命中'}」（第 ${attempt} 次），等待邮箱框…`);
-      emailInput = await firstVisible(page, S.EMAIL_INPUT, { timeout: 20000 });
-      if (!emailInput) {
-        await humanClickByText(page, ['continue with email', 'use email', '使用邮箱', 'メールで続ける'], { timeout: 6000, exclude: OAUTH_EXCLUDE });
-        emailInput = await firstVisible(page, S.EMAIL_INPUT, { timeout: 10000 });
+    log('登录 · 进入登录入口');
+    await waitForHomeReady(page).catch(() => {});
+    let emailInput = await waitForHomeSideAuthEmailInput(page, { timeout: 10000 });
+    if (emailInput) {
+      log('登录 · 检测到登录面板，直接填写邮箱');
+    } else {
+      emailInput = await waitForAuthEmailInput(page, { timeout: 2500 });
+      for (let attempt = 1; attempt <= 2 && !emailInput; attempt += 1) {
+        const clicked = await clickHomeAuthButton(page, {
+          testId: S.LOGIN_BUTTON_TESTID,
+          texts: ['登录', 'log in', 'login', 'sign in', 'ログイン'],
+          exclude: OAUTH_EXCLUDE,
+        });
+        log(`登录 · 点击登录入口，第 ${attempt} 次尝试`);
+        emailInput = await waitForAuthEmailInput(page, { timeout: 25000 });
+        if (!emailInput) {
+          await humanClickByText(page, ['continue with email', 'use email', '使用邮箱', 'メールで続ける'], { timeout: 6000, exclude: OAUTH_EXCLUDE });
+          emailInput = await waitForAuthEmailInput(page, { timeout: 12000 });
+        }
       }
+    }
+    if (!emailInput) {
+      log('登录 · 首页未出现邮箱框，跳转到登录页');
+      await page.goto('https://auth.openai.com/log-in', { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});
+      await waitForAuthReady(page);
+      emailInput = await waitForAuthEmailInput(page, { timeout: 25000 });
     }
     if (!emailInput) { await snapshot(page, 'login-no-email', log); throw new Error('登录：未找到邮箱输入框'); }
 
-    await humanType(emailInput, email);
-    log(`登录2：已填邮箱 ${email}，点继续`);
-    await humanClickByText(page, S.CONTINUE_TEXTS, { timeout: 12000, exclude: OAUTH_EXCLUDE });
+    await fillAuthEmailAndContinue(page, emailInput, email, log);
     landing = await waitForPostEmailLanding(page, log, { timeoutMs: 120000 });
   }
 
@@ -584,10 +871,11 @@ export async function loginChatGPT({ page, email, chatgptUrl = 'https://chatgpt.
   let resetPassword = ''; // 若走了忘记密码流程，这里是新设的密码，需回传存储
   if (landing === 'password') {
     let passwordSubmitted = false;
+    let passwordRejected = false;
     if (password) {
-      // auth.openai.com 表单提交 flaky：提交没前进就 reload 重试（reload=全新 hydration），最多 3 轮
-      for (let attempt = 1; attempt <= 3 && !passwordSubmitted; attempt += 1) {
-        log(`登录3：密码页，填写密码（第 ${attempt} 次）`);
+      // auth.openai.com 表单提交 flaky：无报错时 reload 重试；一旦页面标明密码/邮箱错误则立即转忘记密码。
+      for (let attempt = 1; attempt <= 3 && !passwordSubmitted && !passwordRejected; attempt += 1) {
+        log(`登录 · 填写密码，第 ${attempt} 次尝试：${password}`);
         await waitForAuthReady(page);
         const pwdInput = await firstVisible(page, S.PASSWORD_INPUT, { timeout: 10000 });
         if (!pwdInput) break;
@@ -595,38 +883,63 @@ export async function loginChatGPT({ page, email, chatgptUrl = 'https://chatgpt.
         const beforeUrl = page.url();
         await pwdInput.fill(password).catch(() => {});
         await sleep(300);
+        await waitForPageFullyLoaded(page, { log });
         await pwdInput.press('Enter').catch(() => {});
-        await page.waitForFunction((u) => location.href !== u, beforeUrl, { timeout: 6000 }).catch(() => {});
-        if (page.url() === beforeUrl) {
+
+        let outcome = await waitForLoginPasswordOutcome(page, beforeUrl, { timeoutMs: 3500 });
+        if (outcome === 'rejected') {
+          passwordRejected = true;
+          log('登录 · 密码或邮箱错误，改为重设密码');
+          break;
+        }
+        if (outcome !== 'navigated' && page.url() === beforeUrl) {
           const btn = page.locator('button:has-text("继续"), button:has-text("Continue")').first();
+          await waitForPageFullyLoaded(page, { log });
           await btn.click({ timeout: 6000 }).catch(() => {});
-          await page.waitForFunction((u) => location.href !== u, beforeUrl, { timeout: 8000 }).catch(() => {});
+          outcome = await waitForLoginPasswordOutcome(page, beforeUrl, { timeoutMs: 5000 });
+          if (outcome === 'rejected') {
+            passwordRejected = true;
+            log('登录 · 密码或邮箱错误，改为重设密码');
+            break;
+          }
         }
         passwordSubmitted = page.url() !== beforeUrl;
         if (!passwordSubmitted && await clickRetryIfError(page, log)) {
-          // 密码提交后偶发限流/网络异常页 → 点重试后重判是否已前进
-          await page.waitForFunction((u) => location.href !== u, beforeUrl, { timeout: 6000 }).catch(() => {});
+          outcome = await waitForLoginPasswordOutcome(page, beforeUrl, { timeoutMs: 3500 });
+          if (outcome === 'rejected') {
+            passwordRejected = true;
+            log('登录 · 密码或邮箱错误，改为重设密码');
+            break;
+          }
           passwordSubmitted = page.url() !== beforeUrl;
         }
-        if (!passwordSubmitted && attempt < 3) {
-          // 密码明确错误（有报错文案）→ 不再重试，直接走忘记密码
-          const wrongPwd = await page.evaluate(() => /密码.*(不正确|错误|无效)|incorrect|invalid password|wrong password/i.test(document.body.innerText || '')).catch(() => false);
-          if (wrongPwd) { log('登录3：密码明确不正确，转忘记密码'); break; }
-          log('登录3：提交未生效，reload 重试');
-          await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
-          await sleep(2000);
+        if (!passwordSubmitted && !passwordRejected) {
+          if (await isLoginPasswordRejected(page)) {
+            passwordRejected = true;
+            log('登录 · 密码或邮箱错误，改为重设密码');
+            break;
+          }
+          if (attempt < 3) {
+            log('登录 · 提交无响应，刷新页面后重试');
+            await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
+            await sleep(2000);
+          }
         }
       }
-      log(passwordSubmitted ? '登录3：密码已提交，页面已前进' : '登录3：密码提交多次未生效');
+      if (passwordSubmitted) {
+        log('登录 · 密码已提交，等待下一步');
+      } else if (!passwordRejected) {
+        log('登录 · 密码多次提交未生效');
+      }
     } else {
-      log('登录3：密码页但无密码，尝试改用验证码登录');
+      log('登录 · 未提供密码，改为邮箱验证码登录');
       await humanClickByText(page, ['改用验证码', '使用验证码', '通过电子邮件', 'email a code', 'send code', '发送验证码', 'use a code', 'verification code'], { timeout: 6000, exclude: OAUTH_EXCLUDE }).catch(() => {});
     }
     // 密码未提交成功且没进到收码页 → 忘记密码重设兜底
     if (!passwordSubmitted) {
       const otpReady = await firstVisible(page, `${S.CODE_INPUT}, ${S.CODE_INPUT_SEGMENTED}`, { timeout: 8000 });
       if (!otpReady && !isLoggedInUrl(page.url())) {
-        log('登录3b：无密码/密码错/无 OTP 入口，走"忘记密码"重设流程');
+        log('登录 · 密码登录失败，改为重设密码');
         resetPassword = await forgotPasswordFlow({ page, email, requestCode, log, recorder });
       }
     }
@@ -643,16 +956,16 @@ export async function loginChatGPT({ page, email, chatgptUrl = 'https://chatgpt.
     ? null
     : await firstVisible(page, `${S.CODE_INPUT}, ${S.CODE_INPUT_SEGMENTED}`, { timeout: 60000 });
   if (codeReady) {
-    log('登录4：收码页就绪，取码填码');
-    const code = await requestCode('login');
+    log('登录 · 等待邮箱验证码');
+    const code = await requestCodeWithResend(page, requestCode, log, { purpose: 'login' });
     await fillCode(page, code, log);
     await submitCodeForm(page, log, { code });
     await sleep(4000);
     for (let r = 1; r <= 2; r += 1) {
       if (!(await isOnCodePage(page))) break;
-      log(`登录4：仍在收码页，点重新发送取新码（第 ${r} 轮）`);
+      log(`登录 · 重新发送验证码，第 ${r} 次`);
       await humanClickByText(page, ['重新发送电子邮件', '重新发送', 'resend email', 'resend'], { timeout: 6000, exclude: OAUTH_EXCLUDE }).catch(() => {});
-      const c2 = await requestCode('login');
+      const c2 = await requestCodeWithResend(page, requestCode, log, { purpose: 'login' });
       await fillCode(page, c2, log);
       await submitCodeForm(page, log, { code: c2 });
       await sleep(4000);
@@ -660,14 +973,14 @@ export async function loginChatGPT({ page, email, chatgptUrl = 'https://chatgpt.
     // 邮箱码之后可能再要 2FA（部分账号先邮箱验证再验证器）
     await handleLoginTotpPrompt(page, totpSecret, requestCode, log);
   } else {
-    log('登录4：未见邮箱收码页（已登录/已处理2FA/密码直登）');
+    log('登录 · 无需邮箱验证码，继续下一步');
   }
 
   await waitForSuccess(page, log, 90000);
   let t = await readAccessToken(page);
   for (let i = 0; i < 5 && !t.accessToken; i += 1) { await sleep(2000); t = await readAccessToken(page); }
   if (!t.accessToken) throw new Error(`登录后未取到 accessToken：${t.error || '未知'}`);
-  log(`登录成功，已取到 accessToken${resetPassword ? '（经忘记密码重设，新密码已生成）' : ''}`);
+  log(resetPassword ? '登录成功，已获取登录凭证，密码已重设' : '登录成功，已获取登录凭证');
   await mark('login-done', '登录成功，已取 token');
   return { accessToken: t.accessToken, user: t.user, expires: t.expires, resetPassword };
 }
@@ -694,7 +1007,7 @@ async function isMfaEmailChallenge(page) {
 async function tryLoginMfaEmailFallback(page, requestCode, log) {
   if (typeof requestCode !== 'function') return false;
   await snapshot(page, 'login-2fa-no-secret', log);
-  log('登录5：检测到 2FA 验证器页，但本地无 TOTP 密钥，尝试改用邮箱验证码');
+  log('登录 · 需要双重验证，本地无验证器密钥，改为邮箱验证码');
 
   const emailTexts = [
     '电子邮件', '通过电子邮件', '使用邮箱', '邮箱验证码', '发送电子邮件', '发送验证码', '发送邮件',
@@ -711,7 +1024,7 @@ async function tryLoginMfaEmailFallback(page, requestCode, log) {
     if (!clicked) {
       clicked = await humanClickByText(page, switchTexts, { timeout: 5000, exclude: OAUTH_EXCLUDE }).catch(() => null);
       if (clicked) {
-        log(`登录5：已点击 2FA 备用方式「${clicked}」，查找邮箱验证码入口`);
+        log(`登录 · 已切换到邮箱验证：${clicked}`);
         await sleep(1200);
         // 点"其他方法"后弹出方式选择页（含"电子邮件"选项），选它切到邮箱收码页。
         const emailClicked = await humanClickByText(page, emailTexts, { timeout: 6000, exclude: OAUTH_EXCLUDE }).catch(() => null);
@@ -719,7 +1032,7 @@ async function tryLoginMfaEmailFallback(page, requestCode, log) {
       }
     }
     if (clicked) {
-      log(`登录5：已点击 2FA 邮箱验证入口「${clicked}」（第 ${round} 轮）`);
+      log(`登录 · 已选择邮箱验证：${clicked}，第 ${round} 次`);
       // 等页面跳转到 email-otp 收码页再复检；已到位立刻结束循环，避免把自己从收码页又点走。
       for (let w = 0; w < 6; w += 1) {
         await sleep(800);
@@ -736,17 +1049,31 @@ async function tryLoginMfaEmailFallback(page, requestCode, log) {
     return false;
   }
 
-  log('登录5：2FA 已切换为邮箱验证码，取码并填写');
-  const code = await requestCode('login');
-  await fillCode(page, code, log);
-  await submitCodeForm(page, log, { code });
-  await sleep(2500);
+  log('登录 · 等待邮箱验证码完成双重验证');
+  for (let round = 1; round <= 3; round += 1) {
+    const code = await requestCodeWithResend(page, requestCode, log, { purpose: 'login' });
+    await fillCode(page, code, log);
+    await submitCodeForm(page, log, { code });
+    await sleep(2500);
 
-  // 浏览器错误页（submitCodeForm 已尝试刷新+重填）后仍停在收码页 → 不当作"验证码无效"，交给上层继续
-  if (isChromeErrorUrl(page.url()) || await isMfaEmailChallenge(page)) return true;
-  const text = await pageText(page);
-  if (S.INVALID_CODE_PATTERN.test(text)) throw new Error('2FA 邮箱验证码无效');
-  return true;
+    if (isChromeErrorUrl(page.url())) continue;
+    if (!(await isMfaEmailChallenge(page))) return true;
+
+    if (!(await detectInvalidCode(page))) {
+      await sleep(2000);
+      if (!(await isMfaEmailChallenge(page))) return true;
+    }
+
+    if (round < 3) {
+      log(`登录 · 2FA 邮箱验证码无效或仍停在收码页，重新发送，第 ${round} 次`);
+      await humanClickByText(page, ['重新发送电子邮件', '重新发送', 'resend email', 'resend'], { timeout: 6000, exclude: OAUTH_EXCLUDE }).catch(() => {});
+      await sleep(1500);
+      continue;
+    }
+    if (await detectInvalidCode(page)) throw new Error('2FA 邮箱验证码无效');
+    throw new Error('2FA 邮箱验证码提交后仍停在收码页');
+  }
+  return false;
 }
 
 // 登录时若弹出"输入验证器验证码"(2FA TOTP)页，用 secret 生成 6 位码填入；
@@ -783,18 +1110,23 @@ async function handleLoginTotpPrompt(page, totpSecret, requestCode, log) {
 
     await snapshot(page, 'login-2fa-page', log);
     const code = generateTotpNow(totpSecret);
-    log(`登录5：检测到 2FA 验证器页，用 secret 生成 TOTP 填入`);
+    log(`登录 · 填写验证器验证码：${code}`);
     const before = page.url();
     // 2FA 页输入框：#totp_otp 或 name=code（inputmode=numeric），优先具体选择器
     const totpInput = await firstVisible(page, '#totp_otp, input[name="totp_otp"], input[name="code"][inputmode="numeric"], input[name="code"]', { timeout: 3000 });
-    if (totpInput) { await humanType(totpInput, code); await totpInput.press('Enter').catch(() => {}); }
+    if (totpInput) {
+      await humanType(totpInput, code);
+      await waitForPageFullyLoaded(page, { log });
+      await totpInput.press('Enter').catch(() => {});
+    }
     else await fillCode(page, code, log);
     await page.waitForFunction((u) => location.href !== u, before, { timeout: 5000 }).catch(() => {});
     if (page.url() === before) {
-      await humanClickByText(page, ['继续', 'confirm', 'verify', '确认', '验证', 'continue', 'next', '下一步'], { timeout: 5000, exclude: OAUTH_EXCLUDE }).catch(() => {});
+      await humanClickByText(page, ['继续', 'confirm', 'verify', '确认', '验证', 'continue', 'next', '下一步'], { timeout: 5000, exclude: OAUTH_EXCLUDE, awaitPageLoad: true, log }).catch(() => {});
       await page.waitForFunction((u) => location.href !== u, before, { timeout: 6000 }).catch(() => {});
     }
     if (page.url() === before) {
+      await waitForPageFullyLoaded(page, { log });
       await page.evaluate(() => { const f = document.querySelector('input')?.closest('form'); if (f) (f.requestSubmit ? f.requestSubmit() : f.submit()); }).catch(() => {});
     }
     await sleep(2000);
@@ -818,7 +1150,7 @@ async function handleLoginTotpPrompt(page, totpSecret, requestCode, log) {
   } catch (e) {
     // 明确的 2FA 失败（无密钥 / 密钥不正确）往上抛，让整轮以清晰原因失败；其余异常按原逻辑吞掉
     if (/2FA|totp_secret|验证器|密钥/i.test(String(e && e.message))) throw e;
-    log(`登录5：2FA 处理异常：${e.message}`);
+    log(`登录 · 双重验证处理异常：${e.message}`);
     return false;
   }
 }
@@ -835,11 +1167,13 @@ function resolveStep8Tolerance(partial, passwordOk) {
 // 老账号：登录已注册账号 → 设密码 + 开 2FA → 取 token。复用 loginChatGPT + step8。
 export async function secureExistingChatGPT({ page, email, loginPassword = '', enable2fa = true, forceReset2fa = false, existingTotpSecret = '', chatgptUrl = 'https://chatgpt.com/', requestCode, log, recorder = NOOP_RECORDER }) {
   const newPassword = generatePassword();
+  log(`已有账号 · 生成新密码：${newPassword}`);
+  if (loginPassword) log(`已有账号 · 使用历史密码登录：${loginPassword}`);
 
-  log('老账号1：登录');
+  log('已有账号 · 开始登录');
   const login = await loginChatGPT({ page, email, password: loginPassword, totpSecret: existingTotpSecret, chatgptUrl, requestCode, log, recorder });
 
-  log(`老账号2：设置密码 + ${enable2fa ? (forceReset2fa ? '强制重设' : '开启') : '（跳过）'} TOTP 2FA`);
+  log(`已有账号 · ${enable2fa ? (forceReset2fa ? '重设双重验证' : '开启双重验证') : '跳过双重验证'}，并设置密码`);
   let secure;
   try {
     secure = await step8_setupPasswordAnd2FA(page, { email, password: newPassword, enable2fa, forceReset2fa, existingTotpSecret, requestCode, log, recorder });
@@ -848,7 +1182,7 @@ export async function secureExistingChatGPT({ page, email, loginPassword = '', e
     // 2FA 为可选加固：密码已设成功（含登录阶段忘记密码重设）就按「无 2FA 账号」正常返回，账号照常入池。
     const tolerated = resolveStep8Tolerance(partial, Boolean(login.resetPassword || partial.passwordSet));
     if (tolerated) {
-      log(`老账号2：2FA 未完成但密码已设，容忍 2FA 失败，按无 2FA 账号正常入池：${e.message}`, 'yellow');
+      log(`已有账号 · 双重验证未完成，密码已设置，按普通账号保存：${e.message}`, 'yellow');
       secure = tolerated;
     } else {
       e._partial = {
@@ -891,33 +1225,65 @@ export async function secureExistingChatGPT({ page, email, loginPassword = '', e
 // 若检测到「邮箱已注册」，返回 { emailExists:true } 让 worker 分流到 secureExistingChatGPT。
 export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatgpt.com/', enable2fa = true, requestCode, log, recorder = NOOP_RECORDER }) {
   const password = generatePassword();
+  log(`已生成注册密码：${password}`);
   const { firstName, lastName } = generateRandomName();
   const birthday = generateRandomBirthday();
   const mark = (id, note) => recorder.record(id, { note }).catch(() => {});
 
-  log('步骤1：打开 ChatGPT 官网');
+  log('注册 · 打开 ChatGPT 官网');
   await openWithRetry(page, chatgptUrl, log);
-  await sleep(3000);
+  await waitForHomeReady(page);
   await mark('register-01-home', '已打开官网');
 
-  log('步骤2：进入注册入口');
-  let emailInput = await firstVisible(page, S.EMAIL_INPUT, { timeout: 2500 });
-  for (let attempt = 1; attempt <= 3 && !emailInput; attempt += 1) {
-    const clicked = await humanClickByText(page, [
-      '免费注册', 'sign up for free', 'sign up', '注册', '登録', 'get started', 'create account', 'create',
-    ], { timeout: 15000 });
-    log(`步骤2：模拟点击注册入口「${clicked || '未命中'}」（第 ${attempt} 次），等待邮箱输入框弹出…`);
-    await mark(`register-02a-after-signup-click-${attempt}`, `点注册入口「${clicked || '未命中'}」后`);
-    emailInput = await firstVisible(page, S.EMAIL_INPUT, { timeout: 22000 });
-    if (!emailInput) {
-      // 主界面/主聊天页点"免费注册"常先弹「登录方式」弹窗（Google/Apple/邮箱/电话），需再点"使用邮箱"。
-      const em = await humanClickByText(page, [
-        'continue with email', 'use email', 'email', '使用邮箱', 'メールで続ける',
-        '通过电子邮件', '继续使用电子邮件', '使用电子邮件', '电子邮件地址', '用邮箱继续',
-      ], { timeout: 6000, exclude: OAUTH_EXCLUDE });
-      await mark(`register-02b-after-use-email-${attempt}`, `点「使用邮箱」兜底「${em || '未命中'}」后`);
-      emailInput = await firstVisible(page, S.EMAIL_INPUT, { timeout: 10000 });
+  log('注册 · 进入注册入口');
+  const step2Deadline = Date.now() + 90000;
+  let emailInput = await waitForHomeSideAuthEmailInput(page, { timeout: capTimeout(10000, step2Deadline) });
+  if (emailInput) {
+    log('注册 · 检测到注册面板，直接填写邮箱');
+  } else {
+    emailInput = await waitForAuthEmailInput(page, { timeout: capTimeout(2500, step2Deadline) });
+    let missStreak = 0;
+    for (let attempt = 1; attempt <= 2 && !emailInput && remainingMs(step2Deadline) > 0; attempt += 1) {
+      const clicked = await clickHomeAuthButton(page, {
+        testId: S.SIGNUP_BUTTON_TESTID,
+        texts: ['免费注册', 'sign up for free', 'sign up', '注册', '登録', 'get started', 'create account'],
+      });
+      if (!clicked) missStreak += 1;
+      else missStreak = 0;
+      log(`注册 · 点击注册入口，第 ${attempt} 次尝试`);
+      await mark(`register-02a-after-signup-click-${attempt}`, `点注册入口「${clicked || '未命中'}」后`);
+      // 未命中入口时不必长等弹窗；点中后再给稍长窗口
+      const popupWait = clicked ? 12000 : 4000;
+      emailInput = await waitForAuthEmailInput(page, { timeout: capTimeout(popupWait, step2Deadline) });
+      if (!emailInput && clicked) {
+        // 按钮已点中但弹窗未出：再试一轮多策略点击（常见于 hydrate 未完成只拿到焦点）
+        log('注册 · 注册按钮已点击，等待邮箱输入框出现');
+        await clickHomeAuthButton(page, {
+          testId: S.SIGNUP_BUTTON_TESTID,
+          texts: ['免费注册', 'sign up for free', 'sign up', '注册'],
+        });
+        emailInput = await waitForAuthEmailInput(page, { timeout: capTimeout(8000, step2Deadline) });
+      }
+      if (!emailInput) {
+        const em = await humanClickByText(page, [
+          'continue with email', 'use email', '使用邮箱', 'メールで続ける',
+          '通过电子邮件', '继续使用电子邮件', '使用电子邮件', '电子邮件地址', '用邮箱继续',
+        ], { timeout: capTimeout(4000, step2Deadline), exclude: OAUTH_EXCLUDE });
+        await mark(`register-02b-after-use-email-${attempt}`, `点「使用邮箱」兜底「${em || '未命中'}」后`);
+        emailInput = await waitForAuthEmailInput(page, { timeout: capTimeout(8000, step2Deadline) });
+      }
+      if (!emailInput && missStreak >= 2) {
+        log('注册 · 首页未找到注册入口，跳转到登录页');
+        break;
+      }
     }
+  }
+  if (!emailInput) {
+    log('注册 · 首页未出现邮箱框，跳转到注册页');
+    const gotoMs = capTimeout(45000, step2Deadline) || 15000;
+    await page.goto('https://auth.openai.com/log-in', { waitUntil: 'domcontentloaded', timeout: gotoMs }).catch(() => {});
+    await waitForAuthReady(page);
+    emailInput = await waitForAuthEmailInput(page, { timeout: capTimeout(20000, step2Deadline) || 10000 });
   }
   if (!emailInput) {
     await snapshot(page, 'no-email-input', log);
@@ -925,10 +1291,8 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
     throw new Error('未找到邮箱输入框');
   }
 
-  await humanType(emailInput, email);
-  log(`步骤2：已填写邮箱 ${email}`);
-  await humanClickByText(page, S.CONTINUE_TEXTS, { timeout: 12000, exclude: OAUTH_EXCLUDE });
-  log('步骤2：已点击「继续」，等待 OpenAI 处理并跳转（按钮可能先 loading）…');
+  await fillAuthEmailAndContinue(page, emailInput, email, log);
+  log('注册 · 已提交邮箱，等待页面跳转');
 
   const landing = await waitForPostEmailLanding(page, log, { timeoutMs: 120000 });
   await mark('register-02-post-email', `邮箱提交后 landing=${landing}`);
@@ -936,7 +1300,7 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
   // 邮箱已存在检测：不再抛错，返回标记让 worker 走"老账号"分流
   const afterEmailText = await pageText(page);
   if (S.EMAIL_EXISTS_PATTERN.test(afterEmailText)) {
-    log('步骤2：检测到邮箱已注册（页面文案），转入老账号（登录→按需忘记密码）流程');
+    log('注册 · 该邮箱已注册，改为登录并加固账号');
     return { emailExists: true };
   }
 
@@ -946,48 +1310,47 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
   if (landing === 'password') {
     const st = await detectAuthState(page);
     if (st.pageState === PAGE_STATE.EXISTING_PASSWORD_LOGIN) {
-      log(`步骤2：状态机判定为登录密码页（邮箱已注册，${st.confidence}/${st.reason}），转入老账号流程，URL=${page.url()}`);
+      log('注册 · 该邮箱已注册，改为登录并加固账号');
       return { emailExists: true };
     }
   }
 
   // 步骤3：密码（仅当跳转到密码页时才填；很多流程 email 后直接发码、无密码页）
   if (landing === 'password') {
-    log('步骤3：已进入密码页，填写密码');
+    log(`注册 · 填写注册密码：${password}`);
     const pwdInput = await firstVisible(page, S.PASSWORD_INPUT, { timeout: 15000 });
     if (pwdInput) {
       await humanType(pwdInput, password);
-      await humanClickByText(page, S.CONTINUE_TEXTS, { timeout: 12000, exclude: OAUTH_EXCLUDE });
-      log('步骤3：密码已提交，等待跳转到验证码页（按钮可能先 loading）…');
+      await humanClickByText(page, S.CONTINUE_TEXTS, { timeout: 12000, exclude: OAUTH_EXCLUDE, awaitPageLoad: true, log });
+      log('注册 · 密码已提交，等待验证码页');
       await waitForCodePage(page, log, { timeoutMs: 120000 });
     }
   } else {
-    log('步骤3：本流程 email 后直接进入验证码页，跳过密码步骤');
+    log('注册 · 跳过密码步骤，直接进入验证码页');
   }
 
   // 步骤4：验证码——先确认已在验证码页（跳转完成），再向 Python 请求验证码
-  log('步骤4：确认验证码页已就绪');
+  log('注册 · 等待验证码输入页');
   const codeReady = await firstVisible(page, `${S.CODE_INPUT}, ${S.CODE_INPUT_SEGMENTED}`, { timeout: 60000 });
   if (!codeReady) {
     await snapshot(page, 'no-code-page', log);
     throw new Error('点击继续后未跳转到验证码输入页（可能仍在 loading 或出现异常）');
   }
-  log('步骤4：验证码页已就绪，开始取码并填写');
-  const code = await requestCode('register');
+  log('注册 · 开始填写邮箱验证码');
+  const code = await requestCodeWithResend(page, requestCode, log, { purpose: 'register' });
   await fillCode(page, code, log);
-  await humanClickByText(page, S.CONTINUE_TEXTS, { timeout: 10000, exclude: OAUTH_EXCLUDE });
+  await humanClickByText(page, S.CONTINUE_TEXTS, { timeout: 10000, exclude: OAUTH_EXCLUDE, awaitPageLoad: true, log });
   await sleep(3000);
   // 提交后落到浏览器错误页 → 刷新重填同码再提交（否则会被误判为"验证码无效"）
   if (await recoverFromChromeError(page, log) && await hasVisibleCodeInput(page)) {
-    log('步骤4：验证码提交遇浏览器错误页，刷新后重填同码重试', 'warn');
+    log('注册 · 页面加载异常，刷新后重新填写验证码', 'warn');
     await fillCode(page, code, log);
     await submitCodeForm(page, log, { code });
     await sleep(3000);
   }
   await mark('register-04-code-filled', '注册验证码已填');
 
-  const afterCodeText = await pageText(page);
-  if (!isChromeErrorUrl(page.url()) && S.INVALID_CODE_PATTERN.test(afterCodeText)) {
+  if (!isChromeErrorUrl(page.url()) && await detectInvalidCode(page)) {
     throw new Error('验证码无效');
   }
 
@@ -995,12 +1358,12 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
   // 转 worker 的老账号加固分流（登录已登录态 → 设密码 → 2FA），避免误当新号在 step8 反复撞设密码坑。
   const branch = await detectPostCodeBranch(page, log, { timeoutMs: 20000 });
   if (branch === 'existing') {
-    log('步骤5：验证码后无资料页且已在主界面 → 判定为「邮箱已验证的无密码老号」（OTP 登录），转老账号加固流程');
+    log('注册 · 该邮箱已验证，改为登录并加固账号');
     return { emailExists: true };
   }
 
   // 步骤5：资料（姓名 + 生日）
-  log('步骤5：填写姓名与生日');
+  log('注册 · 填写姓名和生日');
   await fillProfile(page, { firstName, lastName, birthday }, log);
   await checkConsentIfAny(page, log);
 
@@ -1008,33 +1371,32 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
     '完成账户创建', '完成帐户创建', '完成', '创建账号', '创建帐户', '创建账户',
     'create account', 'finish', 'done', 'agree', "i'm 18", '同意', '继续', 'continue', 'next', '下一步',
   ];
-  const submitted = await humanClickByText(page, submitTexts, { timeout: 12000, exclude: OAUTH_EXCLUDE });
-  log(`步骤5：已点击资料提交按钮「${submitted || '未命中'}」`);
+  const submitted = await humanClickByText(page, submitTexts, { timeout: 12000, exclude: OAUTH_EXCLUDE, awaitPageLoad: true, log });
+  log('注册 · 已提交个人资料');
   await sleep(3000);
   await mark('register-05-profile-submitted', '资料已提交');
 
-  await humanClickByText(page, ['agree', 'continue', '同意', '继续', 'okay', 'ok', 'got it', 'stay logged out'], { timeout: 6000, exclude: OAUTH_EXCLUDE }).catch(() => {});
+  await humanClickByText(page, ['agree', 'continue', '同意', '继续', 'okay', 'ok', 'got it', 'stay logged out'], { timeout: 6000, exclude: OAUTH_EXCLUDE, awaitPageLoad: true, log }).catch(() => {});
 
   // 步骤5.5：资料提交后可能被打回"二次邮箱验证"（auth.openai.com/email-verification）。
   for (let round = 1; round <= 2; round += 1) {
     const onCodePage = await isOnCodePage(page);
     if (!onCodePage) break;
-    log(`步骤5.5：检测到二次验证码页（第 ${round} 轮），点击重新发送以获取新码`);
+    log(`注册 · 需要再次验证邮箱，第 ${round} 次`);
     await humanClickByText(page, ['重新发送电子邮件', '重新发送', 'resend email', 'resend', '重新发送邮件'], { timeout: 6000, exclude: OAUTH_EXCLUDE }).catch(() => {});
-    const code2 = await requestCode('register');
+    const code2 = await requestCodeWithResend(page, requestCode, log, { purpose: 'register' });
     await fillCode(page, code2, log);
     await submitCodeForm(page, log, { code: code2 });
     await sleep(4000);
-    const bad = await pageText(page);
-    if (!isChromeErrorUrl(page.url()) && S.INVALID_CODE_PATTERN.test(bad)) throw new Error('二次验证码无效');
+    if (!isChromeErrorUrl(page.url()) && await detectInvalidCode(page)) throw new Error('二次验证码无效');
   }
 
   // 步骤6：等待注册成功
-  log('步骤6：等待注册完成');
+  log('注册 · 等待注册完成');
   await waitForSuccess(page, log);
 
   // 步骤7：读取 accessToken
-  log('步骤7：读取 accessToken');
+  log('注册 · 获取登录凭证');
   let tokenResult = await readAccessToken(page);
   for (let i = 0; i < 5 && !tokenResult.accessToken; i += 1) {
     await sleep(2000);
@@ -1043,11 +1405,11 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
   if (!tokenResult.accessToken) {
     throw new Error(`注册流程走完但未取到 accessToken：${tokenResult.error || '未知'}`);
   }
-  log('已获取 accessToken');
+  log('注册 · 已获取登录凭证');
   await mark('register-06-token', '已取到 accessToken，准备 step8');
 
   // 步骤8：设置密码（必须成功）+ 开启 TOTP 2FA（可选加固，失败可容忍、不影响账号入池）
-  log(`步骤8：设置密码${enable2fa ? ' + 开启 TOTP 2FA' : '（2FA 已关闭，跳过）'}`);
+  log(enable2fa ? '注册 · 设置账号密码并开启双重验证' : '注册 · 设置账号密码');
   let secure;
   try {
     secure = await step8_setupPasswordAnd2FA(page, { email, password, enable2fa, requestCode, log, recorder });
@@ -1057,7 +1419,7 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
     // 只有连密码都没设成才算 step8 失败，走异常清单分流。
     const tolerated = resolveStep8Tolerance(partial, Boolean(partial.passwordSet));
     if (tolerated) {
-      log(`步骤8：2FA 未完成但密码已设，容忍 2FA 失败，按无 2FA 账号正常入池：${e.message}`, 'yellow');
+      log(`注册 · 双重验证未完成，密码已设置，按普通账号保存：${e.message}`, 'yellow');
       secure = tolerated;
     } else {
       e._partial = {
@@ -1098,7 +1460,8 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
 
 async function fillCode(page, code, log) {
   code = String(code == null ? '' : code).replace(/\s+/g, '');
-  if (!code) { log('验证码为空，跳过填码', 'warn'); return; }
+  if (!code) { log('验证码为空，跳过填写', 'warn'); return; }
+  log(`填写验证码：${code}`);
   const segmented = page.locator(S.CODE_INPUT_SEGMENTED);
   const segCount = await segmented.count().catch(() => 0);
 
@@ -1122,10 +1485,10 @@ async function fillCode(page, code, log) {
         await sleep(60 + Math.floor(Math.random() * 90));
       }
       const got = await readSegments();
-      if (got === code) { log('已按分格输入验证码（读回校验通过）'); return; }
-      log(`分格验证码校验不符：填入「${got}」≠ 期望「${code}」，第 ${attempt}/3 轮清空重填`, 'warn');
+      if (got === code) { log('验证码填写完成'); return; }
+      log(`验证码填写不完整，期望 ${code}，实际 ${got}，第 ${attempt}/3 次重试`, 'warn');
     }
-    log(`分格验证码 3 轮仍不符（期望「${code}」），按当前值继续`, 'warn');
+    log(`验证码多次填写仍不完整，期望 ${code}，继续提交`, 'warn');
     return;
   }
 
@@ -1135,16 +1498,16 @@ async function fillCode(page, code, log) {
     let got = '';
     try { got = String((await single.inputValue()) || '').replace(/\s+/g, ''); } catch { /* 无 inputValue 能力时跳过校验 */ }
     if (got && got !== code) {
-      log(`单框验证码校验不符：填入「${got}」≠ 期望「${code}」，用 fill 重置`, 'warn');
+      log(`验证码填写异常，期望 ${code}，实际 ${got}，重新填写`, 'warn');
       await single.fill('').catch(() => {});
       await single.fill(code).catch(() => {});
     }
-    log('已模拟输入验证码');
+    log('验证码填写完成');
     return;
   }
 
   await page.keyboard.type(code, { delay: 80 });
-  log('已通过键盘输入验证码');
+  log('验证码填写完成');
 }
 
 // 提交验证码表单：先在框内按 Enter，再点"继续"兜底，最后原生 form.requestSubmit()。
@@ -1172,7 +1535,7 @@ async function clickRetryIfError(page, log, { max = 3, cooldownMs = 4000 } = {})
     if (!found) break;
     await page.click('[data-reg-retry="1"]', { timeout: 4000 }).catch(() => {});
     await page.evaluate(() => document.querySelector('[data-reg-retry]')?.removeAttribute('data-reg-retry')).catch(() => {});
-    log(`检测到异常页${found.rate ? '(请求超限 rate_limit)' : '(网络/其它)'}，已点「重试」（第 ${i + 1}/${max} 次）`, 'warn');
+    log(`检测到请求受限，已点击重试，第 ${i + 1}/${max} 次`, 'warn');
     did = true;
     await sleep(found.rate ? cooldownMs * 2 : cooldownMs); // 限流多等一会
   }
@@ -1193,7 +1556,7 @@ async function recoverFromChromeError(page, log, { max = 3 } = {}) {
     let u = '';
     try { u = page.url(); } catch { u = ''; }
     if (!isChromeErrorUrl(u)) break;
-    log(`检测到浏览器加载错误页（${u}），刷新重试（第 ${i + 1}/${max} 次）`, 'warn');
+    log(`页面加载失败，正在刷新，第 ${i + 1}/${max} 次`, 'warn');
     await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
     did = true;
     await sleep(2500);
@@ -1216,6 +1579,7 @@ async function hasVisibleCodeInput(page) {
 // 最多 retries 轮。不传 code 时退化为原行为（仅提交，不自愈）。
 async function submitCodeForm(page, log, { code = '', retries = 2 } = {}) {
   for (let attempt = 0; ; attempt += 1) {
+    await waitForPageFullyLoaded(page, { log });
     const before = page.url();
     try {
       const codeInput = page.locator(`${S.CODE_INPUT}, ${S.CODE_INPUT_SEGMENTED}`).last();
@@ -1239,7 +1603,7 @@ async function submitCodeForm(page, log, { code = '', retries = 2 } = {}) {
     // 浏览器加载错误页 → 刷新；若仍在收码页且手里有码，重填同码再走一轮提交
     if (attempt < retries && await recoverFromChromeError(page, log)) {
       if (code && await hasVisibleCodeInput(page)) {
-        log(`验证码提交遇浏览器错误页，刷新后重填同码重试（第 ${attempt + 1}/${retries}）`, 'warn');
+        log(`验证码提交后页面异常，刷新后重新填写，第 ${attempt + 1}/${retries} 次`, 'warn');
         await fillCode(page, code, log);
         continue;
       }
@@ -1250,7 +1614,7 @@ async function submitCodeForm(page, log, { code = '', retries = 2 } = {}) {
   if (await clickRetryIfError(page, log)) {
     await sleep(1500);
   }
-  log('已提交验证码表单');
+  log('验证码已提交');
 }
 
 async function hasLeftCodePage(page, beforeUrl) {
@@ -1325,6 +1689,11 @@ export const __test = {
   isChromeErrorUrl,
   recoverFromChromeError,
   submitCodeForm,
+  requestCodeWithResend,
+  clickResendVerificationCode,
+  waitForPageFullyLoaded,
+  isLoginPasswordRejected,
+  waitForLoginPasswordOutcome,
 };
 
 async function checkConsentIfAny(page, log) {
@@ -1346,7 +1715,7 @@ async function checkConsentIfAny(page, log) {
       }
       return n;
     });
-    if (checked) log(`步骤5：已勾选 ${checked} 个同意复选框`);
+    if (checked) log(`注册 · 已勾选 ${checked} 项同意条款`);
   } catch { /* ignore */ }
 }
 
@@ -1355,22 +1724,25 @@ async function waitForSuccess(page, log, timeoutMs = 120000) {
   let lastUrl = '';
   while (Date.now() < deadline) {
     const url = page.url();
-    if (url !== lastUrl) { log(`当前页面：${url}`); lastUrl = url; }
+    if (url !== lastUrl) {
+      try { log(`当前页面：${new URL(url).pathname}`); } catch { log(`当前页面：${url}`); }
+      lastUrl = url;
+    }
     const text = await pageText(page);
     if (S.SUCCESS_TEXTS.some((t) => text.includes(t))) {
-      log('检测到主界面文案，注册成功');
+      log('注册 · 已进入主界面，注册完成');
       return true;
     }
     if (isLoggedInUrl(url)) {
       const t = await readAccessToken(page);
       if (t.accessToken) {
-        log('会话已建立，注册成功');
+        log('注册 · 登录状态已建立，注册完成');
         return true;
       }
     }
     await sleep(2500);
   }
-  log('等待注册成功超时，仍尝试读取 token');
+  log('注册 · 等待完成超时，继续尝试获取登录凭证');
   await snapshot(page, 'wait-success-timeout', log);
   return false;
 }
@@ -1456,12 +1828,12 @@ async function dismissWelcomeOverlays(page, log) {
     if (await detect()) { appeared = true; break; }
     await sleep(800);
   }
-  if (!appeared) { log('步骤8：未见欢迎插页，直接打开设置'); return; }
+  if (!appeared) { log('安全设置 · 打开账号设置'); return; }
 
   for (let i = 0; i < 4; i += 1) {
     if (!(await detect())) break;
     const hit = await humanClickByText(page, texts, { timeout: 3000, exclude: OAUTH_EXCLUDE }).catch(() => null);
-    log(`步骤8：关闭欢迎插页「${hit || '未命中'}」（第 ${i + 1} 轮）`);
+    log(`安全设置 · 关闭欢迎提示，第 ${i + 1} 次`);
     if (!hit) break;
     await sleep(1500);
   }
@@ -1474,7 +1846,7 @@ async function openSettings(page, log) {
     const btns = [...document.querySelectorAll('button')].filter(vis);
     return btns.find((b) => { const r = b.getBoundingClientRect(); return r.bottom > window.innerHeight - 130 && r.left < 300; }) || null;
   });
-  log(`步骤8：点击账户按钮「${opened || '未命中(试文案兜底)'}」`);
+  log('安全设置 · 打开账号菜单');
   if (!opened) {
     await humanClickByText(page, ['打开个人资料菜单', 'open profile menu', 'user menu', 'profile menu', 'account menu'], { timeout: 6000 }).catch(() => {});
   }
@@ -1483,7 +1855,7 @@ async function openSettings(page, log) {
   await sleep(2500);
   // 兜底：账户菜单/设置项点击不稳时，设置弹窗为 hash 路由（chatgpt.com/#settings），直接直达。
   if (!(await settingsDialogOpen(page))) {
-    log('步骤8：菜单未打开设置弹窗，改用 #settings 直达');
+    log('安全设置 · 直接进入设置页');
     await page.evaluate(() => { window.location.hash = 'settings'; }).catch(() => {});
     await sleep(2800);
   }
@@ -1530,7 +1902,7 @@ async function waitForSecurityTabReady(page, { timeout = 20000 } = {}) {
 // 打开设置并进入安全tab，带重试逻辑
 async function openSecurityTab(page, log, { maxRetries = 3 } = {}) {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    log(`步骤8：尝试打开安全tab（第 ${attempt}/${maxRetries} 次）`);
+    log(`安全设置 · 打开安全选项，第 ${attempt}/${maxRetries} 次尝试`);
 
     // 打开设置
     await openSettings(page, log);
@@ -1542,21 +1914,21 @@ async function openSecurityTab(page, log, { maxRetries = 3 } = {}) {
     if (!secTab) {
       secTab = await humanClickByText(page, ['账户安全与登录', '帐户安全与登录', 'account security & sign in'], { timeout: 6000 }).catch(() => null);
     }
-    log(`步骤8：点击安全tab「${secTab || '未命中'}」`);
+    log('安全设置 · 点击安全选项');
     await sleep(1800);
 
     // 检测是否真正切换成功
     const ready = await waitForSecurityTabReady(page, { timeout: 20000 });
     if (ready) {
-      log(`步骤8：安全tab已成功打开（第 ${attempt} 次尝试）`);
+      log(`安全设置 · 已进入安全页面，第 ${attempt} 次尝试成功`);
       return true;
     }
 
-    log(`步骤8：安全tab未正确显示（第 ${attempt} 次），密码设置元素未出现`);
+    log(`安全设置 · 安全页面未加载完成，第 ${attempt} 次重试`);
 
     // 如果不是最后一次尝试，则刷新页面重试
     if (attempt < maxRetries) {
-      log('步骤8：刷新页面准备重试');
+      log('安全设置 · 刷新页面后重试');
       await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
       await sleep(3000);
       await dismissWelcomeOverlays(page, log);
@@ -1570,7 +1942,7 @@ async function openSecurityTab(page, log, { maxRetries = 3 } = {}) {
 async function disable2fa(page, oldSecret, log) {
   let hit = await clickMarked(page, findRowSwitch, { kw: 'authenticator|验证器应用|身份验证器' });
   if (!hit) hit = await humanClickByText(page, ['authenticator app', 'authenticator', '身份验证器', '验证器应用'], { timeout: 4000 }).catch(() => null);
-  log(`步骤8：点击停用 2FA 开关「${hit || '未命中'}」`);
+  log(`安全设置 · 点击关闭双重验证`);
   await sleep(2000);
   await dumpUi(page, '04c0-disable-dialog', log);
 
@@ -1582,7 +1954,7 @@ async function disable2fa(page, oldSecret, log) {
     }).catch(() => false);
     if (needTotp && oldSecret) {
       const code = generateTotpNow(oldSecret);
-      log(`步骤8：停用需当前验证器码，用旧 secret 生成 TOTP`);
+      log('安全设置 · 填写验证器验证码以关闭双重验证');
       const inp = await firstVisible(page, '#totp_otp, input[name="totp_otp"], input[inputmode="numeric"], input[type="text"]', { timeout: 3000 });
       if (inp) await humanType(inp, code);
     }
@@ -1599,7 +1971,7 @@ async function disable2fa(page, oldSecret, log) {
       }
       return false;
     }).catch(() => false);
-    log(`步骤8：停用尝试 ${r + 1}「${c || '无按钮'}」→ ${off ? '已关闭' : '仍开启'}`);
+    log(`安全设置 · 关闭双重验证，第 ${r + 1} 次尝试，${off ? '已关闭' : '仍开启'}`);
     if (off) return true;
   }
   return false;
@@ -1648,7 +2020,7 @@ async function step8_setupPasswordAnd2FA(page, { email, password, enable2fa = tr
 
     await dismissWelcomeOverlays(page, log);
 
-    log('步骤8：打开设置并进入安全tab');
+    log('安全设置 · 打开设置并进入安全页面');
     await openSecurityTab(page, log);
     await dumpUi(page, '02-security', log);
     await mark('step8-01-security', '已进入安全tab');
@@ -1656,22 +2028,22 @@ async function step8_setupPasswordAnd2FA(page, { email, password, enable2fa = tr
     // —— 设密码 ——（幂等：已设过则跳过。老号登录后密码常已存在，用鲁棒检测识别，命中即不走添加流程）
     const pwAlready = await hasExistingPassword(page);
     if (pwAlready) {
-      log('步骤8：检测到密码已设置（密码行为"更改"），跳过设密码');
+      log('安全设置 · 账号已有密码，跳过设置');
       out.passwordSet = true;
     } else {
-      log('步骤8：设置密码 — 点击密码行的「添加」');
+      log('安全设置 · 点击添加密码');
       let pwEntry = await clickMarked(page, findRowButton, { kw: '密码|password', btns: ['添加', 'add', 'set', '设置', 'create', '创建'] });
       if (!pwEntry) pwEntry = await humanClickByText(page, ['设置密码', '创建密码', 'set password', 'create password'], { timeout: 3000 }).catch(() => null);
-      log(`步骤8：密码入口「${pwEntry || '未命中'}」`);
+      log('安全设置 · 点击密码设置入口');
       await sleep(2500);
       await dumpUi(page, '03-password-entry', log);
 
       // 设密码前 OpenAI 常要求先邮箱验证（跳 auth.openai.com 收码页）
       for (let r = 1; r <= 3; r += 1) {
         if (!(await isOnCodePage(page))) break;
-        log(`步骤8：设密码前需邮箱验证（第 ${r} 轮），取码`);
+        log(`安全设置 · 设置密码前需验证邮箱，第 ${r} 次`);
         if (r > 1) await humanClickByText(page, ['重新发送电子邮件', '重新发送', 'resend'], { timeout: 5000, exclude: OAUTH_EXCLUDE }).catch(() => {});
-        const vcode = await requestCode('password');
+        const vcode = await requestCodeWithResend(page, requestCode, log, { purpose: 'password' });
         await fillCode(page, vcode, log);
         await submitCodeForm(page, log, { code: vcode });
         await sleep(3500);
@@ -1682,31 +2054,32 @@ async function step8_setupPasswordAnd2FA(page, { email, password, enable2fa = tr
       if (pwdInput) {
         const all = page.locator('input[type="password"]');
         const n = await all.count();
+        log(`安全设置 · 填写密码：${password}`);
         await humanType(all.nth(0), password);
         if (n > 1) await humanType(all.nth(1), password);
-        await humanClickByText(page, ['保存', '设置密码', '设置', '确认', '继续', '更新', 'save', 'set password', 'set', 'confirm', 'continue', 'update'], { timeout: 6000, exclude: OAUTH_EXCLUDE });
+        await humanClickByText(page, ['保存', '设置密码', '设置', '确认', '继续', '更新', 'save', 'set password', 'set', 'confirm', 'continue', 'update'], { timeout: 6000, exclude: OAUTH_EXCLUDE, awaitPageLoad: true, log });
         await sleep(2500);
         await clickRetryIfError(page, log); // 设密码提交后偶发限流/网络异常页 → 点重试
         await dumpUi(page, '04-password-submitted', log);
         // 提交后可能还有一次邮箱验证
         const codeBox = await firstVisible(page, `${S.CODE_INPUT}, ${S.CODE_INPUT_SEGMENTED}`, { timeout: 4000 });
         if (codeBox) {
-          log('步骤8：设密码后需邮箱验证，取码');
-          const code = await requestCode('password');
+          log('安全设置 · 设置密码后需验证邮箱');
+          const code = await requestCodeWithResend(page, requestCode, log, { purpose: 'password' });
           await fillCode(page, code, log);
           await submitCodeForm(page, log, { code });
           await sleep(2500);
         }
         out.passwordSet = true;
         out.passwordChanged = true; // 确实新设了密码 → 上层应存这个新密码
-        log('步骤8：密码已提交');
+        log('安全设置 · 密码已保存');
         await mark('step8-02-password-set', '密码已设置');
       } else {
         // 没找到「创建密码」输入框：老号登录后密码往往已存在——先复判是不是账号本就有密码，
         // 是则视为已设、跳过（避免把「已有密码」误报成「设密码失败」）。
         const already = await hasExistingPassword(page);
         if (already) {
-          log('步骤8：未见创建密码输入框，但检测到账号已有密码 → 跳过设密码（沿用原密码）');
+          log('安全设置 · 账号已有密码，沿用原密码');
           out.passwordSet = true;
           // passwordChanged 保持 false：本次没有新设密码，上层应沿用登录用的原密码
         } else {
@@ -1718,7 +2091,7 @@ async function step8_setupPasswordAnd2FA(page, { email, password, enable2fa = tr
               inputs: [...document.querySelectorAll('input')].filter(vis).map((i) => ({ t: i.type, n: i.name, ph: i.placeholder })).slice(0, 12),
             };
           }).catch(() => ({}));
-          log(`步骤8：设密码失败现场 url=${scene.url || '?'} inputs=${JSON.stringify(scene.inputs || [])}`, 'error');
+          log(`安全设置 · 设置密码失败，当前页面异常`, 'error');
           throw new Error('设密码失败：未找到密码输入框，请检查邮箱验证或页面结构变化');
         }
       }
@@ -1726,7 +2099,7 @@ async function step8_setupPasswordAnd2FA(page, { email, password, enable2fa = tr
 
     // 2FA 关闭：只设密码即可返回
     if (!enable2fa) {
-      log('步骤8：enable_2fa=false，跳过 2FA 设置');
+      log('安全设置 · 未配置开启双重验证，跳过');
       return out;
     }
 
@@ -1745,9 +2118,9 @@ async function step8_setupPasswordAnd2FA(page, { email, password, enable2fa = tr
     }).catch(() => false);
 
     if (onSecurityAlready) {
-      log('步骤8：设置弹窗仍在安全 tab，直接开 2FA（跳过重开设置）');
+      log('安全设置 · 继续在当前页面开启双重验证');
     } else {
-      log('步骤8：设密码完成，重新打开设置进安全 tab 准备开 2FA');
+      log('安全设置 · 重新打开设置，准备开启双重验证');
       if (!/chatgpt\.com/.test(page.url())) {
         await page.goto('https://chatgpt.com/', { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
         await sleep(2500);
@@ -1773,29 +2146,29 @@ async function step8_setupPasswordAnd2FA(page, { email, password, enable2fa = tr
 
     if (twofaAlready) {
       if (!forceReset2fa) {
-        log('步骤8：检测到 2FA 已启用，跳过开启（保留原有 secret）');
+        log('安全设置 · 双重验证已开启，跳过');
         out.twoFactorSet = true;
         return out;
       }
-      log('步骤8：强制重设 2FA — 先停用已有的 Authenticator');
+      log('安全设置 · 先关闭已有的双重验证');
       const disabled = await disable2fa(page, existingTotpSecret, log);
       if (!disabled) throw new Error('强制重设2FA失败：无法停用已有的验证器（可能缺少旧 secret 或停用流程变更）');
       await sleep(1500);
       await dumpUi(page, '04c-2fa-disabled', log);
     }
 
-    log('步骤8：开启 TOTP 2FA — 点击 Authenticator app 开关');
+    log('安全设置 · 开启双重验证');
     let twofaToggle = await clickMarked(page, findRowSwitch, { kw: 'authenticator|验证器应用|身份验证器' });
     if (!twofaToggle) twofaToggle = await humanClickByText(page, ['authenticator app', 'authenticator', '身份验证器', '验证器应用', '设置', 'set up'], { timeout: 4000 }).catch(() => null);
-    log(`步骤8：2FA 入口「${twofaToggle || '未命中'}」`);
+    log('安全设置 · 点击双重验证开关');
     await sleep(2500);
     await dumpUi(page, '05-2fa-entry', log);
 
     for (let r = 1; r <= 2; r += 1) {
       if (!(await isOnCodePage(page))) break;
-      log(`步骤8：开2FA前需邮箱验证（第 ${r} 轮），取码`);
+      log(`安全设置 · 开启双重验证前需验证邮箱，第 ${r} 次`);
       if (r > 1) await humanClickByText(page, ['重新发送电子邮件', '重新发送', 'resend'], { timeout: 5000, exclude: OAUTH_EXCLUDE }).catch(() => {});
-      const vc = await requestCode('2fa');
+      const vc = await requestCodeWithResend(page, requestCode, log, { purpose: '2fa' });
       await fillCode(page, vc, log);
       await submitCodeForm(page, log);
       await sleep(3000);
@@ -1809,18 +2182,18 @@ async function step8_setupPasswordAnd2FA(page, { email, password, enable2fa = tr
       await dumpUi(page, '05b-2fa-manual', log);
       secretInfo = await extractTotpSecret(page);
     }
-    log(`步骤8：2FA secret 探测 uri=${secretInfo.uri ? 'yes' : 'no'} key=${secretInfo.key || '(无)'}`);
+    log(`安全设置 · 已获取双重验证密钥：${secretInfo.key || secretInfo.uri || '未获取'}`);
     const secret = secretInfo.key || secretInfo.uri;
     if (!secret) throw new Error('开2FA失败：未提取到 TOTP secret（仅二维码/入口异常）');
 
     out.twoFactorSecret = secretInfo.key || '';
     out.twoFactorUri = secretInfo.uri || '';
     const code = generateTotpNow(secret);
-    log(`步骤8：用 secret 生成 TOTP，回填确认`);
+    log(`安全设置 · 填写验证器验证码：${code}`);
     const codeBox = await firstVisible(page, `${S.CODE_INPUT}, ${S.CODE_INPUT_SEGMENTED}`, { timeout: 6000 });
     if (!codeBox) throw new Error('开2FA失败：未找到 TOTP 确认输入框');
     await fillCode(page, code, log);
-    await humanClickByText(page, ['继续', 'confirm', 'verify', '确认', '验证', '启用', 'enable', '下一步', 'next'], { timeout: 5000, exclude: OAUTH_EXCLUDE });
+    await humanClickByText(page, ['继续', 'confirm', 'verify', '确认', '验证', '启用', 'enable', '下一步', 'next'], { timeout: 5000, exclude: OAUTH_EXCLUDE, awaitPageLoad: true, log });
     await sleep(2500);
     await clickRetryIfError(page, log); // 2FA 确认提交后偶发限流/网络异常页 → 点重试
     await dumpUi(page, '06-2fa-confirmed', log);
@@ -1830,12 +2203,12 @@ async function step8_setupPasswordAnd2FA(page, { email, password, enable2fa = tr
       return [...new Set(codes)].slice(0, 12);
     }).catch(() => []);
     out.recoveryCodes = recovery;
-    await humanClickByText(page, ['完成', '继续', '我已保存', 'done', 'continue', 'i saved', 'close'], { timeout: 4000, exclude: OAUTH_EXCLUDE }).catch(() => {});
+    await humanClickByText(page, ['完成', '继续', '我已保存', 'done', 'continue', 'i saved', 'close'], { timeout: 4000, exclude: OAUTH_EXCLUDE, awaitPageLoad: true, log }).catch(() => {});
     out.twoFactorSet = true;
-    log(`步骤8：2FA 已开启，恢复码 ${recovery.length} 个`);
+    log(`安全设置 · 双重验证已开启${recovery.length ? `，恢复码：${recovery.join(', ')}` : ''}`);
     await mark('step8-03-2fa-set', `2FA 已开启（恢复码 ${recovery.length} 个）`);
   } catch (e) {
-    log(`步骤8失败：${e.message}`, 'error');
+    log(`安全设置失败：${e.message}`, 'error');
     await snapshot(page, 's8-error', log).catch(() => {});
     await mark('step8-error', `step8 失败：${e.message}`);
     const err = new Error(`密码/2FA 设置失败：${e.message}`);

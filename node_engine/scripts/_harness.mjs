@@ -22,6 +22,7 @@ import readline from 'node:readline';
 import fs from 'node:fs';
 import path from 'node:path';
 import { launchSession } from '../cloakbrowser.js';
+import { attachStaticCache } from '../static-cache.js';
 
 export function parseArgs(argv = process.argv.slice(2)) {
   const args = { _: [] };
@@ -154,7 +155,11 @@ export async function launch({ proxy = '', seed = null, headless = false, log = 
   });
   const page = await session.context.newPage();
   page.setDefaultTimeout(45000);
-  return { session, page };
+  const staticCache = await attachStaticCache(session.context, {
+    log,
+    config: { enabled: true, maxAgeDays: 7, dir: '' },
+  });
+  return { session, page, staticCache };
 }
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

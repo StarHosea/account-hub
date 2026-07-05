@@ -11,6 +11,7 @@ import unittest
 
 from services.cdk_service import parse_cdk_type_lines
 from services.mailbox_service import parse_mailbox_lines
+from services.phone_service import parse_phone_lines
 from services.account_service import AccountService
 
 
@@ -62,6 +63,10 @@ class AccountPoolImportTests(unittest.TestCase):
 
 
 class MailboxLineTests(unittest.TestCase):
+    def test_two_dash(self) -> None:
+        rows = parse_mailbox_lines("a@x.com--https://recv/a")
+        self.assertEqual(rows, [{"email": "a@x.com", "fetch_url": "https://recv/a"}])
+
     def test_three_dash(self) -> None:
         rows = parse_mailbox_lines("a@x.com---https://recv/a")
         self.assertEqual(rows, [{"email": "a@x.com", "fetch_url": "https://recv/a"}])
@@ -71,8 +76,26 @@ class MailboxLineTests(unittest.TestCase):
         self.assertEqual(rows, [{"email": "b@x.com", "fetch_url": "https://recv/b"}])
 
     def test_dedup_by_email(self) -> None:
-        rows = parse_mailbox_lines("c@x.com---u1\nc@x.com---u2")
-        self.assertEqual(rows, [{"email": "c@x.com", "fetch_url": "u2"}])
+        rows = parse_mailbox_lines("c@x.com---https://recv/u1\nc@x.com---https://recv/u2")
+        self.assertEqual(rows, [{"email": "c@x.com", "fetch_url": "https://recv/u2"}])
+
+    def test_non_http_url_skipped(self) -> None:
+        rows = parse_mailbox_lines("a@x.com---ftp://recv/a\nb@x.com---not-a-url")
+        self.assertEqual(rows, [])
+
+
+class PhoneLineTests(unittest.TestCase):
+    def test_two_dash(self) -> None:
+        rows = parse_phone_lines("13800138000--https://sms/example")
+        self.assertEqual(rows, [{"phone": "13800138000", "fetch_url": "https://sms/example"}])
+
+    def test_four_dash_compat(self) -> None:
+        rows = parse_phone_lines("13900139000----https://sms/example")
+        self.assertEqual(rows, [{"phone": "13900139000", "fetch_url": "https://sms/example"}])
+
+    def test_phone_only(self) -> None:
+        rows = parse_phone_lines("13800138000")
+        self.assertEqual(rows, [{"phone": "13800138000", "fetch_url": ""}])
 
 
 if __name__ == "__main__":

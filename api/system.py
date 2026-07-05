@@ -18,17 +18,6 @@ class ProxyTestRequest(BaseModel):
     url: str = ""
 
 
-class TrialCheckConfigRequest(BaseModel):
-    enabled: bool | None = None
-    base_url: str | None = None
-    api_key: str | None = None
-
-
-def _safe_trial_check() -> dict:
-    cfg = config.trial_check
-    return {"enabled": cfg["enabled"], "base_url": cfg["base_url"], "has_api_key": bool(cfg["api_key"])}
-
-
 def create_router(app_version: str) -> APIRouter:
     router = APIRouter()
 
@@ -59,18 +48,6 @@ def create_router(app_version: str) -> APIRouter:
             return {"config": config.update(body.model_dump(mode="python"))}
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
-
-    @router.get("/api/trial-check")
-    async def get_trial_check(authorization: str | None = Header(default=None)):
-        """注册成功后「试用资格」检测配置（api_key 不回传，仅 has_api_key）。"""
-        require_admin(authorization)
-        return {"config": _safe_trial_check()}
-
-    @router.post("/api/trial-check")
-    async def update_trial_check(body: TrialCheckConfigRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        config.update_trial_check(body.model_dump(exclude_none=True))
-        return {"config": _safe_trial_check()}
 
     @router.post("/api/proxy/test")
     async def test_proxy_endpoint(body: ProxyTestRequest, authorization: str | None = Header(default=None)):
@@ -107,7 +84,7 @@ def create_router(app_version: str) -> APIRouter:
         return HTMLResponse(f"""<!DOCTYPE html>
 <html lang="zh">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>号池健康监控 - 小海豚</title>
+<title>号池健康监控 - 小鲸鱼</title>
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
 body{{font-family:system-ui,-apple-system,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}}

@@ -12,6 +12,7 @@ from services.phone_service import phone_service
 class AcquireRequest(BaseModel):
     kind: str  # phone | account
     release_id: str | None = None  # 选「下一个」时先释放当前预占
+    token: str | None = None  # 指定预占的 Plus 账号
 
 
 class ActionRequest(BaseModel):
@@ -44,6 +45,24 @@ def create_router() -> APIRouter:
         require_admin(authorization)
         return _summary()
 
+    @router.get("/api/dispatch/accounts")
+    async def list_dispatch_accounts(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        items = dispatch_service.list_dispatchable_accounts()
+        return {
+            "items": [
+                {
+                    "email": a.get("email"),
+                    "access_token": a.get("access_token"),
+                    "activated_at": a.get("activated_at"),
+                    "country": a.get("country"),
+                    "exit_ip": a.get("exit_ip"),
+                }
+                for a in items
+            ],
+            "summary": _summary(),
+        }
+
     @router.post("/api/dispatch/acquire")
     async def acquire(body: AcquireRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
@@ -56,7 +75,7 @@ def create_router() -> APIRouter:
                 dispatch_service.release_phone(body.release_id)
 
         if kind == "account":
-            item = dispatch_service.acquire_account()
+            item = dispatch_service.acquire_account(body.token)
         elif kind == "phone":
             item = dispatch_service.acquire_phone()
         else:

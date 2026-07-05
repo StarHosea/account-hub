@@ -17,6 +17,7 @@
 // ============================================================================
 
 import * as S from './selectors.js';
+import { INVALID_CODE_PATTERN } from './code-errors.js';
 
 // —— 页面状态（互斥）——
 export const PAGE_STATE = Object.freeze({
@@ -126,7 +127,13 @@ export async function collectSignals(page) {
         mfaEnabled,
         // 文案标志
         emailExists: /already\s+exists|already\s+in\s+use|已存在|既に.*存在/i.test(text),
-        invalidCode: /invalid\s+code|incorrect\s+code|code\s+is\s+invalid|无效|不正确|コードが正しく/i.test(text),
+        invalidCode: (() => {
+          const re = new RegExp(sel.invalidCodePattern, 'i');
+          if (re.test(text)) return true;
+          const codeInput = document.querySelector(sel.code);
+          if (codeInput?.getAttribute('aria-invalid') === 'true') return true;
+          return false;
+        })(),
         forgotOrWelcomeBack: /忘记了密码|忘记密码|forgot password|欢迎回来|welcome back/i.test(text),
         checkInbox: /检查你的收件箱|输入.*验证码|check your inbox|enter the code|verification code/i.test(text),
         mfaAuthenticator: /验证器应用|输入验证器|authenticator|two-factor|双重验证|验证你的身份|一次性验证码|一次性密码/i.test(text),
@@ -142,6 +149,7 @@ export async function collectSignals(page) {
       seg: S.CODE_INPUT_SEGMENTED,
       profile: `${S.NAME_INPUT}, ${S.FIRST_NAME_INPUT}, ${S.LAST_NAME_INPUT}, ${S.BIRTHDAY_INPUT}`,
       successTexts: S.SUCCESS_TEXTS,
+      invalidCodePattern: INVALID_CODE_PATTERN.source,
     });
   } catch (e) {
     dom = { evalError: String(e && e.message || e) };

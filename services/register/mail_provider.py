@@ -13,12 +13,18 @@ from typing import Any, Callable, TypeVar
 
 from curl_cffi import requests
 
+from services.account_service import account_service
 from services.mailbox_service import mailbox_service
 
 ResultT = TypeVar("ResultT")
 
 API_MAILBOX_TYPE = "api_mailbox"
 CLOUDMAIL_TYPE = "cloudmail_gen"
+MAILBOX_POOL_EXHAUSTED_MSG = "API 邮箱池没有可用邮箱，请先在「邮箱管理」导入"
+
+
+class MailboxPoolExhaustedError(RuntimeError):
+    """API 邮箱池已无可用邮箱。"""
 
 domain_lock = Lock()
 domain_index = 0
@@ -29,7 +35,7 @@ cloudmail_token_cache: dict[str, tuple[str, float]] = {}
 def _config(mail_config: dict) -> dict:
     return {
         "request_timeout": float(mail_config.get("request_timeout") or 30),
-        "wait_timeout": float(mail_config.get("wait_timeout") or 30),
+        "wait_timeout": float(mail_config.get("wait_timeout") or 300),
         "wait_interval": float(mail_config.get("wait_interval") or 2),
         "user_agent": str(mail_config.get("user_agent") or "Mozilla/5.0"),
         # 收件取件地址永不走代理（注册流程的 socks5 代理与收邮件解耦）。
@@ -129,6 +135,20 @@ def _extract_received_at(content: str) -> datetime | None:
         return datetime(year, month, day, hour, minute, second)
     except Exception:
         return None
+
+
+def _to_comparable_naive_local(dt: datetime) -> datetime:
+    """把带时区的时间转成本地朴素 datetime，便于与 API 收件页解析结果比较。"""
+    if dt.tzinfo is not None:
+        return dt.astimezone().replace(tzinfo=None)
+    return dt
+
+
+def _received_is_fresh(received: datetime | None, after: datetime) -> bool:
+    """邮件到达时间是否严格晚于截止线（双方都转成本地朴素时间再比）。"""
+    if not isinstance(received, datetime):
+        return False
+    return _to_comparable_naive_local(received) > _to_comparable_naive_local(after)
 
 
 def _message_tracking_ref(message: dict[str, Any]) -> str:
@@ -238,9 +258,9 @@ class BaseMailProvider:
     def wait_for_code(self, mailbox: dict[str, Any], after_received_at: datetime | None = None) -> str | None:
         """轮询取验证码，最长等待由 conf['wait_timeout'] 限定。
 
-        after_received_at 给定时，只接受「到达时间晚于它」的邮件的验证码（即发码之后新到的邮件），
+        after_received_at 给定时，只接受「到达时间严格晚于它」的邮件的验证码（即发码之后新到的邮件），
         避免抓到发码前残留在信箱里的旧码。按到达时间判断而非码值——OpenAI 有时会重发相同的码，
-        码值相同不代表是旧码。到达时间无法解析时退回接受当前码（避免死等）。
+        码值相同不代表是旧码。到达时间无法解析时不接受，继续轮询直至超时或出现可判定的新邮件。
         """
 
         def pick_fresh_code(message: dict[str, Any]) -> str | None:
@@ -249,8 +269,8 @@ class BaseMailProvider:
                 return None
             if isinstance(after_received_at, datetime):
                 received = message.get("received_at")
-                if isinstance(received, datetime) and received <= after_received_at:
-                    return None  # 发码前就在信箱里的旧邮件，继续等新邮件到达
+                if not _received_is_fresh(received, after_received_at):
+                    return None
             return code
 
         return self.wait_for(mailbox, pick_fresh_code)
@@ -277,9 +297,17 @@ class ApiMailboxProvider(BaseMailProvider):
         return self._session
 
     def create_mailbox(self, username: str | None = None) -> dict[str, Any]:
+        from services.register_service import register_service
+
+        reserved = register_service.pop_reserved_mailbox()
+        if reserved:
+            return reserved
         acquired = mailbox_service.acquire_unused()
         if not acquired:
-            raise RuntimeError("API 邮箱池没有可用邮箱，请先在「邮箱管理」导入")
+            raise MailboxPoolExhaustedError(MAILBOX_POOL_EXHAUSTED_MSG)
+        from services.account_service import account_service
+
+        account_service.reserve_emails_for_register([acquired["email"]])
         return {
             "provider": self.name,
             "provider_ref": self.provider_ref,
@@ -461,6 +489,15 @@ def _create_provider(mail_config: dict, provider: str = "", provider_ref: str = 
     return _build_provider(entry, mail_config)
 
 
+def is_api_pool_exhausted(mail_config: dict) -> bool:
+    """主邮箱源为 API 池且当前无可用地址时返回 True（CloudMail 按需生成，恒为 False）。"""
+    entries = _entries(mail_config)
+    primary = entries[0] if entries else {"type": API_MAILBOX_TYPE}
+    if primary.get("type") != API_MAILBOX_TYPE:
+        return False
+    return not any(mailbox_service._is_available(m) for m in mailbox_service.list_mailboxes())
+
+
 def create_mailbox(mail_config: dict, username: str | None = None) -> dict:
     provider = _create_provider(mail_config)
     try:
@@ -516,15 +553,32 @@ def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str 
     if not address:
         return
     if success:
-        mailbox_service.bind_account(address, str(mailbox.get("access_token") or ""))
+        token = str(mailbox.get("access_token") or "")
+        mailbox_service.bind_account(address, token)
+        if token:
+            reg_payload: dict = {"access_token": token}
+            for field in ("password", "totp_secret", "otpauth_url"):
+                val = str(mailbox.get(field) or "").strip()
+                if val:
+                    reg_payload[field] = val
+            account_service.complete_registration(address, reg_payload)
     elif _is_bad_mailbox_error(error):
         mailbox_service.mark_used_bad(address, note="疑似已注册过账号，注册机自动标记不可用")
+        account_service.release_registration(
+            address, error=str(error or ""), remove_placeholder=True,
+        )
     else:
         mailbox_service.release(address, cooldown_seconds=_RELEASE_COOLDOWN_SECONDS)
+        account_service.release_registration(
+            address, error=str(error or ""), remove_placeholder=True,
+        )
 
 
 def release_mailbox(mailbox: dict) -> None:
     """把占用的 API 邮箱释放回未使用（流程主动放弃且未消费验证码时）。"""
     if str(mailbox.get("provider") or "") != API_MAILBOX_TYPE:
         return
-    mailbox_service.release(str(mailbox.get("address") or ""))
+    address = str(mailbox.get("address") or "").strip()
+    mailbox_service.release(address)
+    if address:
+        account_service.release_registration(address)

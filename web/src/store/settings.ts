@@ -1,7 +1,6 @@
 
 import { create } from "zustand";
 import { toast } from "sonner";
-
 import {
   fetchActivation,
   fetchRegisterConfig,
@@ -18,14 +17,13 @@ import {
   type RegisterProviderType,
   type SettingsConfig,
 } from "@/lib/api";
+import { navRef } from "@/constants/nav";
 
 function normalizeConfig(config: SettingsConfig): SettingsConfig {
   return {
     ...config,
-    refresh_account_interval_minute: Number(config.refresh_account_interval_minute || 5),
     auto_remove_invalid_accounts: Boolean(config.auto_remove_invalid_accounts),
     auto_remove_rate_limited_accounts: Boolean(config.auto_remove_rate_limited_accounts),
-    auto_relogin_after_refresh: Boolean(config.auto_relogin_after_refresh),
     log_levels: Array.isArray(config.log_levels) ? config.log_levels : [],
     proxy: typeof config.proxy === "string" ? config.proxy : "",
     global_system_prompt: String(config.global_system_prompt || ""),
@@ -49,10 +47,8 @@ type SettingsStore = {
   initialize: () => Promise<void>;
   loadConfig: () => Promise<void>;
   saveConfig: () => Promise<boolean>;
-  setRefreshAccountIntervalMinute: (value: string) => void;
   setAutoRemoveInvalidAccounts: (value: boolean) => void;
   setAutoRemoveRateLimitedAccounts: (value: boolean) => void;
-  setAutoReloginAfterRefresh: (value: boolean) => void;
   setLogLevel: (level: string, enabled: boolean) => void;
   setProxy: (value: string) => void;
   setGlobalSystemPrompt: (value: string) => void;
@@ -67,11 +63,15 @@ type SettingsStore = {
   setRegisterRegions: (values: string[]) => void;
   setRegisterIpwebRotate: (value: boolean) => void;
   setRegisterIpDuration: (value: number) => void;
+  setRegisterStaticCacheEnabled: (value: boolean) => void;
+  setRegisterStaticCacheMaxAgeDays: (value: number) => void;
+  setRegisterStaticCacheDir: (value: string) => void;
   setRegisterMailField: (key: "request_timeout" | "wait_timeout" | "wait_interval", value: string) => void;
   setRegisterProviderType: (type: RegisterProviderType) => void;
   updateRegisterProvider: (updates: Partial<RegisterProvider>) => void;
-  saveRegister: () => Promise<void>;
+  saveRegister: (opts?: { silent?: boolean }) => Promise<void>;
   toggleRegister: () => Promise<void>;
+  stopRegisterRun: () => Promise<void>;
   resetRegister: () => Promise<void>;
 
   loadActivationConfig: () => Promise<void>;
@@ -81,7 +81,7 @@ type SettingsStore = {
     value: string,
   ) => void;
   setActivationAutoActivate: (value: boolean) => void;
-  saveActivationConfig: () => Promise<void>;
+  saveActivationConfig: (opts?: { silent?: boolean }) => Promise<void>;
 };
 
 function buildRegisterPayload(config: RegisterConfig): Partial<RegisterConfig> {
@@ -94,6 +94,9 @@ function buildRegisterPayload(config: RegisterConfig): Partial<RegisterConfig> {
     regions: config.regions && config.regions.length ? config.regions : ["US"],
     ipweb_rotate: Boolean(config.ipweb_rotate),
     ip_duration: Math.min(2880, Math.max(1, Number(config.ip_duration) || 120)),
+    static_cache_enabled: config.static_cache_enabled !== false,
+    static_cache_max_age_days: Math.min(90, Math.max(1, Number(config.static_cache_max_age_days) || 7)),
+    static_cache_dir: String(config.static_cache_dir || "").trim(),
   };
 }
 
@@ -136,10 +139,8 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     try {
       const data = await updateSettingsConfig({
         ...config,
-        refresh_account_interval_minute: Math.max(1, Number(config.refresh_account_interval_minute) || 1),
         auto_remove_invalid_accounts: Boolean(config.auto_remove_invalid_accounts),
         auto_remove_rate_limited_accounts: Boolean(config.auto_remove_rate_limited_accounts),
-        auto_relogin_after_refresh: Boolean(config.auto_relogin_after_refresh),
         proxy: config.proxy.trim(),
         global_system_prompt: String(config.global_system_prompt || "").trim(),
         sensitive_words: (config.sensitive_words || []).map((item) => String(item).trim()).filter(Boolean),
@@ -155,20 +156,12 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     }
   },
 
-  setRefreshAccountIntervalMinute: (value) => {
-    set((state) => (state.config ? { config: { ...state.config, refresh_account_interval_minute: value } } : {}));
-  },
-
   setAutoRemoveInvalidAccounts: (value) => {
     set((state) => (state.config ? { config: { ...state.config, auto_remove_invalid_accounts: value } } : {}));
   },
 
   setAutoRemoveRateLimitedAccounts: (value) => {
     set((state) => (state.config ? { config: { ...state.config, auto_remove_rate_limited_accounts: value } } : {}));
-  },
-
-  setAutoReloginAfterRefresh: (value) => {
-    set((state) => (state.config ? { config: { ...state.config, auto_relogin_after_refresh: value } } : {}));
   },
 
   setLogLevel: (level, enabled) => {
@@ -249,6 +242,26 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     );
   },
 
+  setRegisterStaticCacheEnabled: (value) => {
+    set((state) =>
+      state.registerConfig ? { registerConfig: { ...state.registerConfig, static_cache_enabled: value } } : {},
+    );
+  },
+
+  setRegisterStaticCacheMaxAgeDays: (value) => {
+    set((state) =>
+      state.registerConfig
+        ? { registerConfig: { ...state.registerConfig, static_cache_max_age_days: Math.min(90, Math.max(1, value)) } }
+        : {},
+    );
+  },
+
+  setRegisterStaticCacheDir: (value) => {
+    set((state) =>
+      state.registerConfig ? { registerConfig: { ...state.registerConfig, static_cache_dir: value } } : {},
+    );
+  },
+
   setRegisterMailField: (key, value) => {
     set((state) =>
       state.registerConfig
@@ -300,16 +313,17 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     });
   },
 
-  saveRegister: async () => {
+  saveRegister: async (opts) => {
     const { registerConfig } = get();
     if (!registerConfig) return;
+    set({ isSavingRegister: true });
     try {
-      set({ isSavingRegister: true });
       const data = await updateRegisterConfig(buildRegisterPayload(registerConfig));
       set({ registerConfig: data.register });
-      toast.success("注册配置已保存");
+      if (!opts?.silent) toast.success("注册配置已保存");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "保存注册配置失败");
+      throw error;
     } finally {
       set({ isSavingRegister: false });
     }
@@ -325,9 +339,28 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       }
       const data = registerConfig.enabled ? await stopRegister() : await startRegister();
       set({ registerConfig: data.register });
-      toast.success(registerConfig.enabled ? "注册任务已停止" : "注册任务已启动");
+      toast.success(
+        registerConfig.enabled
+          ? "已停止注册：在途浏览器已终止，运行日志见批量注册页"
+          : `注册任务已启动，请在${navRef("register")}查看运行日志`,
+      );
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "切换注册状态失败");
+    } finally {
+      set({ isSavingRegister: false });
+    }
+  },
+
+  stopRegisterRun: async () => {
+    const { registerConfig } = get();
+    if (!registerConfig?.enabled) return;
+    set({ isSavingRegister: true });
+    try {
+      const data = await stopRegister();
+      set({ registerConfig: data.register });
+      toast.success("已停止注册：在途指纹浏览器已终止");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "停止注册失败");
     } finally {
       set({ isSavingRegister: false });
     }
@@ -380,7 +413,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     );
   },
 
-  saveActivationConfig: async () => {
+  saveActivationConfig: async (opts) => {
     const { activationConfig } = get();
     if (!activationConfig) return;
     set({ isSavingActivationConfig: true });
@@ -397,9 +430,10 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         ...(activationConfig.api_key ? { api_key: activationConfig.api_key } : {}),
       });
       set({ activationConfig: data.config });
-      toast.success("Plus 激活配置已保存");
+      if (!opts?.silent) toast.success("Plus 激活配置已保存");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "保存 Plus 激活配置失败");
+      throw error;
     } finally {
       set({ isSavingActivationConfig: false });
     }

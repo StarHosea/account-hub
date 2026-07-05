@@ -11,7 +11,7 @@
 //   { type:"stop" }
 //
 // 流程严格串行：任一时刻最多一个 requestCode 在等待。Python 收到 need_code 后
-// 用 mail_provider 取码并回写一条 code。若取码超时 Python 回 code:null → 该步抛错。
+// 按 ts 过滤旧码并轮询（单轮约 90s）；超时回 code:null → Node 点「重新发送」再发下一轮 need_code。
 // ============================================================================
 
 import readline from 'node:readline';

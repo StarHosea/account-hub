@@ -1,24 +1,23 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import {
   Card,
   Button,
   InputNumber,
-  Switch,
   Progress,
   Typography,
   Toast,
   Space,
   Popconfirm,
   Table,
-  Tabs,
-  TabPane,
   Badge,
-  Input,
   Tag,
   Spin,
   Empty,
+  Tooltip,
+  Banner,
 } from "@douyinfe/semi-ui-19";
-import { IconPlay, IconStop, IconDelete, IconAlertTriangle, IconSave, IconSearch, IconRefresh } from "@douyinfe/semi-icons";
+import { IconPlay, IconStop, IconDelete } from "@douyinfe/semi-icons";
 
 import {
   fetchActivation,
@@ -27,14 +26,17 @@ import {
   clearActivationLogs,
   fetchAccounts,
   fetchCdks,
+  fetchActivationAudit,
   type ActivationState,
   type Account,
   type PlusStatus,
 } from "@/lib/api";
 import { useSettingsStore } from "@/store/settings";
+import ResourceZeroWarning from "@/components/ResourceZeroWarning";
 import { useIsMobile } from "@/lib/use-is-mobile";
+import { NAV_LABELS, navRef } from "@/constants/nav";
 
-const { Title, Text } = Typography;
+const { Text } = Typography;
 
 const LEVEL_COLOR: Record<string, string> = {
   red: "var(--semi-color-danger)",
@@ -58,12 +60,6 @@ function fmtTime(iso: string): string {
   } catch {
     return iso;
   }
-}
-
-function maskSecret(s: string): string {
-  const v = String(s || "");
-  if (v.length <= 8) return v;
-  return `${v.slice(0, 4)}…${v.slice(-4)}`;
 }
 
 function LogView({ logs }: { logs: LogEntry[] }) {
@@ -122,11 +118,6 @@ function renderPlusStatus(a: Account) {
           {a.plus_last_message}
         </Text>
       ) : null}
-      {a.plus_cdk ? (
-        <Text type="tertiary" size="small" style={{ fontFamily: "monospace" }}>
-          CDK {maskSecret(a.plus_cdk)}
-        </Text>
-      ) : null}
     </div>
   );
 }
@@ -151,42 +142,24 @@ function OverviewCard({ label, value, danger }: { label: string; value: number; 
   );
 }
 
-function zerosWarning(zeros: string[]) {
-  if (!zeros.length) return null;
-  return (
-    <Space spacing={4} align="center">
-      <IconAlertTriangle style={{ color: "var(--semi-color-warning)" }} />
-      <Text type="warning" size="small">
-        以下资源为 0：{zeros.join("、")}
-      </Text>
-    </Space>
-  );
-}
-
 export default function ActivatorPage() {
   const isMobile = useIsMobile();
 
-  // 激活配置（并发数 / 激活数量 target / 注册后自动激活）走 store。
   const activationConfig = useSettingsStore((s) => s.activationConfig);
   const isSavingActivationConfig = useSettingsStore((s) => s.isSavingActivationConfig);
   const loadActivationConfig = useSettingsStore((s) => s.loadActivationConfig);
   const setActivationConfigField = useSettingsStore((s) => s.setActivationConfigField);
-  const setActivationAutoActivate = useSettingsStore((s) => s.setActivationAutoActivate);
   const saveActivationConfig = useSettingsStore((s) => s.saveActivationConfig);
 
-  // 激活运行态 + 账号 + 资源。
   const [activation, setActivation] = useState<ActivationState | null>(null);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [cdkAvailable, setCdkAvailable] = useState(0);
   const [activationBusy, setActivationBusy] = useState(false);
-  const [activeTab, setActiveTab] = useState("monitor");
-  // 激活失败清单：独立按 activation=failed 拉取，避免被「前 200 条」混合截断。
-  const [failedAccounts, setFailedAccounts] = useState<Account[]>([]);
-  const [failedQuery, setFailedQuery] = useState("");
+  const [auditStats, setAuditStats] = useState({ failed: 0, review: 0 });
 
-  const loadFailedAccounts = useCallback(() => {
-    void fetchAccounts({ activation: "failed", page_size: 200 })
-      .then((r) => setFailedAccounts(r.items))
+  const loadAuditStats = useCallback(() => {
+    void fetchActivationAudit({ abnormal_only: true, page_size: 1 })
+      .then((r) => setAuditStats({ failed: r.stats.failed, review: r.stats.review }))
       .catch(() => {});
   }, []);
 
@@ -214,7 +187,7 @@ export default function ActivatorPage() {
     void pullActivation();
     void pullAccounts();
     pullResources();
-    loadFailedAccounts();
+    loadAuditStats();
 
     const timer = setInterval(() => {
       if (document.visibilityState !== "visible") return;
@@ -222,7 +195,7 @@ export default function ActivatorPage() {
       void pullActivation();
       if (tick % 2 === 0) void pullAccounts();
       if (tick % 5 === 0) pullResources();
-      if (tick % 5 === 0) loadFailedAccounts();
+      if (tick % 5 === 0) loadAuditStats();
     }, 1000);
     return () => clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -231,13 +204,11 @@ export default function ActivatorPage() {
   const act = activation?.activation;
   const activationRunning = !!act?.running;
   const activatingCount = act?.summary.activating ?? 0;
-  const freeCount = act?.summary.free ?? 0;
-  const pendingActivate = act?.summary.not_plus_by_type ?? 0;
+  const pendingActivate = act?.summary.pending ?? 0;
   const activatedCount = act?.summary.plus_by_type ?? 0;
 
   const target = activationConfig?.target ?? 0;
-  const concurrency = activationConfig?.concurrency ?? 3;
-  const autoActivate = !!activationConfig?.auto_activate_after_register;
+  const concurrency = activationConfig?.concurrency ?? 10;
 
   const activationPercent = (() => {
     const total = act?.stats.total ?? 0;
@@ -252,33 +223,20 @@ export default function ActivatorPage() {
     [accounts],
   );
 
-  // 激活失败清单：前端按邮箱 / 失败原因过滤。
-  const filteredFailed = useMemo(() => {
-    const q = failedQuery.trim().toLowerCase();
-    if (!q) return failedAccounts;
-    return failedAccounts.filter(
-      (a) =>
-        (a.email || "").toLowerCase().includes(q) ||
-        (a.plus_last_message || "").toLowerCase().includes(q),
-    );
-  }, [failedAccounts, failedQuery]);
+  const abnormalCount = auditStats.failed + auditStats.review;
 
   const handleStartActivation = async () => {
-    if (freeCount === 0) {
-      Toast.warning("可激活账号为 0（没有未激活账号）");
-      return;
-    }
     if (cdkAvailable === 0) {
-      Toast.warning("可用 CDK 为 0，无法激活，请先在「CDK 管理」导入");
+      Toast.warning(`可用激活码为 0，无法激活，请先在${navRef("cdks")}中导入`);
       return;
     }
     setActivationBusy(true);
     try {
-      // 激活数量：target>0 则按 target，否则全部未激活账号（freeCount）。
-      const limit = target > 0 ? target : freeCount;
-      const s = await startActivation([], limit);
+      await saveActivationConfig({ silent: true });
+      const limit = target > 0 ? target : undefined;
+      const s = await startActivation(undefined, limit, undefined, concurrency);
       setActivation(s);
-      Toast.success(`已开始激活未激活账号（本轮上限 ${limit} 个）`);
+      Toast.success(limit ? `已开始激活，最多 ${limit} 个账号` : "已开始激活全部可激活账号");
     } catch (e) {
       Toast.error(e instanceof Error ? e.message : "启动激活失败");
     } finally {
@@ -309,67 +267,42 @@ export default function ActivatorPage() {
     }
   };
 
-  const handleSaveConfig = async () => {
-    await saveActivationConfig();
-  };
-
   const activationColumns = [
     { title: "邮箱", dataIndex: "email", render: (v: string | null) => v || <Text type="tertiary">—</Text> },
     { title: "激活进度", dataIndex: "plus_status", render: (_: unknown, a: Account) => renderPlusStatus(a) },
   ];
 
-  // 激活失败清单列：与注册机「异常清单」风格对齐（邮箱 / 失败原因 / CDK / 时间）。
-  const failedColumns = [
-    { title: "邮箱", dataIndex: "email", width: 240, render: (v: string | null) => v || <Text type="tertiary">—</Text> },
-    {
-      title: "激活失败原因",
-      dataIndex: "plus_last_message",
-      render: (v: string | null) => (
-        <Text type="danger" size="small" ellipsis={{ showTooltip: true }} style={{ maxWidth: 360 }}>
-          {v || "—"}
-        </Text>
-      ),
-    },
-    {
-      title: "CDK",
-      dataIndex: "plus_cdk",
-      width: 160,
-      render: (v: string | null) =>
-        v ? (
-          <Text type="tertiary" size="small" style={{ fontFamily: "monospace" }}>
-            {maskSecret(v)}
-          </Text>
-        ) : (
-          <Text type="tertiary" size="small">—</Text>
-        ),
-    },
-    {
-      title: "时间",
-      dataIndex: "created_at",
-      width: 170,
-      render: (v: string | null) => (
-        <Text type="tertiary" size="small">{v ? new Date(v).toLocaleString() : "—"}</Text>
-      ),
-    },
-  ];
-
-  const tabLabel = (text: string, count: number) => (
-    <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-      {text}
-      {count > 0 ? <Badge count={count} overflowCount={99} type="primary" /> : null}
-    </span>
-  );
-
-  const activationZeros = [
-    freeCount === 0 ? "可激活账号" : null,
-    cdkAvailable === 0 ? "可用 CDK" : null,
+  const activationResourceHints = [
+    pendingActivate === 0 ? `待激活账号为空，请先完成${navRef("register")}或手动导入` : null,
+    cdkAvailable === 0 ? `可用激活码为空，请先在${navRef("cdks")}中导入` : null,
   ].filter(Boolean) as string[];
+  const startActivationDisabled = pendingActivate === 0 || cdkAvailable === 0;
+  const startActivationDisabledTip = [
+    pendingActivate === 0 ? "待激活账号为空" : null,
+    cdkAvailable === 0 ? "可用激活码为空" : null,
+  ]
+    .filter(Boolean)
+    .join("，");
 
   return (
     <div style={{ maxWidth: 1080 }}>
-      <Title heading={isMobile ? 4 : 3} style={{ marginBottom: 16 }}>
-        激活器
-      </Title>
+      {abnormalCount > 0 ? (
+        <Banner
+          fullMode={false}
+          type="warning"
+          closeIcon={null}
+          style={{ marginBottom: 16 }}
+          description={
+            <span>
+              有 {auditStats.failed} 个激活失败、{auditStats.review} 个待核查，请前往
+              <Link to="/activation-audit" style={{ margin: "0 4px" }}>
+                {NAV_LABELS.activationAudit}
+              </Link>
+              查看详情与处理。
+            </span>
+          }
+        />
+      ) : null}
 
       <div
         style={{
@@ -380,12 +313,13 @@ export default function ActivatorPage() {
         }}
       >
         <OverviewCard label="待激活" value={pendingActivate} />
-        <OverviewCard label="激活中" value={activatingCount} />
+        <OverviewCard label="进行中" value={activatingCount} />
         <OverviewCard label="已激活" value={activatedCount} />
-        <OverviewCard label="可用 CDK" value={cdkAvailable} danger={cdkAvailable === 0} />
+        <OverviewCard label="可用激活码" value={cdkAvailable} danger={cdkAvailable === 0} />
       </div>
 
-      <Card title="启动设置" headerExtraContent={zerosWarning(activationZeros)} style={{ marginBottom: 16 }}>
+      <Card title="任务配置" style={{ marginBottom: 16 }}>
+        <ResourceZeroWarning hints={activationResourceHints} />
         <Space wrap spacing="loose" align="end">
           <div>
             <Text style={{ display: "block", marginBottom: 6 }}>并发数</Text>
@@ -399,7 +333,7 @@ export default function ActivatorPage() {
             />
           </div>
           <div>
-            <Text style={{ display: "block", marginBottom: 6 }}>激活数量（0=不限）</Text>
+            <Text style={{ display: "block", marginBottom: 6 }}>激活上限（0 表示不限）</Text>
             <InputNumber
               min={0}
               value={target}
@@ -408,34 +342,26 @@ export default function ActivatorPage() {
               style={{ width: 140 }}
             />
           </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-            <Text>注册成功后自动激活</Text>
-            <Switch
-              checked={autoActivate}
-              onChange={(v) => setActivationAutoActivate(v)}
-              disabled={activationRunning}
-            />
-          </div>
-          <Button
-            icon={<IconSave />}
-            loading={isSavingActivationConfig}
-            disabled={activationRunning}
-            onClick={() => void handleSaveConfig()}
-          >
-            保存设置
-          </Button>
           {activationRunning ? (
             <Popconfirm title="确认停止激活？" content="将中断正在进行的激活流程" onConfirm={() => void handleStopActivation()}>
               <Button theme="solid" type="danger" icon={<IconStop />} loading={activationBusy}>
-                停止
+                停止激活
               </Button>
             </Popconfirm>
+          ) : startActivationDisabled ? (
+            <Tooltip content={startActivationDisabledTip}>
+              <span style={{ display: "inline-block" }}>
+                <Button theme="solid" type="primary" icon={<IconPlay />} loading={activationBusy || isSavingActivationConfig} disabled>
+                  启动激活
+                </Button>
+              </span>
+            </Tooltip>
           ) : (
             <Button
               theme="solid"
               type="primary"
               icon={<IconPlay />}
-              loading={activationBusy}
+              loading={activationBusy || isSavingActivationConfig}
               onClick={() => void handleStartActivation()}
             >
               启动激活
@@ -452,78 +378,47 @@ export default function ActivatorPage() {
         </div>
       </Card>
 
-      <Tabs activeKey={activeTab} onChange={setActiveTab} type="line">
-        <TabPane tab={tabLabel("激活监控", activatingCount)} itemKey="monitor">
-          <div style={{ paddingTop: 12 }}>
-            <Card title="正在激活的账号" style={{ marginBottom: 16 }}>
-              {activatingCount > activatingAccounts.length ? (
-                <Text type="tertiary" size="small" style={{ display: "block", marginBottom: 8 }}>
-                  另有 {activatingCount - activatingAccounts.length} 个进行中账号未在列表显示（列表上限 200）。
-                </Text>
-              ) : null}
-              <Table
-                dataSource={activatingAccounts}
-                columns={activationColumns}
-                rowKey="access_token"
-                size="small"
-                pagination={false}
-                empty={<Empty description="当前没有正在激活的账号" />}
-                scroll={{ y: 300 }}
-              />
-            </Card>
+      <Card
+        title={
+          <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+            运行监控
+            {activatingCount > 0 ? <Badge count={activatingCount} overflowCount={99} type="primary" /> : null}
+          </span>
+        }
+        style={{ marginBottom: 16 }}
+      >
+        {activatingCount > activatingAccounts.length ? (
+          <Text type="tertiary" size="small" style={{ display: "block", marginBottom: 8 }}>
+            另有 {activatingCount - activatingAccounts.length} 个进行中账号未在列表显示（列表上限 200）。
+          </Text>
+        ) : null}
+        <Table
+          dataSource={activatingAccounts}
+          columns={activationColumns}
+          rowKey="access_token"
+          size="small"
+          pagination={false}
+          empty={<Empty description="当前没有进行中的激活任务" />}
+          scroll={{ y: 300 }}
+        />
+      </Card>
 
-            <Card
-              title="详细日志"
-              headerExtraContent={
-                <Button
-                  icon={<IconDelete />}
-                  size="small"
-                  type="tertiary"
-                  disabled={!act?.logs?.length}
-                  onClick={() => void handleClearActivationLogs()}
-                >
-                  清空日志
-                </Button>
-              }
-            >
-              <LogView logs={act?.logs ?? []} />
-            </Card>
-          </div>
-        </TabPane>
-
-        <TabPane tab={tabLabel("激活失败清单", failedAccounts.length)} itemKey="failed">
-          <div style={{ paddingTop: 12 }}>
-            <Card
-              title={`激活失败账号清单（${failedAccounts.length}）`}
-              headerExtraContent={
-                <Space>
-                  <Input
-                    prefix={<IconSearch />}
-                    placeholder="搜索邮箱 / 原因"
-                    value={failedQuery}
-                    onChange={(v) => setFailedQuery(v)}
-                    style={{ width: 200 }}
-                    showClear
-                  />
-                  <Button icon={<IconRefresh />} size="small" onClick={() => loadFailedAccounts()}>
-                    刷新
-                  </Button>
-                </Space>
-              }
-            >
-              <Table
-                dataSource={filteredFailed}
-                columns={failedColumns}
-                rowKey="access_token"
-                size="small"
-                pagination={false}
-                empty={<Empty description="暂无激活失败账号" />}
-                scroll={{ y: 360 }}
-              />
-            </Card>
-          </div>
-        </TabPane>
-      </Tabs>
+      <Card
+        title="详细日志"
+        headerExtraContent={
+          <Button
+            icon={<IconDelete />}
+            size="small"
+            type="tertiary"
+            disabled={!act?.logs?.length}
+            onClick={() => void handleClearActivationLogs()}
+          >
+            清空日志
+          </Button>
+        }
+      >
+        <LogView logs={act?.logs ?? []} />
+      </Card>
     </div>
   );
 }

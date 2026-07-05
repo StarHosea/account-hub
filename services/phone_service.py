@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -75,7 +76,7 @@ def _norm_phone(phone: str) -> str:
 
 
 def parse_phone_lines(text: str) -> list[dict[str, str]]:
-    """解析批量导入文本，每行 `手机号----接码地址`。
+    """解析批量导入文本，每行 `手机号---接码地址`（分隔符至少两个连字符 `-`）。
 
     - 忽略空行与 `#` 注释行；
     - 没有分隔符的行视为「仅手机号」，接码地址留空；
@@ -86,7 +87,7 @@ def parse_phone_lines(text: str) -> list[dict[str, str]]:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        parts = line.split(SEP, 1)
+        parts = re.split(r"-{2,}", line, maxsplit=1)
         phone = parts[0].strip()
         fetch_url = parts[1].strip() if len(parts) == 2 else ""
         if not phone:

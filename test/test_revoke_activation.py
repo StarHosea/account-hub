@@ -68,14 +68,12 @@ class RevokeActivationTest(unittest.TestCase):
 
 class RevokeActivationCdkIntegrationTest(unittest.TestCase):
     def test_revoke_use_restores_available(self):
-        from pathlib import Path
         import tempfile
 
         from services.cdk_service import CdkService
 
         with tempfile.TemporaryDirectory() as tmp:
-            store = Path(tmp) / "cdks.json"
-            svc = CdkService(store_file=store)
+            svc = CdkService()
             svc._cdks = {
                 "CDK-1": {
                     "cdk": "CDK-1",

@@ -114,12 +114,10 @@ async function humanClickByText(page, texts, { timeout = 15000, poll = 400, excl
 }
 
 // 轮询等待某选择器可见后返回其 locator（等待窗口弹出，不是绕过）。
-// 轮询期间若命中限流页则立即抛错，避免长时间空等。
 async function firstVisible(page, selector, { timeout = 15000 } = {}) {
   const deadline = Date.now() + timeout;
   const loc = page.locator(selector).first();
   while (Date.now() < deadline) {
-    await throwIfRateLimited(page);
     if (await loc.isVisible().catch(() => false)) return loc;
     await sleep(400);
   }

@@ -1,15 +1,12 @@
 from __future__ import annotations
 
-import json
 import threading
 from datetime import datetime, timezone
-from pathlib import Path
 
-from services.config import DATA_DIR, config
+from services.config import config
 
 
 COLLECTION = "register_abnormal"
-LEGACY_FILE = DATA_DIR / "register_abnormal.json"
 
 
 def _now() -> str:
@@ -27,8 +24,7 @@ class RegisterAbnormalService:
     这些账号不进入号池（账号管理）。由 openai_register.worker() 在各类失败路径调用 add() 写入。
     """
 
-    def __init__(self, store_file: Path = LEGACY_FILE, storage=None) -> None:
-        self._store_file = store_file
+    def __init__(self, storage=None) -> None:
         self._storage = storage if storage is not None else config.get_storage_backend()
         self._lock = threading.RLock()
         self._items: dict[str, dict] = self._load()
@@ -39,19 +35,9 @@ class RegisterAbnormalService:
     def _load(self) -> dict[str, dict]:
         items = self._storage.load_collection(COLLECTION)
         if items is None:
-            items = self._read_legacy_items()
-            result = self._items_to_map(items)
-            self._storage.save_collection(COLLECTION, list(result.values()))
-            return result
+            items = []
+            self._storage.save_collection(COLLECTION, [])
         return self._items_to_map(items)
-
-    def _read_legacy_items(self) -> list:
-        try:
-            data = json.loads(self._store_file.read_text(encoding="utf-8"))
-        except Exception:
-            return []
-        items = data if isinstance(data, list) else data.get("items") if isinstance(data, dict) else None
-        return items if isinstance(items, list) else []
 
     def _items_to_map(self, items: list) -> dict[str, dict]:
         result: dict[str, dict] = {}
@@ -78,6 +64,7 @@ class RegisterAbnormalService:
             "access_token": str(item.get("access_token") or "").strip() or None,
             "password": str(item.get("password") or "").strip() or None,
             "eligible": item.get("eligible") if isinstance(item.get("eligible"), bool) else None,
+            "recording_path": str(item.get("recording_path") or "").strip() or None,
             "created_at": item.get("created_at") or _now(),
         }
 
@@ -124,6 +111,7 @@ class RegisterAbnormalService:
                 "access_token": extra.get("access_token") or existing.get("access_token"),
                 "password": extra.get("password") or existing.get("password"),
                 "eligible": extra.get("eligible", existing.get("eligible")),
+                "recording_path": extra.get("recording_path") or existing.get("recording_path"),
                 "created_at": existing.get("created_at") or _now(),
             }
             normalized = self._normalize(merged)

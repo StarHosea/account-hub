@@ -7,7 +7,6 @@ from sqlalchemy import create_engine, text
 
 from services.storage.database_storage import DatabaseStorageBackend
 from services.storage.db_url import resolve_database_url
-from services.storage.json_seed_migration import maybe_migrate_json_seeds
 from services.storage.operation_log_storage import OperationLogStorage
 
 
@@ -51,18 +50,6 @@ class StoragePostgresTest(unittest.TestCase):
         loaded = self.backend.load_collection("register_abnormal")
         self.assertEqual(len(loaded or []), 1)
         self.assertEqual(loaded[0]["email"], "bad@example.com")
-
-    def test_json_seed_migration_accounts(self) -> None:
-        path = self.data_dir / "accounts.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            '[{"access_token": "tok1", "email": "a@x.com"}]',
-            encoding="utf-8",
-        )
-        maybe_migrate_json_seeds(self.backend, self.data_dir)
-        accounts = self.backend.load_accounts()
-        self.assertEqual(len(accounts), 1)
-        self.assertEqual(accounts[0]["access_token"], "tok1")
 
     def test_operation_logs_add_and_list(self) -> None:
         storage = OperationLogStorage(self.url)

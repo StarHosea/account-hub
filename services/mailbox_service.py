@@ -1,14 +1,10 @@
 from __future__ import annotations
 
-import json
 import re
 import threading
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
-from services.config import DATA_DIR, config
-
-MAILBOX_FILE = DATA_DIR / "mailboxes.json"
+from services.config import config
 
 # 单次批量导入上限（防止一次性提交超大文本拖慢全量重写）。
 MAX_IMPORT_ROWS = 2000
@@ -56,10 +52,7 @@ class MailboxService:
     used=True 表示该邮箱已注册过账号（或被人工标记不再使用），注册机会跳过它。
     """
 
-    def __init__(self, store_file: Path = MAILBOX_FILE, storage=None):
-        # storage 可注入（测试隔离用）；默认取全局单例后端。store_file 仅用于旧
-        # data/mailboxes.json 的一次性迁移读取。
-        self._store_file = store_file
+    def __init__(self, storage=None):
         self._storage = storage if storage is not None else config.get_storage_backend()
         self._lock = threading.RLock()
         self._mailboxes: dict[str, dict] = self._load()
@@ -69,19 +62,9 @@ class MailboxService:
     def _load(self) -> dict[str, dict]:
         items = self._storage.load_collection("mailboxes")
         if items is None:
-            items = self._read_legacy_items()
-            result = self._items_to_map(items)
-            self._storage.save_collection("mailboxes", list(result.values()))
-            return result
+            items = []
+            self._storage.save_collection("mailboxes", [])
         return self._items_to_map(items)
-
-    def _read_legacy_items(self) -> list:
-        try:
-            data = json.loads(self._store_file.read_text(encoding="utf-8"))
-        except Exception:
-            return []
-        items = data if isinstance(data, list) else data.get("items") if isinstance(data, dict) else None
-        return items if isinstance(items, list) else []
 
     def _items_to_map(self, items: list) -> dict[str, dict]:
         result: dict[str, dict] = {}

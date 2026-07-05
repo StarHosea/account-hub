@@ -18,6 +18,13 @@ import {
   type SettingsConfig,
 } from "@/lib/api";
 import { navRef } from "@/constants/nav";
+import {
+  buildRegisterProxyPayload,
+  DEFAULT_HTTP_PROXY,
+  defaultIpwebFields,
+  hydrateRegisterProxyFields,
+  type RegisterProxyMode,
+} from "@/lib/register-proxy";
 
 function normalizeConfig(config: SettingsConfig): SettingsConfig {
   return {
@@ -56,16 +63,23 @@ type SettingsStore = {
 
   loadRegister: (silent?: boolean) => Promise<void>;
   setRegisterConfig: (config: RegisterConfig) => void;
-  setRegisterProxy: (value: string) => void;
+  setRegisterProxyMode: (mode: RegisterProxyMode) => void;
+  setRegisterHttpProxy: (value: string) => void;
+  setRegisterIpwebGateway: (value: string) => void;
+  setRegisterIpwebAccountId: (value: string) => void;
+  setRegisterIpwebPassword: (value: string) => void;
   setRegisterTotal: (value: string) => void;
   setRegisterThreads: (value: string) => void;
   setRegisterEnable2fa: (value: boolean) => void;
   setRegisterRegions: (values: string[]) => void;
-  setRegisterIpwebRotate: (value: boolean) => void;
-  setRegisterIpDuration: (value: number) => void;
+  setRegisterTimeoutMinutes: (value: number) => void;
   setRegisterStaticCacheEnabled: (value: boolean) => void;
   setRegisterStaticCacheMaxAgeDays: (value: number) => void;
   setRegisterStaticCacheDir: (value: string) => void;
+  setRegisterRecordEnabled: (value: boolean) => void;
+  setRegisterRecordDir: (value: string) => void;
+  setRegisterRecordKeep: (value: "fail" | "all" | "none") => void;
+  setRegisterDiagPublicUrl: (value: string) => void;
   setRegisterMailField: (key: "request_timeout" | "wait_timeout" | "wait_interval", value: string) => void;
   setRegisterProviderType: (type: RegisterProviderType) => void;
   updateRegisterProvider: (updates: Partial<RegisterProvider>) => void;
@@ -84,19 +98,48 @@ type SettingsStore = {
   saveActivationConfig: (opts?: { silent?: boolean }) => Promise<void>;
 };
 
+function clampRegisterTimeoutSeconds(seconds: number): number {
+  return Math.min(1800, Math.max(60, Math.round(seconds)));
+}
+
+function registerTimeoutMinutes(config: RegisterConfig): number {
+  return Math.round(clampRegisterTimeoutSeconds(Number(config.register_timeout) || 600) / 60);
+}
+
+function withRegisterProxyFields(config: RegisterConfig): RegisterConfig {
+  return hydrateRegisterProxyFields(config);
+}
+
 function buildRegisterPayload(config: RegisterConfig): Partial<RegisterConfig> {
+  const register_timeout = clampRegisterTimeoutSeconds(
+    Number(config.register_timeout) || registerTimeoutMinutes(config) * 60,
+  );
+  let proxyPayload: ReturnType<typeof buildRegisterProxyPayload>;
+  try {
+    proxyPayload = buildRegisterProxyPayload(config);
+  } catch (error) {
+    throw error instanceof Error ? error : new Error("注册代理配置无效");
+  }
   return {
     mail: config.mail,
-    proxy: config.proxy.trim(),
+    proxy: proxyPayload.proxy,
+    proxy_mode: proxyPayload.proxy_mode,
+    http_proxy: proxyPayload.http_proxy,
     total: Math.max(1, Number(config.total) || 1),
     threads: Math.max(1, Number(config.threads) || 1),
     enable_2fa: Boolean(config.enable_2fa),
     regions: config.regions && config.regions.length ? config.regions : ["US"],
-    ipweb_rotate: Boolean(config.ipweb_rotate),
-    ip_duration: Math.min(2880, Math.max(1, Number(config.ip_duration) || 120)),
+    ipweb_rotate: proxyPayload.ipweb_rotate,
+    register_timeout,
     static_cache_enabled: config.static_cache_enabled !== false,
     static_cache_max_age_days: Math.min(90, Math.max(1, Number(config.static_cache_max_age_days) || 7)),
     static_cache_dir: String(config.static_cache_dir || "").trim(),
+    record_enabled: config.record_enabled !== false,
+    record_dir: String(config.record_dir || "").trim(),
+    record_keep: (["fail", "all", "none"].includes(String(config.record_keep || "fail"))
+      ? String(config.record_keep)
+      : "fail") as "fail" | "all" | "none",
+    diag_public_url: String(config.diag_public_url || "").trim().replace(/\/$/, ""),
   };
 }
 
@@ -190,7 +233,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     if (!silent) set({ isLoadingRegister: true });
     try {
       const data = await fetchRegisterConfig();
-      set({ registerConfig: data.register });
+      set({ registerConfig: withRegisterProxyFields(data.register) });
     } catch (error) {
       if (!silent) toast.error(error instanceof Error ? error.message : "加载注册配置失败");
     } finally {
@@ -199,11 +242,48 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   },
 
   setRegisterConfig: (config) => {
-    set({ registerConfig: config, isLoadingRegister: false });
+    set({ registerConfig: withRegisterProxyFields(config), isLoadingRegister: false });
   },
 
-  setRegisterProxy: (value) => {
-    set((state) => (state.registerConfig ? { registerConfig: { ...state.registerConfig, proxy: value } } : {}));
+  setRegisterProxyMode: (mode) => {
+    set((state) => {
+      if (!state.registerConfig) return {};
+      const next: RegisterConfig = { ...state.registerConfig, proxy_mode: mode };
+      if (mode === "ipweb") {
+        const defaults = defaultIpwebFields();
+        if (!next.ipweb_gateway?.trim()) next.ipweb_gateway = defaults.gateway;
+        if (!next.ipweb_account_id?.trim()) next.ipweb_account_id = defaults.accountId;
+        if (!next.ipweb_password?.trim()) next.ipweb_password = defaults.password;
+      }
+      if (mode === "http" && !next.http_proxy?.trim()) {
+        next.http_proxy = DEFAULT_HTTP_PROXY;
+      }
+      return { registerConfig: withRegisterProxyFields(next) };
+    });
+  },
+
+  setRegisterHttpProxy: (value) => {
+    set((state) =>
+      state.registerConfig ? { registerConfig: { ...state.registerConfig, http_proxy: value } } : {},
+    );
+  },
+
+  setRegisterIpwebGateway: (value) => {
+    set((state) =>
+      state.registerConfig ? { registerConfig: { ...state.registerConfig, ipweb_gateway: value } } : {},
+    );
+  },
+
+  setRegisterIpwebAccountId: (value) => {
+    set((state) =>
+      state.registerConfig ? { registerConfig: { ...state.registerConfig, ipweb_account_id: value } } : {},
+    );
+  },
+
+  setRegisterIpwebPassword: (value) => {
+    set((state) =>
+      state.registerConfig ? { registerConfig: { ...state.registerConfig, ipweb_password: value } } : {},
+    );
   },
 
   setRegisterTotal: (value) => {
@@ -230,15 +310,19 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     );
   },
 
-  setRegisterIpwebRotate: (value) => {
+  setRegisterTimeoutMinutes: (value) => {
+    const minutes = Math.min(30, Math.max(1, Math.round(Number(value) || 10)));
+    const register_timeout = minutes * 60;
     set((state) =>
-      state.registerConfig ? { registerConfig: { ...state.registerConfig, ipweb_rotate: value } } : {},
-    );
-  },
-
-  setRegisterIpDuration: (value) => {
-    set((state) =>
-      state.registerConfig ? { registerConfig: { ...state.registerConfig, ip_duration: value } } : {},
+      state.registerConfig
+        ? {
+            registerConfig: {
+              ...state.registerConfig,
+              register_timeout,
+              ip_duration: minutes,
+            },
+          }
+        : {},
     );
   },
 
@@ -259,6 +343,32 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   setRegisterStaticCacheDir: (value) => {
     set((state) =>
       state.registerConfig ? { registerConfig: { ...state.registerConfig, static_cache_dir: value } } : {},
+    );
+  },
+
+  setRegisterRecordEnabled: (value) => {
+    set((state) =>
+      state.registerConfig ? { registerConfig: { ...state.registerConfig, record_enabled: value } } : {},
+    );
+  },
+
+  setRegisterRecordDir: (value) => {
+    set((state) =>
+      state.registerConfig ? { registerConfig: { ...state.registerConfig, record_dir: value } } : {},
+    );
+  },
+
+  setRegisterRecordKeep: (value) => {
+    set((state) =>
+      state.registerConfig ? { registerConfig: { ...state.registerConfig, record_keep: value } } : {},
+    );
+  },
+
+  setRegisterDiagPublicUrl: (value) => {
+    set((state) =>
+      state.registerConfig
+        ? { registerConfig: { ...state.registerConfig, diag_public_url: value.trim().replace(/\/$/, "") } }
+        : {},
     );
   },
 
@@ -319,7 +429,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     set({ isSavingRegister: true });
     try {
       const data = await updateRegisterConfig(buildRegisterPayload(registerConfig));
-      set({ registerConfig: data.register });
+      set({ registerConfig: withRegisterProxyFields(data.register) });
       if (!opts?.silent) toast.success("注册配置已保存");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "保存注册配置失败");
@@ -338,7 +448,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         await updateRegisterConfig(buildRegisterPayload(registerConfig));
       }
       const data = registerConfig.enabled ? await stopRegister() : await startRegister();
-      set({ registerConfig: data.register });
+      set({ registerConfig: withRegisterProxyFields(data.register) });
       toast.success(
         registerConfig.enabled
           ? "已停止注册：在途浏览器已终止，运行日志见批量注册页"
@@ -357,7 +467,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     set({ isSavingRegister: true });
     try {
       const data = await stopRegister();
-      set({ registerConfig: data.register });
+      set({ registerConfig: withRegisterProxyFields(data.register) });
       toast.success("已停止注册：在途指纹浏览器已终止");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "停止注册失败");
@@ -370,7 +480,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     set({ isSavingRegister: true });
     try {
       const data = await resetRegisterApi();
-      set({ registerConfig: data.register });
+      set({ registerConfig: withRegisterProxyFields(data.register) });
       toast.success("注册统计已重置");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "重置注册统计失败");

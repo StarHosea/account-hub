@@ -14,9 +14,6 @@ from services.config import DATA_DIR, config
 from services.register import mail_provider, openai_register, fingerprint
 
 
-REGISTER_FILE = DATA_DIR / "register.json"
-
-
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -34,6 +31,8 @@ def _default_config() -> dict:
     return {
         "mail": _default_mail(),
         "proxy": "",
+        "proxy_mode": "ipweb",
+        "http_proxy": "http://127.0.0.1:7890",
         "total": 10,
         "threads": 3,
         "enabled": False,
@@ -46,12 +45,17 @@ def _default_config() -> dict:
         # 浏览器引擎（CloakBrowser）相关：注册内核已完全替换为浏览器引擎
         "engine": "browser",
         "headless": False,
-        "register_timeout": 900,
+        "register_timeout": 600,
         "node_bin": "node",
         # 浏览器静态资源 route 缓存（JS/CSS/字体等，不共享 Cookie）
         "static_cache_enabled": True,
         "static_cache_max_age_days": 7,
         "static_cache_dir": "",
+        # 注册失败 DOM/Trace 存证（默认开启，目录 data/recordings）
+        "record_enabled": True,
+        "record_dir": "",
+        "record_keep": "fail",
+        "diag_public_url": "",
         "stats": {
             "success": 0,
             "fail": 0,
@@ -95,11 +99,26 @@ def _normalize_providers(mail: dict) -> list[dict]:
     return cleaned
 
 
+def _infer_proxy_mode(proxy: str) -> str:
+    p = str(proxy or "").strip()
+    if not p:
+        return "ipweb"
+    parsed = fingerprint.parse_proxy(p)
+    if parsed and parsed.host.endswith("ipweb.cc") and parsed.user.startswith("B_"):
+        return "ipweb"
+    return "http"
+
+
 def _normalize(raw: dict) -> dict:
     cfg = _default_config()
     cfg["total"] = max(1, int(raw.get("total") or cfg["total"]))
     cfg["threads"] = max(1, int(raw.get("threads") or cfg["threads"]))
     cfg["proxy"] = str(raw.get("proxy") or "").strip()
+    mode = str(raw.get("proxy_mode") or "").strip().lower()
+    cfg["proxy_mode"] = mode if mode in ("none", "ipweb", "http") else _infer_proxy_mode(cfg["proxy"])
+    cfg["http_proxy"] = str(raw.get("http_proxy") or "").strip() or "http://127.0.0.1:7890"
+    if cfg["proxy_mode"] == "none":
+        cfg["proxy"] = ""
     mail = raw.get("mail") if isinstance(raw.get("mail"), dict) else {}
     cfg["mail"] = {
         "request_timeout": float(mail.get("request_timeout") or 30),
@@ -116,6 +135,10 @@ def _normalize(raw: dict) -> dict:
     # 未显式配置时：ipweb 动态住宅代理（B_<id>_..._<SID>）默认开启号一号一 IP。
     if "ipweb_rotate" in raw:
         cfg["ipweb_rotate"] = bool(raw.get("ipweb_rotate"))
+    elif cfg["proxy_mode"] == "http":
+        cfg["ipweb_rotate"] = False
+    elif cfg["proxy_mode"] == "none":
+        cfg["ipweb_rotate"] = False
     else:
         parsed = fingerprint.parse_proxy(cfg["proxy"])
         cfg["ipweb_rotate"] = bool(
@@ -123,18 +146,24 @@ def _normalize(raw: dict) -> dict:
             and parsed.host.endswith("ipweb.cc")
             and parsed.user.startswith("B_")
         )
-    cfg["ip_duration"] = min(2880, max(1, int(raw.get("ip_duration") or 120)))
+    cfg["register_timeout"] = min(1800, max(60, int(raw.get("register_timeout") or 600)))
+    # ipweb 一号一 IP 粘性时长与单次注册时限对齐（分钟）
+    cfg["ip_duration"] = min(2880, max(1, (cfg["register_timeout"] + 59) // 60))
     # 出口 IP 探活重试：0 关闭探活（旧行为），上限 20 次避免死循环空转
     cfg["ip_probe_retries"] = min(20, max(0, int(raw.get("ip_probe_retries", cfg["ip_probe_retries"]))))
     # 浏览器引擎配置：engine 固定 browser；headless 默认有头（Linux 上配 Xvfb）；
     # register_timeout 每账号整轮超时（秒）；node_bin 为 node 可执行文件。
     cfg["engine"] = "browser"
     cfg["headless"] = bool(raw.get("headless"))
-    cfg["register_timeout"] = min(1800, max(60, int(raw.get("register_timeout") or 900)))
     cfg["node_bin"] = str(raw.get("node_bin") or "node").strip() or "node"
     cfg["static_cache_enabled"] = bool(raw.get("static_cache_enabled", cfg["static_cache_enabled"]))
     cfg["static_cache_max_age_days"] = min(90, max(1, int(raw.get("static_cache_max_age_days") or cfg["static_cache_max_age_days"])))
     cfg["static_cache_dir"] = str(raw.get("static_cache_dir") or "").strip()
+    cfg["record_enabled"] = bool(raw.get("record_enabled", cfg["record_enabled"]))
+    cfg["record_dir"] = str(raw.get("record_dir") or "").strip()
+    keep = str(raw.get("record_keep") or cfg["record_keep"]).strip().lower()
+    cfg["record_keep"] = keep if keep in {"fail", "all", "none"} else "fail"
+    cfg["diag_public_url"] = str(raw.get("diag_public_url") or cfg.get("diag_public_url") or "").strip().rstrip("/")
     base_stats = _default_config()["stats"]
     raw_stats = raw.get("stats") if isinstance(raw.get("stats"), dict) else {}
     cfg["stats"] = {**base_stats, **{k: raw_stats[k] for k in base_stats if k in raw_stats}, "threads": cfg["threads"]}
@@ -147,6 +176,42 @@ def _resolve_static_cache_dir(cfg: dict) -> Path:
     p = Path(raw)
     return p if p.is_absolute() else DATA_DIR.parent / p
   return DATA_DIR / "http-cache"
+
+
+def _resolve_record_dir(cfg: dict) -> Path:
+    if not bool(cfg.get("record_enabled", True)):
+        return Path()
+    raw = str(cfg.get("record_dir") or "").strip()
+    if raw:
+        p = Path(raw)
+        return p if p.is_absolute() else DATA_DIR.parent / p
+    return DATA_DIR / "recordings"
+
+
+def _record_stats(cfg: dict) -> dict:
+    path = _resolve_record_dir(cfg)
+    dir_count = 0
+    size_bytes = 0
+    if path.is_dir():
+        try:
+            for entry in path.iterdir():
+                if not entry.is_dir():
+                    continue
+                dir_count += 1
+                for file_path in entry.rglob("*"):
+                    if not file_path.is_file():
+                        continue
+                    try:
+                        size_bytes += file_path.stat().st_size
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+    return {
+        "record_dir_count": dir_count,
+        "record_size_bytes": size_bytes,
+        "record_resolved_dir": str(path),
+    }
 
 
 def _static_cache_stats(cfg: dict) -> dict:
@@ -173,8 +238,7 @@ def _static_cache_stats(cfg: dict) -> dict:
 
 
 class RegisterService:
-    def __init__(self, store_file: Path):
-        self._store_file = store_file
+    def __init__(self):
         self._storage = config.get_storage_backend()
         self._lock = threading.RLock()
         self._runner: threading.Thread | None = None
@@ -207,18 +271,10 @@ class RegisterService:
     def _load(self) -> dict:
         data = self._storage.load_state("register")
         if data is None:
-            # 后端首次启动：从旧 data/register.json 迁移种子配置。
-            data = self._read_legacy_config()
-            normalized = _normalize(data)
+            normalized = _normalize({})
             self._storage.save_state("register", normalized)
             return normalized
         return _normalize(data)
-
-    def _read_legacy_config(self) -> dict:
-        try:
-            return json.loads(self._store_file.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
 
     def _save(self) -> None:
         self._storage.save_state("register", self._config)
@@ -232,6 +288,7 @@ class RegisterService:
         stats["active_browsers"] = openai_register.active_browser_count()
         base["stats"] = stats
         base.update(_static_cache_stats(self._config))
+        base.update(_record_stats(self._config))
         return base
 
     def _push_to_worker(self) -> None:
@@ -241,6 +298,7 @@ class RegisterService:
                 "mail", "proxy", "total", "threads", "enable_2fa", "regions", "ipweb_rotate",
                 "ip_duration", "ip_probe_retries", "engine", "headless", "register_timeout", "node_bin",
                 "static_cache_enabled", "static_cache_max_age_days", "static_cache_dir",
+                "record_enabled", "record_dir", "record_keep", "diag_public_url",
             )
         })
 
@@ -442,4 +500,4 @@ class RegisterService:
         self._append_log(f"注册任务结束，成功{success}，失败{fail}", "yellow")
 
 
-register_service = RegisterService(REGISTER_FILE)
+register_service = RegisterService()

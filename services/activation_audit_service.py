@@ -8,7 +8,7 @@ from typing import Any
 from services.cdk_redeem_client import scrub
 from services.storage.activation_audit_storage import ActivationAuditStorage
 
-COLLECTION = "activation_audit"  # 历史 JSON 集合名（仅 migrate_from_json_file 使用）
+COLLECTION = "activation_audit"
 MAX_RECORDS = 3000
 MAX_EVENTS_PER_RECORD = 5000
 MAX_LOG_EVENTS_PER_RECORD = 500
@@ -150,10 +150,6 @@ class ActivationAuditService:
 
     def _load(self) -> dict[str, dict]:
         items = self._storage.load()
-        if items is None:
-            items = self._storage.migrate_from_json_file()
-        if items is None:
-            items = self._storage.migrate_from_legacy_sqlite()
         if items is None:
             self._storage.save([])
             return {}

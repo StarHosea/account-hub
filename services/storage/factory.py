@@ -36,11 +36,7 @@ def create_storage_backend(data_dir: Path) -> StorageBackend:
     elif backend_type in ("sqlite", "postgres", "postgresql", "mysql", "database"):
         database_url = resolve_database_url(data_dir)
         print(f"[storage] Using PostgreSQL storage: {mask_database_url(database_url)}")
-        backend = DatabaseStorageBackend(database_url)
-        from services.storage.json_seed_migration import maybe_migrate_json_seeds
-
-        maybe_migrate_json_seeds(backend, data_dir)
-        return backend
+        return DatabaseStorageBackend(database_url)
     
     elif backend_type == "git":
         # Git 仓库存储

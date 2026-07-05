@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 from typing import Any
 
 from sqlalchemy import Column, String, Text, create_engine, text
@@ -29,7 +28,6 @@ class OperationLogStorage:
     """账号操作日志：PostgreSQL 持久化。"""
 
     _SEEDED_KEY = "__seeded__:operation_logs"
-    _LEGACY_PATH = DATA_DIR / "logs.jsonl"
 
     def __init__(self, database_url: str | None = None) -> None:
         url = (database_url or os.getenv("DATABASE_URL") or resolve_database_url(DATA_DIR)).strip()
@@ -38,12 +36,6 @@ class OperationLogStorage:
         LogBase.metadata.create_all(self.engine)
         self._Session = sessionmaker(bind=self.engine)
         self._ensure_state_table()
-        self._migrated_jsonl = False
-
-    def _ensure_migrated(self) -> None:
-        if not self._migrated_jsonl:
-            self._maybe_migrate_jsonl()
-            self._migrated_jsonl = True
 
     def _ensure_state_table(self) -> None:
         with self.engine.begin() as conn:
@@ -76,33 +68,6 @@ class OperationLogStorage:
                 {"key": self._SEEDED_KEY, "data": payload},
             )
 
-    def _maybe_migrate_jsonl(self) -> None:
-        if self._is_seeded() or not self._LEGACY_PATH.exists():
-            return
-        session = self._Session()
-        try:
-            count = 0
-            for line_number, raw_line in enumerate(self._LEGACY_PATH.read_text(encoding="utf-8").splitlines()):
-                item = self._parse_line(raw_line, line_number)
-                if item is None:
-                    continue
-                session.merge(self._row_from_item(item))
-                count += 1
-            session.commit()
-            self._mark_seeded()
-            backup = DATA_DIR / "logs.jsonl.migrated"
-            try:
-                self._LEGACY_PATH.rename(backup)
-            except Exception:
-                pass
-            if count:
-                print(f"[operation_logs] migrated {count} lines from logs.jsonl to PostgreSQL")
-        except Exception:
-            session.rollback()
-            raise
-        finally:
-            session.close()
-
     @staticmethod
     def _parse_line(raw_line: str, line_number: int) -> dict[str, Any] | None:
         import hashlib
@@ -133,7 +98,6 @@ class OperationLogStorage:
         )
 
     def add(self, item: dict[str, Any]) -> None:
-        self._ensure_migrated()
         session = self._Session()
         try:
             session.merge(self._row_from_item(item))
@@ -153,7 +117,6 @@ class OperationLogStorage:
         end_date: str = "",
         limit: int = 200,
     ) -> list[dict[str, Any]]:
-        self._ensure_migrated()
         session = self._Session()
         try:
             query = session.query(OperationLogRow).order_by(OperationLogRow.time.desc())

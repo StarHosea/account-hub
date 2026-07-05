@@ -3,12 +3,23 @@ from __future__ import annotations
 import asyncio
 import json
 
-from fastapi import APIRouter, Header, Query
-from fastapi.responses import Response, StreamingResponse
+from fastapi import APIRouter, Header, Query, Request
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from api.support import require_admin
 from services.register_abnormal_service import register_abnormal_service
+from services.register_diag_service import (
+    artifacts_zip_bytes,
+    brief_latest,
+    build_brief,
+    build_brief_markdown,
+    diag_meta,
+    list_diag_entries,
+    recording_html_path,
+    screenshot_path,
+    trace_zip_path,
+)
 from services.register_service import register_service
 
 
@@ -19,6 +30,8 @@ class RegisterStartRequest(BaseModel):
 class RegisterConfigRequest(BaseModel):
     mail: dict | None = None
     proxy: str | None = None
+    proxy_mode: str | None = None
+    http_proxy: str | None = None
     total: int | None = None
     threads: int | None = None
     enable_2fa: bool | None = None
@@ -33,6 +46,10 @@ class RegisterConfigRequest(BaseModel):
     static_cache_enabled: bool | None = None
     static_cache_max_age_days: int | None = None
     static_cache_dir: str | None = None
+    record_enabled: bool | None = None
+    record_dir: str | None = None
+    record_keep: str | None = None
+    diag_public_url: str | None = None
 
 
 class RegisterAbnormalDeleteRequest(BaseModel):
@@ -159,6 +176,62 @@ def create_router() -> APIRouter:
             text,
             media_type="text/plain; charset=utf-8",
             headers={"Content-Disposition": 'attachment; filename="register-abnormal.txt"'},
+        )
+
+    # ----------------------------- 注册诊断（无鉴权，本地 AI 直链） ----------------------------- #
+
+    @router.get("/api/register/diag/meta")
+    async def register_diag_meta(request: Request):
+        return diag_meta(request)
+
+    @router.get("/api/register/diag/list")
+    async def register_diag_list(request: Request):
+        return list_diag_entries(request)
+
+    @router.get("/api/register/diag/brief")
+    async def register_diag_brief(request: Request, email: str = Query(default="")):
+        target = str(email or "").strip()
+        if not target:
+            return brief_latest(request)
+        return build_brief(target, request)
+
+    @router.get("/api/register/diag/brief.md")
+    async def register_diag_brief_md(request: Request, email: str = Query(default="")):
+        body = build_brief_markdown(email, request)
+        return Response(body, media_type="text/markdown; charset=utf-8")
+
+    @router.get("/api/register/diag/artifacts")
+    async def register_diag_artifacts(email: str = Query(...)):
+        filename, payload = artifacts_zip_bytes(email)
+        return Response(
+            payload,
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    @router.get("/api/register/diag/recording")
+    async def register_diag_recording(email: str = Query(...)):
+        path = recording_html_path(email)
+        if not path:
+            return Response("recording.html 不存在", status_code=404, media_type="text/plain; charset=utf-8")
+        return FileResponse(path, media_type="text/html; charset=utf-8")
+
+    @router.get("/api/register/diag/screenshot")
+    async def register_diag_screenshot(email: str = Query(...)):
+        path = screenshot_path(email)
+        if not path:
+            return Response("截图不存在", status_code=404, media_type="text/plain; charset=utf-8")
+        return FileResponse(path, media_type="image/png")
+
+    @router.get("/api/register/diag/trace")
+    async def register_diag_trace(email: str = Query(...)):
+        path = trace_zip_path(email)
+        if not path:
+            return Response("trace.zip 不存在", status_code=404, media_type="text/plain; charset=utf-8")
+        return FileResponse(
+            path,
+            media_type="application/zip",
+            headers={"Content-Disposition": 'attachment; filename="trace.zip"'},
         )
 
     return router

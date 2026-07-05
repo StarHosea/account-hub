@@ -399,18 +399,32 @@ export type RegisterConfig = {
     providers: RegisterProvider[];
   };
   proxy: string;
+  proxy_mode?: "none" | "ipweb" | "http";
+  http_proxy?: string;
+  /** 前端 UI：由 proxy 解析或用户填写，保存时组装回 proxy */
+  ipweb_gateway?: string;
+  ipweb_account_id?: string;
+  ipweb_password?: string;
   total: number;
   threads: number;
   enable_2fa?: boolean;
   regions?: string[];
   ipweb_rotate?: boolean;
   ip_duration?: number;
+  register_timeout?: number;
   static_cache_enabled?: boolean;
   static_cache_max_age_days?: number;
   static_cache_dir?: string;
   static_cache_size_bytes?: number;
   static_cache_file_count?: number;
   static_cache_resolved_dir?: string;
+  record_enabled?: boolean;
+  record_dir?: string;
+  record_keep?: "fail" | "all" | "none";
+  record_dir_count?: number;
+  record_size_bytes?: number;
+  record_resolved_dir?: string;
+  diag_public_url?: string;
   stats: {
     job_id?: string;
     success: number;
@@ -1072,7 +1086,15 @@ export type RegisterAbnormal = {
   access_token: string | null;
   password: string | null;
   eligible: boolean | null;
+  recording_path?: string | null;
   created_at: string;
+  urls?: {
+    brief?: string;
+    artifacts?: string;
+    recording?: string;
+    screenshot?: string;
+    trace?: string;
+  };
 };
 
 export type RegisterAbnormalStats = {

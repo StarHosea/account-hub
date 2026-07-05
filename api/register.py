@@ -76,14 +76,31 @@ def create_router() -> APIRouter:
 
         async def stream():
             last = ""
+            idle = 0.0
             while True:
                 payload = json.dumps(register_service.get(), ensure_ascii=False)
                 if payload != last:
                     last = payload
+                    idle = 0.0
                     yield f"data: {payload}\n\n"
+                else:
+                    # 空闲时定期发心跳注释行，避免长时间不发数据被反代 idle timeout 掐断连接。
+                    idle += 0.5
+                    if idle >= 15:
+                        idle = 0.0
+                        yield ": ping\n\n"
                 await asyncio.sleep(0.5)
 
-        return StreamingResponse(stream(), media_type="text/event-stream")
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                # 关闭 nginx 对该响应的缓冲，SSE 才能实时逐条下发。
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     # ----------------------------- 注册机异常账号清单 ----------------------------- #
 

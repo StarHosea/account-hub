@@ -82,15 +82,27 @@ _active_procs: set[subprocess.Popen] = set()
 progress_lock = threading.Lock()
 progress: dict[int, dict] = {}
 
+# 号一号一 IP：本轮注册已占用的出口公网 IP 集合。探到活 IP 后先在此去重，
+# 已占用则视为「撞号」换 SID 重试，仅探到全新 IP 才登记放行。每轮 start 时清空。
+_used_ips_lock = threading.Lock()
+_used_exit_ips: set[str] = set()
+
 
 def _progress_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
 def reset_progress() -> None:
-    """新一轮注册开始时清空上一轮的进度表。"""
+    """新一轮注册开始时清空上一轮的进度表与出口 IP 去重集合。"""
     with progress_lock:
         progress.clear()
+    reset_used_exit_ips()
+
+
+def reset_used_exit_ips() -> None:
+    """清空「号一号一 IP」去重集合（新一轮注册重新计数）。"""
+    with _used_ips_lock:
+        _used_exit_ips.clear()
 
 
 def progress_snapshot() -> list[dict]:
@@ -200,13 +212,14 @@ def _resolve_account_proxy(identity) -> str:
 
 
 def _acquire_working_proxy(identity, index: int) -> tuple[str, str]:
-    """拿到一条「探活通过」的账号专属出口代理，返回 (account_proxy, exit_ip)。
+    """拿到一条「探活通过且出口 IP 未被本轮占用」的账号专属出口代理，返回 (account_proxy, exit_ip)。
 
     - 未配代理 → 直连 ("","")。
-    - 关闭探活（ip_probe_retries<=0）→ 只解析一次、不探活，行为同旧逻辑（exit_ip 空）。
-    - ipweb 轮换开启 → 最多试 ip_probe_retries 次，每次换全新 SID 后探活，命中即返回；
+    - 关闭探活（ip_probe_retries<=0）→ 只解析一次、不探活、不去重，行为同旧逻辑（exit_ip 空）。
+    - ipweb 轮换开启 → 最多试 ip_probe_retries 次，每次换全新 SID 后探活；探到的 IP 若已被
+      本轮其它账号占用则视为撞号、换 SID 重试，探到全新 IP 才登记占用并返回（号一号一 IP）；
       全失败 → 记 warning 并回退「最后一次解析到的代理」（不比旧逻辑差，仍带出口代理）。
-    - 非 ipweb（固定代理）→ 探活一次；不活也照用（用户固定代理，换 SID 无意义）。
+    - 非 ipweb（固定代理）→ 探活一次；撞号/不活也照用（用户固定代理，换 SID 无意义）。
     """
     base = config.get("proxy") or ""
     if not base:
@@ -226,14 +239,25 @@ def _acquire_working_proxy(identity, index: int) -> tuple[str, str]:
         last_proxy = acct_proxy
         exit_ip = _probe_exit_ip(acct_proxy)
         if exit_ip:
-            if attempt > 1:
-                step(index, f"出口 IP 探活通过（第 {attempt} 次换线）：{exit_ip}")
+            # 号一号一 IP：探到活 IP 后做全局去重。已被本轮占用 → 撞号，换 SID 重试。
+            with _used_ips_lock:
+                duplicated = exit_ip in _used_exit_ips
+                if not duplicated:
+                    _used_exit_ips.add(exit_ip)
+            if not duplicated:
+                if attempt > 1:
+                    step(index, f"出口 IP 探活通过（第 {attempt} 次换线）：{exit_ip}")
+                return acct_proxy, exit_ip
+            if rotate:
+                step(index, f"出口 IP {exit_ip} 已被占用（撞号），换 SID 重试（第 {attempt}/{attempts} 次）", "yellow")
+                continue
+            # 非 ipweb 固定代理：换 SID 无意义，撞号也只能沿用（固定代理本就共享同一 IP）
             return acct_proxy, exit_ip
         if rotate:
             step(index, f"出口 IP 探活失败（第 {attempt}/{attempts} 次），换 SID 重试", "yellow")
 
     if rotate:
-        step(index, "多次换 SID 仍未探到活 IP，回退沿用最后一条代理继续", "yellow")
+        step(index, "多次换 SID 仍未探到未占用的新 IP，回退沿用最后一条代理继续（本账号可能与他号共用 IP）", "yellow")
     # 非 ipweb 固定代理：探活失败也照用（换 SID 无意义）
     return last_proxy, ""
 

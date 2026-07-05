@@ -16,6 +16,26 @@ import { launchSession } from './cloakbrowser.js';
 import { sleep } from './utils.js';
 import { registerChatGPT, secureExistingChatGPT, loginChatGPT } from './flows/openai/register.js';
 
+// 只要主 frame 浏览器地址变化，就单独打一行 [URL] 日志（不与业务日志混行），
+// 便于按页面路径精准定位当前步骤/卡点。ChatGPT 是 SPA：很多跳转走 history.pushState/
+// 改 hash（如 #settings、/log-in/password 内部路由），不触发 framenavigated——
+// 故 framenavigated 即时打真实跳转，再叠一个轻量轮询兜底 SPA/hash 变化，零遗漏。
+function attachUrlLogger(page, log) {
+  let last = '';
+  const emitIfChanged = () => {
+    let url = '';
+    try { url = page.url(); } catch { return; }
+    if (!url || url === 'about:blank' || url === last) return;
+    last = url;
+    log(`[URL] ${url}`);
+  };
+  page.on('framenavigated', (frame) => { if (frame === page.mainFrame()) emitIfChanged(); });
+  const timer = setInterval(emitIfChanged, 500);
+  if (timer.unref) timer.unref(); // 不因轮询定时器阻止进程退出
+  page.on('close', () => clearInterval(timer));
+  return () => clearInterval(timer);
+}
+
 function parseJob() {
   const raw = process.argv[2];
   if (raw) {
@@ -78,6 +98,7 @@ async function runReal(job) {
     const seed = session.seed;
     const page = await session.context.newPage();
     page.setDefaultTimeout(45000);
+    attachUrlLogger(page, (m) => log(m)); // 地址一变就单独打一行 [URL]，覆盖 register/login/existing 全流程
 
     const common = {
       page,

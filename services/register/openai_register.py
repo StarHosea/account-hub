@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import random
 import re
 import subprocess
@@ -51,7 +52,7 @@ config = {
     # 浏览器引擎相关（由 register_service._push_to_worker 下发）
     "engine": "browser",
     "headless": False,
-    "register_timeout": 300,
+    "register_timeout": 900,
     "node_bin": "node",
     "cloakbrowser_license": "",
     "static_cache_enabled": True,
@@ -125,6 +126,8 @@ progress: dict[int, dict] = {}
 # 已占用则视为「撞号」换 SID 重试，仅探到全新 IP 才登记放行。每轮 start 时清空。
 _used_ips_lock = threading.Lock()
 _used_exit_ips: set[str] = set()
+
+_TIMEOUT_SENTINEL = object()
 
 
 def _progress_now() -> str:
@@ -555,9 +558,62 @@ def _lookup_stored_credentials(email: str) -> tuple[str, str]:
     return "", ""
 
 
-def _run_browser_job(index: int, email: str, mailbox: dict, browser_proxy: str, identity) -> tuple[dict | None, str | None, dict]:
+def _register_timeout_s() -> int:
+    return int(config.get("register_timeout") or 900)
+
+
+def _remaining_task_seconds(deadline_at: float) -> float:
+    return max(0.0, deadline_at - time.time())
+
+
+def _timeout_error_message() -> str:
+    return f"注册超时（{_register_timeout_s()} 秒）"
+
+
+def _start_stdout_reader(proc: subprocess.Popen, out_q: queue.Queue) -> None:
+    def _reader() -> None:
+        try:
+            if proc.stdout:
+                for raw_line in proc.stdout:
+                    out_q.put(raw_line)
+        except Exception:
+            pass
+        finally:
+            out_q.put(None)
+
+    threading.Thread(target=_reader, daemon=True).start()
+
+
+def _next_worker_line(proc: subprocess.Popen, out_q: queue.Queue, deadline_at: float):
+    """读取下一行 NDJSON；None=EOF；_TIMEOUT_SENTINEL=任务时限已到。"""
+    while True:
+        remaining = _remaining_task_seconds(deadline_at)
+        if remaining <= 0:
+            return _TIMEOUT_SENTINEL
+        try:
+            item = out_q.get(timeout=min(1.0, remaining))
+        except queue.Empty:
+            if proc.poll() is not None and out_q.empty():
+                return None
+            continue
+        return item
+
+
+def _run_browser_job(
+    index: int,
+    email: str,
+    mailbox: dict,
+    browser_proxy: str,
+    identity,
+    *,
+    deadline_at: float,
+) -> tuple[dict | None, str | None, dict]:
     """启动 Node 子进程跑浏览器流程，泵 NDJSON，返回 (result_data, error_msg, partial)。"""
-    timeout_s = int(config.get("register_timeout") or 300)
+    remaining = _remaining_task_seconds(deadline_at)
+    if remaining <= 0:
+        return None, _timeout_error_message(), {}
+
+    timeout_s = max(1, int(remaining))
     job = {
         "email": email,
         "proxyUrl": browser_proxy,
@@ -584,14 +640,14 @@ def _run_browser_job(index: int, email: str, mailbox: dict, browser_proxy: str, 
             parts.append("双重验证密钥")
         step(index, f"已从本地读取历史{'和'.join(parts)}")
     mode_label = "无头" if job.get("headless") else "有界面"
-    step(index, f"正在启动浏览器，{mode_label}模式，最长等待 {timeout_s} 秒")
+    step(index, f"正在启动浏览器，{mode_label}模式，本任务剩余时限约 {timeout_s} 秒")
     proc = _spawn_worker(job)
     step(index, "浏览器已启动")
     with _active_lock:
         _active_procs.add(proc)
 
     # 硬超时看门狗：Node 侧自身有 Promise.race，这里再兜一层，防止无输出挂死。
-    watchdog = threading.Timer(timeout_s + 60, lambda: _terminate(proc))
+    watchdog = threading.Timer(remaining + 15, lambda: _terminate(proc))
     watchdog.daemon = True
     watchdog.start()
 
@@ -608,12 +664,21 @@ def _run_browser_job(index: int, email: str, mailbox: dict, browser_proxy: str, 
 
     threading.Thread(target=_drain_stderr, daemon=True).start()
 
+    out_q: queue.Queue = queue.Queue()
+    _start_stdout_reader(proc, out_q)
+
     data: dict | None = None
     err_msg: str | None = None
     partial: dict = {}
     try:
-        for raw_line in proc.stdout:  # type: ignore[union-attr]
-            line = raw_line.strip()
+        while True:
+            raw_line = _next_worker_line(proc, out_q, deadline_at)
+            if raw_line is _TIMEOUT_SENTINEL:
+                err_msg = err_msg or _timeout_error_message()
+                break
+            if raw_line is None:
+                break
+            line = str(raw_line).strip()
             if not line:
                 continue
             try:
@@ -624,11 +689,19 @@ def _run_browser_job(index: int, email: str, mailbox: dict, browser_proxy: str, 
             if etype == "log":
                 step(index, str(evt.get("message") or ""), _level_color(evt.get("level")))
             elif etype == "need_code":
+                if _remaining_task_seconds(deadline_at) <= 0:
+                    err_msg = _timeout_error_message()
+                    break
                 purpose = str(evt.get("purpose") or "register")
                 label = _code_purpose_label(purpose)
                 step(index, f"正在等待{label}验证码…")
+                round_timeout = min(
+                    mail_code.ROUND_WAIT_TIMEOUT,
+                    _remaining_task_seconds(deadline_at),
+                )
                 code = mail_code.fulfill_need_code(
                     _mail_config(), mailbox, ts=evt.get("ts"), purpose=purpose,
+                    round_timeout=round_timeout,
                 )
                 _send_line(proc, {"type": "code", "code": code})
                 if code:
@@ -663,12 +736,36 @@ def _run_browser_job(index: int, email: str, mailbox: dict, browser_proxy: str, 
 def worker(index: int) -> dict:
     ensure_config_loaded()
     start = time.time()
+    deadline_at = start + _register_timeout_s()
     _progress_update(index, status="running", step="任务启动", email="")
     mailbox: dict | None = None
     mailbox_settled = False
 
+    def _fail_timeout() -> dict:
+        nonlocal mailbox_settled
+        err = _timeout_error_message()
+        if mailbox is not None and not mailbox_settled:
+            try:
+                mail_provider.mark_mailbox_result(mailbox, success=False, error=err)
+                mailbox_settled = True
+            except Exception:
+                pass
+        email = str((mailbox or {}).get("address") or "").strip()
+        fetch_url = str((mailbox or {}).get("fetch_url") or "")
+        if email:
+            register_abnormal_service.add(email, fetch_url=fetch_url, reason=err)
+            log(f"{email} 注册超时，已记入异常清单", "yellow")
+        cost = time.time() - start
+        with stats_lock:
+            stats["done"] += 1
+            stats["fail"] += 1
+        log(f"任务 {index} {err}，耗时 {cost:.1f} 秒", "red")
+        return {"ok": False, "index": index, "error": err}
+
     verb = _mailbox_verb()
     try:
+        if _remaining_task_seconds(deadline_at) <= 0:
+            return _fail_timeout()
         step(index, f"任务启动，开始{verb}邮箱")
         try:
             mailbox = mail_provider.create_mailbox(_mail_config())
@@ -691,6 +788,9 @@ def worker(index: int) -> dict:
                 stats["fail"] += 1
             log(f"任务{index} 注册任务已停止，跳过启动浏览器", "yellow")
             return {"ok": False, "index": index, "error": "注册任务已停止", "stop_run": True}
+
+        if _remaining_task_seconds(deadline_at) <= 0:
+            return _fail_timeout()
 
         identity = build_identity(enabled_regions=config.get("regions") or ["US"])
         acct_proxy, exit_ip = _acquire_working_proxy(identity, index)
@@ -724,7 +824,12 @@ def worker(index: int) -> dict:
             log(f"任务{index} 注册任务已停止，跳过启动浏览器", "yellow")
             return {"ok": False, "index": index, "error": "注册任务已停止", "stop_run": True}
 
-        data, err_msg, partial = _run_browser_job(index, email, mailbox, browser_proxy, identity)
+        if _remaining_task_seconds(deadline_at) <= 0:
+            return _fail_timeout()
+
+        data, err_msg, partial = _run_browser_job(
+            index, email, mailbox, browser_proxy, identity, deadline_at=deadline_at,
+        )
 
         # —— 成功：拿到 token —— #
         if data and str(data.get("accessToken") or "").strip():

@@ -134,21 +134,35 @@ class AccountService:
         """启动对账：把硬杀残留、卡在「排队中/激活中」的账号复位为「未激活」，供重启后重新激活。
 
         清 plus_cdk/plus_task_id/plus_last_message；**保留 plus_attempts**（续着已试次数，避免无限重试）；
-        不动 plus_unavailable 及「已激活/激活失败」终态。返回复位数量。
+        不动 plus_unavailable 及「已激活/激活失败」终态。同时把 stage 从 activating 复位为 registered。
+        返回复位数量。
         """
+        from services.account_lifecycle import STAGE_ACTIVATING, STAGE_REGISTERED, apply_stage, enrich_account
+
         reset = 0
         for acct in self.list_accounts():
-            if acct.get("plus_status") in ("排队中", "激活中"):
-                token = acct.get("access_token")
-                if not token:
-                    continue
-                self.update_account(token, {
-                    "plus_status": "未激活",
-                    "plus_cdk": None,
-                    "plus_task_id": None,
-                    "plus_last_message": None,
-                }, quiet=True)
-                reset += 1
+            item = enrich_account(acct)
+            if item.get("plus_status") in ("已激活", "激活失败"):
+                continue
+            if item.get("plus_activated_at"):
+                continue
+            token = item.get("access_token")
+            if not token:
+                continue
+            stuck_plus = item.get("plus_status") in ("排队中", "激活中")
+            stuck_stage = str(item.get("stage")) == STAGE_ACTIVATING
+            if not stuck_plus and not stuck_stage:
+                continue
+            patch: dict = {
+                "plus_status": "未激活",
+                "plus_cdk": None,
+                "plus_task_id": None,
+                "plus_last_message": None,
+            }
+            if stuck_stage:
+                patch = apply_stage({**item, **patch}, STAGE_REGISTERED)
+            self.update_account(token, patch, quiet=True)
+            reset += 1
         return reset
 
     @staticmethod
@@ -199,8 +213,7 @@ class AccountService:
             normalized = self._normalize_account(item)
             if normalized is None:
                 continue
-            raw_token = str(item.get("access_token") or item.get("accessToken") or "").strip()
-            key = raw_token if is_email_key(raw_token) else self._account_dict_key(normalized)
+            key = self._account_dict_key(normalized)
             if key:
                 result[key] = normalized
         return result
@@ -287,11 +300,13 @@ class AccountService:
 
     @staticmethod
     def _account_dict_key(item: dict) -> str:
+        email = str(item.get("email") or "").strip()
+        if email:
+            return email_storage_key(email)
         token = str(item.get("access_token") or "").strip()
         if token and not is_email_key(token):
             return token
-        email = str(item.get("email") or "").strip()
-        return email_storage_key(email) if email else ""
+        return ""
 
     def _normalize_account(self, item: dict) -> dict | None:
         if not isinstance(item, dict):
@@ -420,6 +435,49 @@ class AccountService:
             token = self._token_aliases.get(token, token)
         return token
 
+    def _resolve_storage_key_locked(self, identifier: str) -> str:
+        """Map API identifier (JWT / email:: / email) to the in-memory accounts dict key."""
+        token = str(identifier or "").strip()
+        if not token:
+            return ""
+        aliased = self._resolve_access_token_locked(token)
+        if aliased in self._accounts:
+            return aliased
+        if token in self._accounts:
+            return token
+        if is_email_key(token):
+            return token if token in self._accounts else ""
+        if self._looks_like_email(token):
+            email_key = email_storage_key(token)
+            if email_key in self._accounts:
+                return email_key
+        norm = token.lower()
+        for key, raw in self._accounts.items():
+            if not isinstance(raw, dict):
+                continue
+            stored_token = str(raw.get("access_token") or "").strip()
+            if stored_token and stored_token in {token, aliased}:
+                return key
+            email = str(raw.get("email") or "").strip().lower()
+            if email and email == norm:
+                return key
+        return ""
+
+    def _rekey_account_locked(self, old_key: str) -> str:
+        raw = self._accounts.get(old_key)
+        if not isinstance(raw, dict):
+            return old_key
+        normalized = self._normalize_account(dict(raw))
+        if normalized is None:
+            return old_key
+        new_key = self._account_dict_key(normalized)
+        if not new_key:
+            return old_key
+        if new_key != old_key:
+            self._accounts.pop(old_key, None)
+        self._accounts[new_key] = normalized
+        return new_key
+
     def resolve_access_token(self, access_token: str) -> str:
         if not access_token:
             return ""
@@ -428,15 +486,17 @@ class AccountService:
 
     def _get_account_for_token(self, access_token: str) -> tuple[str, dict | None]:
         with self._lock:
-            resolved = self._resolve_access_token_locked(access_token)
-            account = self._accounts.get(resolved)
-            return resolved, dict(account) if account else None
+            storage_key = self._resolve_storage_key_locked(access_token)
+            if not storage_key:
+                return "", None
+            account = self._accounts.get(storage_key)
+            return storage_key, dict(account) if account else None
 
     def _record_token_refresh_error(self, access_token: str, event: str, error: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:
-            resolved = self._resolve_access_token_locked(access_token)
-            current = self._accounts.get(resolved)
+            storage_key = self._resolve_storage_key_locked(access_token)
+            current = self._accounts.get(storage_key) if storage_key else None
             if current is None:
                 return
             next_item = dict(current)
@@ -444,7 +504,7 @@ class AccountService:
             next_item["last_token_refresh_error_at"] = now
             account = self._normalize_account(next_item)
             if account is not None:
-                self._accounts[resolved] = account
+                self._accounts[storage_key] = account
                 self._save_accounts()
         log_service.add(
             LOG_TYPE_ACCOUNT,
@@ -461,10 +521,11 @@ class AccountService:
     def _apply_refreshed_tokens(self, old_access_token: str, token_data: dict, event: str) -> str:
         now = datetime.now(timezone.utc).isoformat()
         with self._image_slot_condition:
-            old_token = self._resolve_access_token_locked(old_access_token)
-            current = self._accounts.get(old_token)
+            storage_key = self._resolve_storage_key_locked(old_access_token)
+            current = self._accounts.get(storage_key) if storage_key else None
             if current is None:
-                return old_token
+                return old_access_token
+            old_token = str(current.get("access_token") or old_access_token).strip()
             new_token = str(token_data.get("access_token") or old_token).strip()
             if not new_token:
                 return old_token
@@ -487,12 +548,11 @@ class AccountService:
 
             rotated = new_token != old_token
             if rotated:
-                self._accounts.pop(old_token, None)
                 self._token_aliases[old_token] = new_token
                 old_inflight = int(self._image_inflight.pop(old_token, 0))
                 if old_inflight:
                     self._image_inflight[new_token] = int(self._image_inflight.get(new_token, 0)) + old_inflight
-            self._accounts[new_token] = account
+            self._accounts[storage_key] = account
             self._save_accounts()
             self._image_slot_condition.notify_all()
 
@@ -839,8 +899,8 @@ class AccountService:
         if not access_token:
             return
         with self._lock:
-            access_token = self._resolve_access_token_locked(access_token)
-            current = self._accounts.get(access_token)
+            storage_key = self._resolve_storage_key_locked(access_token)
+            current = self._accounts.get(storage_key) if storage_key else None
             if current is None:
                 return
             next_item = dict(current)
@@ -848,7 +908,7 @@ class AccountService:
             account = self._normalize_account(next_item)
             if account is None:
                 return
-            self._accounts[access_token] = account
+            self._accounts[storage_key] = account
             self._save_accounts()
 
     def remove_invalid_token(self, access_token: str, event: str, quiet: bool = False) -> bool:
@@ -866,10 +926,8 @@ class AccountService:
     def get_account(self, access_token: str) -> dict | None:
         if not access_token:
             return None
-        with self._lock:
-            access_token = self._resolve_access_token_locked(access_token)
-            account = self._accounts.get(access_token)
-            return dict(account) if account else None
+        _, account = self._get_account_for_token(access_token)
+        return account
 
     def list_accounts(self) -> list[dict]:
         """返回所有账号的副本，并为每个账号附加当前图片在途数 image_inflight。
@@ -969,10 +1027,10 @@ class AccountService:
             )
             new_token = str(merged.get("access_token") or "").strip()
 
-            if email_key and email_key != new_token:
-                self._accounts.pop(email_key, None)
+            if new_token:
+                self._accounts.pop(new_token, None)
             for stale_key in list(self._accounts.keys()):
-                if stale_key in {new_token, email_key}:
+                if stale_key == email_key:
                     continue
                 stale = self._accounts.get(stale_key)
                 if (
@@ -981,12 +1039,9 @@ class AccountService:
                 ):
                     self._accounts.pop(stale_key, None)
 
-            if new_token:
-                self._accounts[new_token] = self._normalize_account(merged)
-                account = dict(self._accounts[new_token])
-            else:
-                self._accounts[email_key] = self._normalize_account(merged)
-                account = dict(self._accounts[email_key])
+            storage_key = email_key if norm else (new_token or email_key)
+            self._accounts[storage_key] = self._normalize_account(merged)
+            account = dict(self._accounts[storage_key])
             self._save_accounts()
             return account
 
@@ -1211,7 +1266,22 @@ class AccountService:
             added = 0
             skipped = 0
             for access_token, payload in deduped.items():
-                current = self._accounts.get(access_token)
+                incoming = dict(payload)
+                if not incoming.get("created_at"):
+                    incoming.pop("created_at", None)
+                preview = self._normalize_account(
+                    {
+                        **incoming,
+                        "access_token": access_token,
+                        "type": str(incoming.get("type") or "free"),
+                    }
+                )
+                if preview is None:
+                    continue
+                storage_key = self._account_dict_key(preview)
+                if not storage_key:
+                    continue
+                current = self._accounts.get(storage_key)
                 if current is None:
                     added += 1
                     self._cumulative_total += 1
@@ -1219,9 +1289,6 @@ class AccountService:
                     current = {"created_at": self._now()}
                 else:
                     skipped += 1
-                incoming = dict(payload)
-                if not incoming.get("created_at"):
-                    incoming.pop("created_at", None)
                 account = self._normalize_account(
                     {
                         **current,
@@ -1231,7 +1298,7 @@ class AccountService:
                     }
                 )
                 if account is not None:
-                    self._accounts[access_token] = account
+                    self._accounts[storage_key] = account
             self._save_accounts()
             items = [dict(item) for item in self._accounts.values()]
             log_service.add(LOG_TYPE_ACCOUNT, f"新增 {added} 个账号，跳过 {skipped} 个",
@@ -1243,14 +1310,26 @@ class AccountService:
         if not target_set:
             return {"removed": 0, "items": self.list_accounts()}
         with self._lock:
-            target_set = {self._resolve_access_token_locked(token) for token in target_set if token}
-            removed = sum(self._accounts.pop(token, None) is not None for token in target_set)
+            storage_keys: set[str] = set()
+            audit_tokens: list[str] = []
             for token in target_set:
-                self._image_inflight.pop(token, None)
+                storage_key = self._resolve_storage_key_locked(token)
+                if not storage_key:
+                    continue
+                storage_keys.add(storage_key)
+                raw = self._accounts.get(storage_key)
+                if isinstance(raw, dict):
+                    audit_token = str(raw.get("access_token") or storage_key).strip()
+                    if audit_token:
+                        audit_tokens.append(audit_token)
+                        self._image_inflight.pop(audit_token, None)
+            removed = sum(self._accounts.pop(key, None) is not None for key in storage_keys)
+            for key in storage_keys:
+                self._image_inflight.pop(key, None)
             self._token_aliases = {
                 old: new
                 for old, new in self._token_aliases.items()
-                if old not in target_set and new not in target_set
+                if old not in storage_keys and new not in storage_keys
             }
             if removed:
                 if self._accounts:
@@ -1262,7 +1341,7 @@ class AccountService:
                 try:
                     from services.activation_audit_service import activation_audit_service
 
-                    activation_audit_service.delete_by_access_tokens(list(target_set))
+                    activation_audit_service.delete_by_access_tokens(audit_tokens or list(storage_keys))
                 except Exception:
                     pass
             items = [dict(item) for item in self._accounts.values()]
@@ -1277,11 +1356,14 @@ class AccountService:
         meta_by_token = meta_by_token or {}
         with self._lock:
             for token in target:
-                resolved = self._resolve_access_token_locked(token)
-                current = self._accounts.get(resolved)
+                storage_key = self._resolve_storage_key_locked(token)
+                current = self._accounts.get(storage_key) if storage_key else None
                 if current is None:
                     continue
-                incoming_meta = _normalize_checkout_meta(meta_by_token.get(token) or meta_by_token.get(resolved))
+                stored_token = str(current.get("access_token") or storage_key).strip()
+                incoming_meta = _normalize_checkout_meta(
+                    meta_by_token.get(token) or meta_by_token.get(stored_token) or meta_by_token.get(storage_key)
+                )
                 state_changed = bool(current.get("used")) != bool(used)
                 meta_changed = incoming_meta != _normalize_checkout_meta(current.get("checkout_meta"))
                 if not state_changed and not meta_changed:
@@ -1297,7 +1379,7 @@ class AccountService:
                     current["checkout_at"] = None
                     current["checkout_meta"] = None
                 current = enrich_account(current)
-                self._accounts[resolved] = self._normalize_account(current)
+                self._accounts[storage_key] = self._normalize_account(current)
                 updated += 1
             if updated:
                 self._save_accounts()
@@ -1320,8 +1402,8 @@ class AccountService:
         revoked_tokens: list[str] = []
         with self._lock:
             for token in target:
-                resolved = self._resolve_access_token_locked(token)
-                current = self._accounts.get(resolved)
+                storage_key = self._resolve_storage_key_locked(token)
+                current = self._accounts.get(storage_key) if storage_key else None
                 if current is None:
                     skipped += 1
                     continue
@@ -1351,8 +1433,10 @@ class AccountService:
                     skipped += 1
                     continue
                 account["last_activation_audit_id"] = None
-                self._accounts[resolved] = account
-                revoked_tokens.append(resolved)
+                self._accounts[storage_key] = account
+                audit_token = str(account.get("access_token") or storage_key).strip()
+                if audit_token:
+                    revoked_tokens.append(audit_token)
                 updated += 1
             if updated:
                 self._save_accounts()
@@ -1380,30 +1464,36 @@ class AccountService:
         if not access_token:
             return None
         with self._lock:
-            access_token = self._resolve_access_token_locked(access_token)
-            current = self._accounts.get(access_token)
+            storage_key = self._resolve_storage_key_locked(access_token)
+            current = self._accounts.get(storage_key) if storage_key else None
             if current is None:
                 return None
-            account = self._normalize_account({**current, **updates, "access_token": access_token})
+            stored_token = str(current.get("access_token") or storage_key).strip()
+            account = self._normalize_account({**current, **updates, "access_token": stored_token})
             if account is None:
                 return None
             if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
-                self._accounts.pop(access_token, None)
+                self._accounts.pop(storage_key, None)
                 self._save_accounts()
-                log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
+                log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(stored_token)})
                 return None
-            self._accounts[access_token] = account
+            next_key = self._account_dict_key(account)
+            if not next_key:
+                return None
+            if next_key != storage_key:
+                self._accounts.pop(storage_key, None)
+            self._accounts[next_key] = account
             self._save_accounts()
             if not quiet:
                 log_service.add(LOG_TYPE_ACCOUNT, "更新账号",
-                                {"token": anonymize_token(access_token), "status": account.get("status")})
+                                {"token": anonymize_token(stored_token), "status": account.get("status")})
             return dict(account)
         return None
 
     def _record_refresh_success(self, access_token: str) -> None:
         with self._lock:
-            access_token = self._resolve_access_token_locked(access_token)
-            current = self._accounts.get(access_token)
+            storage_key = self._resolve_storage_key_locked(access_token)
+            current = self._accounts.get(storage_key) if storage_key else None
             if current is None:
                 return
             next_item = dict(current)
@@ -1413,7 +1503,7 @@ class AccountService:
             next_item["last_refresh_error_at"] = None
             account = self._normalize_account(next_item)
             if account is not None:
-                self._accounts[access_token] = account
+                self._accounts[storage_key] = account
 
     def _should_defer_invalid_token(self, account: dict | None, now: datetime) -> bool:
         if not isinstance(account, dict):
@@ -1438,10 +1528,11 @@ class AccountService:
     ) -> bool:
         now = datetime.now(timezone.utc)
         with self._lock:
-            access_token = self._resolve_access_token_locked(access_token)
-            current = self._accounts.get(access_token)
+            storage_key = self._resolve_storage_key_locked(access_token)
+            current = self._accounts.get(storage_key) if storage_key else None
             if current is None:
                 return True
+            stored_token = str(current.get("access_token") or access_token).strip()
             should_defer = defer_invalid_removal and self._should_defer_invalid_token(current, now)
             next_item = dict(current)
             next_item["invalid_count"] = int(next_item.get("invalid_count") or 0) + 1
@@ -1450,13 +1541,13 @@ class AccountService:
             next_item["last_refresh_error_at"] = now.isoformat()
             account = self._normalize_account(next_item)
             if account is not None:
-                self._accounts[access_token] = account
+                self._accounts[storage_key] = account
                 self._save_accounts()
             if should_defer:
                 log_service.add(
                     LOG_TYPE_ACCOUNT,
                     "暂缓标记异常账号",
-                    {"source": event, "token": anonymize_token(access_token), "error": str(error or "")},
+                    {"source": event, "token": anonymize_token(stored_token), "error": str(error or "")},
                 )
                 return False
         return True
@@ -1466,8 +1557,8 @@ class AccountService:
             return None
         self.release_image_slot(access_token)
         with self._lock:
-            access_token = self._resolve_access_token_locked(access_token)
-            current = self._accounts.get(access_token)
+            storage_key = self._resolve_storage_key_locked(access_token)
+            current = self._accounts.get(storage_key) if storage_key else None
             if current is None:
                 return None
             next_item = dict(current)
@@ -1488,11 +1579,15 @@ class AccountService:
             if account is None:
                 return None
             if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
-                self._accounts.pop(access_token, None)
+                self._accounts.pop(storage_key, None)
                 self._save_accounts()
-                log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
+                log_service.add(
+                    LOG_TYPE_ACCOUNT,
+                    "自动移除限流账号",
+                    {"token": anonymize_token(str(account.get("access_token") or access_token))},
+                )
                 return None
-            self._accounts[access_token] = account
+            self._accounts[storage_key] = account
             self._save_accounts()
             return dict(account)
         return None

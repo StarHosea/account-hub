@@ -514,6 +514,16 @@ class ActivationService:
             raise
         finally:
             clear_recorder()
+            acct = account_service.get_account(token)
+            if acct:
+                item = enrich_account(acct)
+                if str(item.get("stage")) == STAGE_ACTIVATING:
+                    patch = apply_stage(item, STAGE_REGISTERED)
+                    if item.get("plus_status") in (STATUS_QUEUED, STATUS_ACTIVATING):
+                        patch["plus_status"] = STATUS_UNACTIVATED
+                        patch["plus_cdk"] = None
+                        patch["plus_task_id"] = None
+                    account_service.update_account(token, patch, quiet=True)
 
     def _log_raw(self, cdk: str, phase: str, js: object, log_sink=None) -> None:
         """把兑换接口的原始响应（脱敏 + 截断）写进激活日志，便于本地定位真实信封结构与状态词。"""

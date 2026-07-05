@@ -36,6 +36,19 @@ class ReceivedAtParseTests(unittest.TestCase):
         html = '<span>发件人：OpenAI</span><span>时间：2026-07-01 22:45:38</span>'
         self.assertEqual(mp._extract_received_at(html), datetime(2026, 7, 1, 22, 45, 38))
 
+    def test_parses_icloud_api_rfc822_dt(self) -> None:
+        html = (
+            '<div class="card"><div class="fr">ChatGPT</div>'
+            '<div class="su">你的 ChatGPT 验证码</div>'
+            '<div class="dt">Sun, 05 Jul 2026 16:49:58 +0000</div></div>'
+        )
+        parsed = mp._extract_received_at(html)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.year, 2026)
+        self.assertEqual(parsed.month, 7)
+        self.assertEqual(parsed.day, 5)
+        self.assertEqual((parsed.hour, parsed.minute, parsed.second), (16, 49, 58))
+
     def test_returns_none_when_absent(self) -> None:
         self.assertIsNone(mp._extract_received_at("no timestamp here"))
 
@@ -62,6 +75,18 @@ class WaitForFreshCodeTests(unittest.TestCase):
     def test_accepts_newer_email_with_new_code(self) -> None:
         provider = _FakeProvider([("111111", T0), ("222222", T1)])
         self.assertEqual(provider.wait_for_code({}, after_received_at=T0), "222222")
+
+    def test_accepts_icloud_html_when_after_cutoff(self) -> None:
+        html = (
+            '<div class="card"><div class="fr">ChatGPT</div>'
+            '<div class="su">Your code</div>'
+            '<div class="dt">Sun, 05 Jul 2026 16:49:58 +0000</div>'
+            '<div class="bd">Your verification code is 855006</div></div>'
+        )
+        received = mp._extract_received_at(html)
+        self.assertIsNotNone(received)
+        after = datetime(2026, 7, 5, 16, 49, 0)  # local naive, before mail arrived (UTC 16:49:58)
+        self.assertTrue(mp._received_is_fresh(received, after))
 
     def test_no_baseline_keeps_old_behavior(self) -> None:
         self.assertEqual(_FakeProvider([("111111", T0)]).wait_for_code({}), "111111")

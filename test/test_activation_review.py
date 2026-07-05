@@ -1,8 +1,10 @@
 import unittest
 from unittest.mock import patch
 
-from services.account_lifecycle import STAGE_PLUS_REVIEW, STAGE_REGISTERED
+from services.account_lifecycle import STAGE_ACTIVATING, STAGE_PLUS_REVIEW, STAGE_REGISTERED
 from services.activation_service import ActivationService, is_activation_eligible
+from services.account_service import AccountService
+from test.test_account_export import MemoryStorage
 
 
 class ActivationReviewTest(unittest.TestCase):
@@ -108,6 +110,37 @@ class ActivationReviewTest(unittest.TestCase):
         self.assertEqual(updates[0]["plus_last_message"], "套餐核实失败：token invalidated (/backend-api/me)")
         self.assertIsNone(updates[0].get("last_error"))
         self.assertEqual(updates[0]["plus_status"], "已激活")
+
+    def test_reconcile_stuck_activations_resets_stage(self):
+        storage = MemoryStorage([
+            {
+                "email": "stuck@x.com",
+                "access_token": "eyJstuck",
+                "stage": STAGE_ACTIVATING,
+                "plan": "free",
+                "plus_status": "激活中",
+            },
+            {
+                "email": "failed@x.com",
+                "access_token": "eyJfail",
+                "stage": STAGE_REGISTERED,
+                "plan": "free",
+                "plus_status": "激活失败",
+                "plus_unavailable": True,
+            },
+        ])
+        svc = AccountService(storage)
+        reset = svc.reconcile_stuck_activations()
+        self.assertEqual(reset, 1)
+        stuck = svc.get_account("eyJstuck")
+        self.assertIsNotNone(stuck)
+        assert stuck is not None
+        self.assertEqual(stuck.get("stage"), STAGE_REGISTERED)
+        self.assertEqual(stuck.get("plus_status"), "未激活")
+        failed = svc.get_account("eyJfail")
+        self.assertIsNotNone(failed)
+        assert failed is not None
+        self.assertEqual(failed.get("plus_status"), "激活失败")
 
 
 if __name__ == "__main__":

@@ -112,14 +112,25 @@ def _extract_code(message: dict[str, Any]) -> str | None:
 
 
 _TS_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?")
+_RFC822_DT_RE = re.compile(
+    r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\s+\d{1,2}\s+\w+\s+\d{4}\s+\d{2}:\d{2}:\d{2}(?:\s*(?:\([A-Z]+\)|[+-]\d{4}))?",
+    re.I,
+)
 
 
 def _extract_received_at(content: str) -> datetime | None:
-    """从收件页 HTML 里解析邮件的真实到达时间（provider 本地时区的朴素时间，仅用于相对先后比较）。
+    """从收件页 HTML 里解析邮件的真实到达时间（用于相对先后比较）。
 
-    优先取「时间/日期/Date/Received」标签后的时间戳；否则取页面里第一个时间戳。解析失败返回 None。
+    优先取「时间/日期/Date/Received」标签后的 ISO 时间戳；其次取 icloud-api 等页面的
+    ``<div class="dt">`` RFC822 时间；再否则取页面里第一个 ISO / RFC822 时间戳。解析失败返回 None。
     """
     text = content or ""
+    dt_match = re.search(r'class="dt"[^>]*>([^<]+)<', text, re.I)
+    if dt_match:
+        parsed = _parse_received_at(dt_match.group(1).strip())
+        if parsed is not None:
+            return parsed
+
     match = None
     for label in ("时间", "日期", "Date", "Received", "Time"):
         match = re.search(re.escape(label) + r"[：:\s]*" + _TS_RE.pattern, text)
@@ -127,14 +138,18 @@ def _extract_received_at(content: str) -> datetime | None:
             break
     if match is None:
         match = _TS_RE.search(text)
-    if match is None:
-        return None
-    try:
-        year, month, day, hour, minute = (int(match.group(i)) for i in range(1, 6))
-        second = int(match.group(6) or 0)
-        return datetime(year, month, day, hour, minute, second)
-    except Exception:
-        return None
+    if match is not None:
+        try:
+            year, month, day, hour, minute = (int(match.group(i)) for i in range(1, 6))
+            second = int(match.group(6) or 0)
+            return datetime(year, month, day, hour, minute, second)
+        except Exception:
+            pass
+
+    rfc = _RFC822_DT_RE.search(text)
+    if rfc:
+        return _parse_received_at(rfc.group(0))
+    return None
 
 
 def _to_comparable_naive_local(dt: datetime) -> datetime:

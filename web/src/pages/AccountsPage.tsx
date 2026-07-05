@@ -626,7 +626,6 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
     planType === "free"
       ? [
           { label: "总数", value: summary.total },
-          { label: "注册中", value: summary.registering ?? 0, color: "var(--semi-color-primary)" },
           { label: "已注册", value: summary.registered ?? 0, color: "var(--semi-color-success)" },
           { label: "激活中", value: summary.activating ?? 0, color: "var(--semi-color-warning)" },
         ]
@@ -642,7 +641,6 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
     planType === "free"
       ? [
           { label: "全部状态", value: "" },
-          { label: "注册中", value: "registering" },
           { label: "已注册", value: "registered" },
           { label: "激活中", value: "activating" },
         ]

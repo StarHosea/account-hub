@@ -24,6 +24,12 @@ class AccountLifecycleTest(unittest.TestCase):
         self.assertFalse(account_in_view(mailbox, "free"))
         self.assertTrue(account_in_view(registered, "free"))
 
+    def test_free_view_hides_registering(self):
+        registering = enrich_account(
+            {"email": "c@b.com", "stage": "registering", "_registering": True},
+        )
+        self.assertFalse(account_in_view(registering, "free"))
+
     def test_plus_view_filter(self):
         accounts = [
             enrich_account({"email": "p@b.com", "access_token": "eyJ1", "stage": STAGE_PLUS_ACTIVATED, "plan": "plus", "type": "plus"}),

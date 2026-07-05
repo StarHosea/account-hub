@@ -32,6 +32,7 @@ class RegisterAbnormalService:
         self._storage = storage if storage is not None else config.get_storage_backend()
         self._lock = threading.RLock()
         self._items: dict[str, dict] = self._load()
+        self.reconcile_account_placeholders()
 
     # ----------------------------- 持久化 ----------------------------- #
 
@@ -130,7 +131,38 @@ class RegisterAbnormalService:
                 return None
             self._items[key] = normalized
             self._save()
+            if not str(normalized.get("access_token") or "").strip():
+                self._release_registering_placeholder(
+                    email,
+                    str(normalized.get("reason") or ""),
+                )
             return dict(normalized)
+
+    def _release_registering_placeholder(self, email: str, reason: str) -> None:
+        from services.account_service import account_service
+
+        account_service.release_registration(
+            email,
+            error=reason,
+            remove_placeholder=True,
+        )
+
+    def reconcile_account_placeholders(self) -> int:
+        """启动时清理异常清单中无 token 条目对应的「注册中」占位账号。"""
+        cleaned = 0
+        with self._lock:
+            for item in self._items.values():
+                if str(item.get("access_token") or "").strip():
+                    continue
+                email = str(item.get("email") or "").strip()
+                if not email:
+                    continue
+                self._release_registering_placeholder(
+                    email,
+                    str(item.get("reason") or ""),
+                )
+                cleaned += 1
+        return cleaned
 
     def delete(self, emails: list[str]) -> int:
         removed = 0

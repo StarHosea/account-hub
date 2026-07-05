@@ -8,7 +8,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from services.account_lifecycle import STAGE_REGISTERING, email_storage_key  # noqa: E402
+from services.account_lifecycle import STAGE_REGISTERING, STAGE_UNREGISTERED, email_storage_key  # noqa: E402
 from services.account_service import AccountService  # noqa: E402
 from test.test_account_export import MemoryStorage  # noqa: E402
 
@@ -66,6 +66,35 @@ class RegisterCredentialsPersistenceTest(unittest.TestCase):
         assert account is not None
         self.assertEqual(account.get("password"), "FromMailbox1!")
         self.assertEqual(account.get("totp_secret"), "ABCDEFGH23456789")
+
+    def test_release_registration_removes_placeholder(self) -> None:
+        email_key = email_storage_key(self.EMAIL)
+        self.service._accounts[email_key] = self.service._normalize_account(
+            {"email": self.EMAIL, "stage": STAGE_REGISTERING, "_registering": True}
+        )
+
+        self.service.release_registration(self.EMAIL, error="register failed", remove_placeholder=True)
+
+        self.assertNotIn(email_key, self.service._accounts)
+        self.assertIsNone(self.service.find_by_email(self.EMAIL))
+
+    def test_release_registration_keeps_unregistered_mailbox_record(self) -> None:
+        email_key = email_storage_key(self.EMAIL)
+        self.service._accounts[email_key] = self.service._normalize_account(
+            {
+                "email": self.EMAIL,
+                "fetch_url": "http://mailbox",
+                "stage": STAGE_UNREGISTERED,
+            }
+        )
+
+        self.service.release_registration(self.EMAIL, error="user cancelled")
+
+        account = self.service.find_by_email(self.EMAIL)
+        self.assertIsNotNone(account)
+        assert account is not None
+        self.assertEqual(account.get("stage"), STAGE_UNREGISTERED)
+        self.assertEqual(account.get("fetch_url"), "http://mailbox")
 
 
 if __name__ == "__main__":

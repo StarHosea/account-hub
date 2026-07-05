@@ -312,7 +312,7 @@ def account_in_view(account: dict[str, Any], view: str) -> bool:
     stage = str(item.get("stage") or "")
     plan = str(item.get("plan") or PLAN_FREE)
     if view == "free":
-        if stage == STAGE_UNREGISTERED:
+        if stage in (STAGE_UNREGISTERED, STAGE_REGISTERING):
             return False
         if stage not in FREE_STAGES:
             return False

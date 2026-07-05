@@ -27,8 +27,11 @@ export function useRegisterStream() {
 
   useEffect(() => {
     void loadRegister();
-    void getStoredAuthKey().then((key) => {
-      if (!key) return;
+    let closed = false; // 组件卸载标记，避免卸载后还排程重连
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const connect = (key: string) => {
+      if (closed) return;
       const base = webConfig.apiUrl.replace(/\/$/, "");
       const es = new EventSource(`${base}/api/register/events?token=${encodeURIComponent(key)}`);
       esRef.current = es;
@@ -55,11 +58,24 @@ export function useRegisterStream() {
         lastLenRef.current = logs.length;
       };
       es.onerror = () => {
+        // EventSource 出错后原生会自动重连，但一旦手动 close 就彻底停掉重连。
+        // 这里 close 掉坏连接，再自行排程重连——否则断一次就要刷新页面才恢复。
         es.close();
         esRef.current = null;
+        if (closed) return;
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        reconnectTimer = setTimeout(() => connect(key), 3000);
       };
+    };
+
+    void getStoredAuthKey().then((key) => {
+      if (!key || closed) return;
+      connect(key);
     });
+
     return () => {
+      closed = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
       esRef.current?.close();
       esRef.current = null;
     };

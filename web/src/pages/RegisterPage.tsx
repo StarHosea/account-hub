@@ -292,7 +292,8 @@ export default function RegisterPage() {
             icon={<IconLink />}
             title="复制诊断链接（给本地 AI）"
             onClick={() => {
-              const url = `${window.location.origin}/api/register/diag/brief?email=${encodeURIComponent(row.email)}`;
+              const base = (registerConfig?.diag_public_url || window.location.origin).replace(/\/$/, "");
+              const url = `${base}/api/register/diag/brief.md?email=${encodeURIComponent(row.email)}`;
               void copyToClipboard(url, "诊断链接");
             }}
           />

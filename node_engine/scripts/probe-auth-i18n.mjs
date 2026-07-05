@@ -21,7 +21,7 @@ for (const locale of LOCALES) {
     } catch { /* ignore */ }
   });
   await page.setExtraHTTPHeaders({ 'Accept-Language': `${locale},${locale.split('-')[0]};q=0.9,en;q=0.8` });
-  await page.goto('https://auth.openai.com/log-in', { waitUntil: 'networkidle', timeout: 120000 }).catch((e) => {
+  await page.goto('https://auth.openai.com/log-in', { waitUntil: 'domcontentloaded', timeout: 120000 }).catch((e) => {
     log(`${locale} 打开失败：${e?.message || e}`, 'warn');
   });
   await page.waitForTimeout(3000);

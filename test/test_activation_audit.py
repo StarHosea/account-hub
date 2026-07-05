@@ -77,6 +77,17 @@ class ActivationAuditServiceTest(unittest.TestCase):
         listed = activation_audit_service.list_items(page_size=50)["items"]
         self.assertFalse(any(i["email"] == "del@x.com" for i in listed))
 
+    def test_delete_by_email_removes_all_attempts(self):
+        first = ActivationAuditRecorder(email="wipe@x.com", access_token="eyJw1")
+        first.finish(OUTCOME_FAILED, "first")
+        second = ActivationAuditRecorder(email="wipe@x.com", access_token="eyJw1")
+        second.finish(OUTCOME_REVIEW, "second")
+
+        removed = activation_audit_service.delete_by_emails(["wipe@x.com"])
+        self.assertGreaterEqual(removed, 2)
+        listed = activation_audit_service.list_items(page_size=50)["items"]
+        self.assertFalse(any(i["email"] == "wipe@x.com" for i in listed))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -26,32 +26,30 @@ const OAUTH_EXCLUDE = [
 
 const DIAG_DIR = process.env.REG_DIAG_DIR || '';
 
-/** 表单提交前等待页面资源加载完毕（readyState=complete + load；对标浏览器标签不再转圈）。超时 60s 则刷新。 */
+/** 等待 DOM 加载完成（domcontentloaded + readyState=complete）。全站统一页面等待口径。 */
+async function waitForDomReady(page, { timeoutMs = 20000 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  const remain = () => Math.max(500, deadline - Date.now());
+  if (remain() <= 500) return false;
+  try {
+    await page.waitForLoadState('domcontentloaded', { timeout: remain() });
+    await page.waitForFunction(() => document.readyState === 'complete', { timeout: remain() });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 表单提交前等待 DOM 就绪；超时 60s 则刷新后重试。 */
 const FORM_SUBMIT_PAGE_LOAD_MS = 60000;
 
 async function waitForPageFullyLoaded(page, { timeoutMs = FORM_SUBMIT_PAGE_LOAD_MS, log } = {}) {
-  const deadline = Date.now() + timeoutMs;
+  if (await waitForDomReady(page, { timeoutMs })) return;
 
-  const waitOnce = async () => {
-    const remain = () => Math.max(500, deadline - Date.now());
-    if (remain() <= 500) return false;
-    try {
-      await page.waitForLoadState('domcontentloaded', { timeout: remain() });
-      await page.waitForFunction(() => document.readyState === 'complete', { timeout: remain() });
-      await page.waitForLoadState('load', { timeout: remain() });
-      await page.waitForLoadState('networkidle', { timeout: Math.min(remain(), 8000) }).catch(() => {});
-      return true;
-    } catch {
-      return false;
-    }
-  };
-
-  if (await waitOnce()) return;
-
-  log?.(`页面资源加载超过 ${Math.round(timeoutMs / 1000)}s，刷新浏览器`, 'warn');
-  await page.reload({ waitUntil: 'load', timeout: 60000 }).catch(() => {});
+  log?.(`页面 DOM 加载超过 ${Math.round(timeoutMs / 1000)}s，刷新浏览器`, 'warn');
+  await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
   await sleep(800);
-  if (!(await waitOnce())) {
+  if (!(await waitForDomReady(page, { timeoutMs: Math.min(timeoutMs, 20000) }))) {
     log?.('刷新后页面仍未完全加载，继续尝试提交', 'warn');
   }
 }
@@ -158,21 +156,12 @@ async function waitForAuthEntryOpen(page, { timeout = 10000 } = {}) {
 
 // 等 chatgpt.com 首页 hydrate（按钮可见但 onClick 未绑定时，只会高亮焦点、弹窗不出）。
 async function waitForHomeReady(page, { timeout = 20000 } = {}) {
-  await page.waitForFunction(
-    () => {
-      try {
-        return document.styleSheets.length > 0 && document.readyState !== 'loading';
-      } catch { return false; }
-    },
-    { timeout },
-  ).catch(() => {});
+  await waitForDomReady(page, { timeoutMs: timeout }).catch(() => {});
   try {
     await page.locator(
       `[data-testid="${S.SIGNUP_BUTTON_TESTID}"], [data-testid="${S.LOGIN_BUTTON_TESTID}"], [data-testid="${S.NO_AUTH_RIGHT_LOGIN_PANEL_TESTID}"]`,
     ).first().waitFor({ state: 'visible', timeout: Math.min(timeout, 15000) });
   } catch { /* 可能已在 auth 子域或弹窗内 */ }
-  await page.waitForLoadState('networkidle', { timeout: Math.min(timeout, 12000) }).catch(() => {});
-  await sleep(800);
 }
 
 function homeSideAuthPanelSel() {
@@ -442,7 +431,7 @@ async function openWithRetry(page, url, log, { attempts = 3 } = {}) {
   for (let i = 1; i <= attempts; i += 1) {
     try {
       await page.goto(url, { waitUntil: 'commit', timeout: 90000 });
-      await page.waitForLoadState('domcontentloaded', { timeout: 45000 }).catch(() => {});
+      await waitForDomReady(page, { timeoutMs: 45000 }).catch(() => {});
       await page.waitForFunction(
         () => /免费注册|sign up|登录|log ?in/i.test(document.body?.innerText || ''),
         { timeout: 30000 }
@@ -597,14 +586,9 @@ async function fillBirthday(page, { year, month, day }, log) {
 
 // ---------------- 主流程 ----------------
 
-// 等 auth.openai.com 页面 hydrate 完成再交互（否则按钮 onClick 未绑定，点击无效）。
-// 信号：样式表已加载（styleSheets>0）+ readyState 非 loading。
+// 等 auth.openai.com 页面 DOM 就绪再交互（与全站 waitForDomReady 口径一致）。
 async function waitForAuthReady(page, { timeout = 12000 } = {}) {
-  await page.waitForFunction(() => {
-    try { return document.styleSheets.length > 0 && document.readyState !== 'loading'; }
-    catch { return false; }
-  }, { timeout }).catch(() => {});
-  await sleep(600);
+  await waitForDomReady(page, { timeoutMs: timeout }).catch(() => {});
 }
 
 // 可靠点击 auth.openai.com 的按钮/链接（Remix 页面对标记点击不稳）：
@@ -613,7 +597,6 @@ async function waitForAuthReady(page, { timeout = 12000 } = {}) {
 // （"忘记了密码？"是 <a> 链接）。移植自 browserregister clickButtonRobust。
 async function clickButtonRobust(page, textRe, { timeout = 10000, tries = 3, reloadOnFail = false, log } = {}) {
   await waitForPageFullyLoaded(page, { log });
-  await waitForAuthReady(page);
   const before = page.url();
   for (let i = 0; i < tries; i += 1) {
     const btn = page.locator('button, a, [role="button"]').filter({ hasText: textRe }).first();
@@ -638,7 +621,7 @@ async function clickButtonRobust(page, textRe, { timeout = 10000, tries = 3, rel
     if (moved) return true;
     if (reloadOnFail && i < tries - 1) {
       await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
-      await waitForAuthReady(page);
+      await waitForDomReady(page, { timeoutMs: 12000 }).catch(() => {});
     }
   }
   return page.url() !== before;

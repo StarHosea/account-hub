@@ -17,6 +17,13 @@
 const FALLBACK_ENABLED = String(process.env.CLOAK_FALLBACK_CHROMIUM || 'true').toLowerCase() !== 'false';
 const HARDENING_ARGS = ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'];
 
+// CDP 联调端口：设 CLOAK_CDP_PORT 时浏览器暴露标准 CDP（供 cdp-drive.mjs connectOverCDP 逐步驱动）。
+// 生产默认不设、零影响；仅注册机流程联调时开。见 skill: register-cdp-debug。
+function cdpArgs() {
+  const port = Number(process.env.CLOAK_CDP_PORT || 0);
+  return port > 0 ? [`--remote-debugging-port=${port}`, '--remote-debugging-address=127.0.0.1'] : [];
+}
+
 let _launchContext = null;
 let _loadError = null;
 
@@ -65,7 +72,7 @@ export async function launchSession(proxyUrl, { headless = false, fingerprintSee
         locale: 'en-US',
         viewport: { width: 1280, height: 800 },
         // 固定指纹种子 + Docker 加固参数（buildArgs 按键去重，用户 args 覆盖默认）
-        args: [`--fingerprint=${seed}`, ...HARDENING_ARGS],
+        args: [`--fingerprint=${seed}`, ...HARDENING_ARGS, ...cdpArgs()],
       };
       if (proxyUrl) opts.proxy = proxyUrl; // 带账号密码的完整代理地址
       const context = await launchContext(opts);
@@ -105,6 +112,7 @@ async function launchFallbackChromium(proxyUrl, headless, log) {
     proxy: pwProxy,
     args: [
       ...HARDENING_ARGS,
+      ...cdpArgs(),
       '--disable-blink-features=AutomationControlled',
       '--disable-features=IsolateOrigins,site-per-process',
     ],

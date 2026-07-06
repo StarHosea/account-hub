@@ -813,15 +813,24 @@ async function forgotPasswordFlow({ page, email, requestCode, log, recorder = NO
       await mark('forgot-02-retry', { note: '确认页错误页已点重试', url: page.url() });
       await sleep(2000);
     }
-    const moved2 = await clickButtonRobust(page, S.RESET_CONTINUE_PATTERN, { timeout: 12000, tries: 4, reloadOnFail: true, log });
+    let moved2 = await clickButtonRobust(page, S.RESET_CONTINUE_PATTERN, { timeout: 12000, tries: 4, reloadOnFail: true, log });
     log(`重设密码 · 点击继续发送重置邮件，${moved2 ? '页面已跳转' : '页面未变化'}`);
     await throwIfRateLimited(page, log);
     await sleep(2500);
     if (await clickRetryIfError(page, log)) {
       await mark('forgot-02-retry', { note: '继续后错误页已点重试', url: page.url() });
       await sleep(2000);
+      const movedAgain = await clickButtonRobust(page, S.RESET_CONTINUE_PATTERN, { timeout: 12000, tries: 4, reloadOnFail: true, log });
+      log(`重设密码 · 重试后再次点击继续，${movedAgain ? '页面已跳转' : '页面未变化'}`);
+      moved2 = moved2 || movedAgain;
+      await throwIfRateLimited(page, log);
+      await sleep(2500);
     }
-    await mark('forgot-02-continue', { note: moved2 ? 'continue-moved' : 'continue-no-move', url: page.url() });
+    const codeVisible = await firstVisible(page, `${S.CODE_INPUT}, ${S.CODE_INPUT_SEGMENTED}`, { timeout: 3000 }).catch(() => null);
+    await mark('forgot-02-continue', {
+      note: codeVisible ? 'continue-code-visible' : (moved2 ? 'continue-moved' : 'continue-no-move'),
+      url: page.url(),
+    });
     await snapshot(page, 'forgot-02-after-continue', log);
   } else {
     await mark('forgot-02-skip', { note: '非 reset-password URL，跳过继续', url: page.url() });
@@ -996,6 +1005,15 @@ export async function loginChatGPT({ page, email, chatgptUrl = 'https://chatgpt.
   }
 
   if (landing === null) {
+    // 已登录（含 CDP 挂接时停在 #settings）：勿再 goto 首页，避免打断当前流程
+    if (isLoggedInUrl(page.url()) || /chatgpt\.com/i.test(page.url())) {
+      const t0 = await readAccessToken(page);
+      if (t0.accessToken) {
+        log('登录 · 当前已是登录状态');
+        return { accessToken: t0.accessToken, user: t0.user, expires: t0.expires };
+      }
+    }
+
     log('登录 · 打开 ChatGPT 官网');
     await openWithRetry(page, chatgptUrl, log, { recorder });
     await sleep(2500);
@@ -1036,6 +1054,44 @@ export async function loginChatGPT({ page, email, chatgptUrl = 'https://chatgpt.
 
     await fillAuthEmailAndContinue(page, emailInput, email, log);
     landing = await waitForPostEmailLanding(page, log, { timeoutMs: 120000 });
+  }
+
+  // auth error / unknown：独立登录页重试并重新判定落点（避免 /api/auth/error 空等后失败）
+  if (/\/api\/auth\/error/i.test(page.url()) || landing === 'unknown') {
+    if (/\/api\/auth\/error/i.test(page.url())) {
+      log('登录 · 遇到 auth error，改走独立登录页', 'yellow');
+      await page.goto('https://auth.openai.com/log-in', { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});
+      await waitForAuthReady(page);
+      const retryEmail = await waitForAuthEmailInput(page, { timeout: 25000 });
+      if (retryEmail) {
+        await fillAuthEmailAndContinue(page, retryEmail, email, log);
+        landing = await waitForPostEmailLanding(page, log, { timeoutMs: 90000 });
+      }
+    }
+    if (landing === 'unknown') {
+      if (await firstVisible(page, S.PASSWORD_INPUT, { timeout: 5000 })) landing = 'password';
+      else if (await firstVisible(page, `${S.CODE_INPUT}, ${S.CODE_INPUT_SEGMENTED}`, { timeout: 5000 })) landing = 'code';
+      else {
+        log('登录 · 邮箱提交后落点未知，改走独立登录页', 'yellow');
+        await page.goto('https://auth.openai.com/log-in', { waitUntil: 'domcontentloaded', timeout: 90000 }).catch(() => {});
+        await waitForAuthReady(page);
+        const retryEmail = await waitForAuthEmailInput(page, { timeout: 25000 });
+        if (retryEmail) {
+          await fillAuthEmailAndContinue(page, retryEmail, email, log);
+          landing = await waitForPostEmailLanding(page, log, { timeoutMs: 90000 });
+        }
+        if (landing === 'unknown') {
+          if (await firstVisible(page, S.PASSWORD_INPUT, { timeout: 5000 })) landing = 'password';
+          else if (await firstVisible(page, `${S.CODE_INPUT}, ${S.CODE_INPUT_SEGMENTED}`, { timeout: 5000 })) landing = 'code';
+        }
+      }
+    }
+  }
+
+  // 仍未知 → 按密码页兜底，触发 OTP / 忘记密码分支
+  if (landing === 'unknown') {
+    log('登录 · 仍未知落点，按密码页兜底走 OTP/忘记密码');
+    landing = 'password';
   }
 
   // 老账号可能有密码页：有密码就登录；密码错/无密码/提交卡住 →
@@ -1332,13 +1388,42 @@ async function handleLoginTotpPrompt(page, totpSecret, requestCode, log) {
   }
 }
 
+// 从 extractTotpSecret 结果归一化 base32 密钥（落库用 twoFactorSecret，不只靠 uri）。
+function totpKeyFromSecretInfo(secretInfo = {}) {
+  const key = String(secretInfo.key || '').trim();
+  if (key) return key.toUpperCase();
+  const uri = String(secretInfo.uri || '').trim();
+  if (!uri) return '';
+  const m = uri.match(/[?&]secret=([A-Z2-7]+)/i);
+  return m ? m[1].toUpperCase() : '';
+}
+
+function hasStoredTotpSecret(partial, existingTotpSecret = '') {
+  return Boolean(
+    totpKeyFromSecretInfo(partial || {})
+    || String(partial?.twoFactorSecret || '').trim()
+    || String(partial?.twoFactorUri || '').trim()
+    || String(existingTotpSecret || '').trim(),
+  );
+}
+
 // step8（设密码 + 开 2FA）失败后的收尾决策：2FA 为可选加固，其失败不否定已成功的密码设置。
-// passwordOk=true（密码已设，或老账号登录阶段已用忘记密码重设）→ 返回一个可入号池的 secure
-//   （强制 twoFactorSet=false，其余沿用 step8 的部分结果），上层照常标记注册成功；
-// passwordOk=false（连密码都没设成）→ 返回 null，上层据此抛错、走异常清单分流。
-function resolveStep8Tolerance(partial, passwordOk) {
+// require2fa=true 时若无任何可落库 secret，返回 null（避免「2FA 已开但密钥空」静默入池）。
+function resolveStep8Tolerance(partial, passwordOk, { require2fa = false, existingTotpSecret = '' } = {}) {
   if (!passwordOk) return null;
-  return { ...(partial || {}), twoFactorSet: false };
+  const hasSecret = hasStoredTotpSecret(partial, existingTotpSecret);
+  if (require2fa && !hasSecret) return null;
+  return {
+    ...(partial || {}),
+    twoFactorSet: hasSecret,
+    twoFactorSecret: String(partial?.twoFactorSecret || '').trim() || String(existingTotpSecret || '').trim(),
+  };
+}
+
+// 安全页检测到 2FA 已开启时：本地无 secret 必须关后重开才能落库；显式 forceReset2fa 同理。
+function shouldForceReset2faWhenAlreadyEnabled({ forceReset2fa = false, existingTotpSecret = '' } = {}) {
+  if (forceReset2fa) return true;
+  return !String(existingTotpSecret || '').trim();
 }
 
 // 老账号：登录已注册账号 → 设密码 + 开 2FA → 取 token。复用 loginChatGPT + step8。
@@ -1350,14 +1435,27 @@ export async function secureExistingChatGPT({ page, email, loginPassword = '', e
   log('已有账号 · 开始登录');
   const login = await loginChatGPT({ page, email, password: loginPassword, totpSecret: existingTotpSecret, chatgptUrl, requestCode, log, recorder });
 
-  log(`已有账号 · ${enable2fa ? (forceReset2fa ? '重设双重验证' : '开启双重验证') : '跳过双重验证'}，并设置密码`);
+  log(`已有账号 · ${enable2fa ? (forceReset2fa ? '重设双重验证' : (existingTotpSecret ? '开启双重验证' : '本地无2FA密钥，将尝试关闭后重开')) : '跳过双重验证'}，并设置密码`);
   let secure;
   try {
-    secure = await step8_setupPasswordAnd2FA(page, { email, password: newPassword, enable2fa, forceReset2fa, existingTotpSecret, requestCode, log, recorder });
+    secure = await step8_setupPasswordAnd2FA(page, {
+      email,
+      password: newPassword,
+      enable2fa,
+      forceReset2fa,
+      existingTotpSecret,
+      requestCode,
+      log,
+      recorder,
+    });
   } catch (e) {
     const partial = e._secure || {};
-    // 2FA 为可选加固：密码已设成功（含登录阶段忘记密码重设）就按「无 2FA 账号」正常返回，账号照常入池。
-    const tolerated = resolveStep8Tolerance(partial, Boolean(login.resetPassword || partial.passwordSet));
+    const passwordOk = Boolean(login.resetPassword || partial.passwordSet);
+    const require2fa = enable2fa && shouldForceReset2faWhenAlreadyEnabled({ forceReset2fa, existingTotpSecret });
+    const tolerated = resolveStep8Tolerance(partial, passwordOk, {
+      require2fa,
+      existingTotpSecret: forceReset2fa ? '' : existingTotpSecret,
+    });
     if (tolerated) {
       log(`已有账号 · 双重验证未完成，密码已设置，按普通账号保存：${e.message}`, 'yellow');
       secure = tolerated;
@@ -1386,8 +1484,8 @@ export async function secureExistingChatGPT({ page, email, loginPassword = '', e
     // 最终密码：忘记密码重设 > step8 真正新设 > 用于登录的原密码（passwordChanged 才是"确实改了"）
     password: login.resetPassword || (secure.passwordChanged ? newPassword : (loginPassword || '')),
     passwordSet: Boolean(login.resetPassword) || secure.passwordSet,
-    // 2FA：step8 新开用新 secret；未改则回传注入的 existingTotpSecret，避免存空覆盖库里已有密钥
-    twoFactorSecret: secure.twoFactorSecret || existingTotpSecret,
+    // 2FA：step8 新开用新 secret；强制重设失败时不回退旧 secret（可能已失效）
+    twoFactorSecret: secure.twoFactorSecret || (forceReset2fa ? '' : existingTotpSecret),
     twoFactorUri: secure.twoFactorUri,
     recoveryCodes: secure.recoveryCodes,
     twoFactorSet: secure.twoFactorSet,
@@ -1651,7 +1749,7 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
     const partial = e._secure || {};
     // 2FA 为可选加固：只要密码已设成功，就按「无 2FA 账号」正常返回（照常入号池、标记注册成功），
     // 只有连密码都没设成才算 step8 失败，走异常清单分流。
-    const tolerated = resolveStep8Tolerance(partial, Boolean(partial.passwordSet));
+    const tolerated = resolveStep8Tolerance(partial, Boolean(partial.passwordSet), { require2fa: enable2fa });
     if (tolerated) {
       log(`注册 · 双重验证未完成，密码已设置，按普通账号保存：${e.message}`, 'yellow');
       secure = tolerated;
@@ -1740,7 +1838,8 @@ async function fillCode(page, code, log) {
   if (single) {
     audit.codeInputMode = 'single';
     audit.codeInputCount = 1;
-    await humanType(single, code);
+    await single.click({ timeout: 5000 }).catch(() => {});
+    await single.fill(code).catch(async () => { await humanType(single, code); });
     let got = '';
     try { got = String((await single.inputValue()) || '').replace(/\s+/g, ''); } catch { /* 无 inputValue 能力时跳过校验 */ }
     audit.codeReadback = got;
@@ -1988,6 +2087,8 @@ export const __test = {
   tryLoginMfaEmailFallback,
   isMfaEmailChallenge,
   resolveStep8Tolerance,
+  shouldForceReset2faWhenAlreadyEnabled,
+  detectAuthenticator2faEnabledFromText,
   fillCode,
   isChromeErrorUrl,
   recoverFromChromeError,
@@ -2245,15 +2346,134 @@ async function openSecurityTab(page, log, { maxRetries = 3 } = {}) {
   throw new Error(`打开安全tab失败：尝试 ${maxRetries} 次后仍无法显示密码设置元素`);
 }
 
-// 停用已启用的 Authenticator 2FA（强制重设时先调用）。
-async function disable2fa(page, oldSecret, log) {
-  let hit = await clickMarked(page, findRowSwitch, { kw: 'authenticator|验证器应用|身份验证器' });
-  if (!hit) hit = await humanClickByText(page, ['authenticator app', 'authenticator', '身份验证器', '验证器应用'], { timeout: 4000 }).catch(() => null);
-  log(`安全设置 · 点击关闭双重验证`);
+// 确认弹窗内点击「移除」（避免误点「活跃会话」等含「移除」字样的其它按钮）。
+async function clickRemoveAuthenticatorConfirm(page, log) {
+  try {
+    const dlg = page.locator('[role=dialog]').filter({ hasText: /移除验证器应用|remove authenticator/i });
+    const btn = dlg.getByRole('button', { name: /^(移除|remove)$/i });
+    if (await btn.count() > 0) {
+      await btn.first().click({ timeout: 6000 });
+      log('安全设置 · 确认移除验证器：移除');
+      return true;
+    }
+  } catch { /* fall through evaluate */ }
+  const hit = await page.evaluate(() => {
+    const vis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
+    const dlg = [...document.querySelectorAll('[role=dialog],dialog,div')].filter(vis)
+      .find((el) => /移除验证器应用|remove authenticator/i.test(el.innerText || '') && /取消|cancel/i.test(el.innerText || ''));
+    if (!dlg) return null;
+    const btn = [...dlg.querySelectorAll('button,[role=button]')].filter(vis)
+      .find((b) => /^(移除|remove)$/i.test((b.innerText || '').trim()));
+    if (btn) { btn.click(); return (btn.innerText || '').trim(); }
+    return null;
+  }).catch(() => null);
+  if (hit) log(`安全设置 · 确认移除验证器：${hit}`);
+  return Boolean(hit);
+}
+
+// 刷新并重新进入安全页（移除 2FA 被拦时，实测刷新后重开设置即可，无需完整重新登录）。
+async function refreshSecuritySettings(page, log) {
+  log('安全设置 · 刷新页面后重新打开安全页');
+  await humanClickByText(page, ['取消', 'cancel', '关闭', 'close'], { timeout: 3000, exclude: OAUTH_EXCLUDE }).catch(() => {});
+  await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+  await sleep(2500);
+  await dismissWelcomeOverlays(page, log);
+  await openSecurityTab(page, log);
+}
+
+// 判断安全页上 Authenticator 2FA 是否真正已启用（新版 MFA UI 勿仅凭 switch 判定）。
+function detectAuthenticator2faEnabledFromText(t = '') {
+  if (/验证器应用已启用|authenticator app enabled/i.test(t)) return true;
+  if (/移除验证器应用|remove authenticator app|remove authenticator/i.test(t)) return true;
+  if (/添加另一种方法|add another (method|way)/i.test(t) && !/移除验证器|remove authenticator/i.test(t)) return false;
+  return false;
+}
+
+async function isAuthenticator2faEnabled(page) {
+  return page.evaluate(() => {
+    const vis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
+    const t = document.body?.innerText || '';
+    if (/验证器应用已启用|authenticator app enabled/i.test(t)) return true;
+    if (/移除验证器应用|remove authenticator app|remove authenticator/i.test(t)) return true;
+    if (/添加另一种方法|add another (method|way)/i.test(t) && !/移除验证器|remove authenticator/i.test(t)) return false;
+    const rows = [...document.querySelectorAll('div,li,section')].filter(vis)
+      .filter((el) => /authenticator|验证器应用|身份验证器/i.test(el.innerText || '') && (el.innerText || '').length < 120)
+      .sort((a, b) => (a.innerText || '').length - (b.innerText || '').length);
+    for (const row of rows) {
+      const txt = row.innerText || '';
+      if (!/已启用|enabled/i.test(txt)) continue;
+      const sw = [...row.querySelectorAll('[role="switch"],input[type="checkbox"]')].filter(vis)[0];
+      if (sw && (sw.getAttribute('aria-checked') === 'true' || sw.checked === true)) return true;
+    }
+    return false;
+  }).catch(() => false);
+}
+
+// 点击「移除验证器应用」入口（含非 button 的可点击文案）。
+async function clickRemoveAuthenticatorEntry(page, log) {
+  const MARK = 'data-reg-rm-auth';
+  const hit = await page.evaluate((mark) => {
+    const vis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
+    const wanted = /^(移除验证器应用|remove authenticator app|remove authenticator)$/i;
+    document.querySelectorAll(`[${mark}]`).forEach((e) => e.removeAttribute(mark));
+    const cands = [...document.querySelectorAll('button,a,[role=button],[role=link],span,div,p')].filter(vis);
+    for (const el of cands) {
+      const txt = (el.innerText || el.getAttribute('aria-label') || '').trim();
+      if (!wanted.test(txt)) continue;
+      el.setAttribute(mark, '1');
+      return txt;
+    }
+    const incl = cands.filter((el) => {
+      const txt = (el.innerText || '').trim();
+      return txt.length < 40 && /移除验证器应用|remove authenticator/i.test(txt);
+    }).sort((a, b) => (a.innerText || '').length - (b.innerText || '').length);
+    if (incl[0]) { incl[0].setAttribute(mark, '1'); return (incl[0].innerText || '').trim(); }
+    return null;
+  }, MARK).catch(() => null);
+  if (!hit) return null;
+  try {
+    await page.click(`[${MARK}="1"]`, { timeout: 5000 });
+    log(`安全设置 · 已点击：${hit}`);
+    return hit;
+  } catch {
+    return null;
+  } finally {
+    await page.evaluate((m) => document.querySelectorAll(`[${m}]`).forEach((e) => e.removeAttribute(m)), MARK).catch(() => {});
+  }
+}
+
+async function disable2faOnce(page, oldSecret, log, { requestCode } = {}) {
+  log(`安全设置 · 点击移除验证器应用`);
+  let hit = await clickRemoveAuthenticatorEntry(page, log);
+  if (!hit) {
+    hit = await humanClickByText(page, ['移除验证器应用', 'remove authenticator app', 'remove authenticator'], { timeout: 6000, exclude: OAUTH_EXCLUDE }).catch(() => null);
+  }
+  if (!hit) {
+    hit = await clickMarked(page, findRowButton, { kw: 'authenticator|验证器应用|身份验证器', btns: ['移除', 'remove'] });
+  }
+  if (!hit) {
+    log('安全设置 · 未找到「移除验证器应用」入口', 'yellow');
+    return false;
+  }
+  await sleep(1500);
+  await clickRemoveAuthenticatorConfirm(page, log);
   await sleep(2000);
   await dumpUi(page, '04c0-disable-dialog', log);
 
   for (let r = 0; r < 3; r += 1) {
+    if (requestCode && (await isOnCodePage(page))) {
+      log(`安全设置 · 关闭双重验证前需验证邮箱，第 ${r + 1} 次`);
+      if (r > 0) {
+        await humanClickByText(page, ['重新发送电子邮件', '重新发送', 'resend'], { timeout: 5000, exclude: OAUTH_EXCLUDE }).catch(() => {});
+      }
+      const vcResult = await requestCodeWithResend(page, requestCode, log, { purpose: '2fa' });
+      const vc = vcResult.code;
+      if (vc) {
+        await fillCode(page, vc, log);
+        await submitCodeForm(page, log, { code: vc });
+        await sleep(2500);
+      }
+    }
     const needTotp = await page.evaluate(() => {
       const vis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
       return vis(document.querySelector('#totp_otp, input[name="totp_otp"]'))
@@ -2264,22 +2484,25 @@ async function disable2fa(page, oldSecret, log) {
       log('安全设置 · 填写验证器验证码以关闭双重验证');
       const inp = await firstVisible(page, '#totp_otp, input[name="totp_otp"], input[inputmode="numeric"], input[type="text"]', { timeout: 3000 });
       if (inp) await humanType(inp, code);
+    } else if (needTotp && !oldSecret) {
+      log('安全设置 · 关闭双重验证需要当前 TOTP，但本地无密钥', 'yellow');
     }
-    const c = await humanClickByText(page, ['停用', '关闭', '移除', '禁用', '确认', '继续', 'disable', 'turn off', 'remove', 'confirm', 'continue', '删除'], { timeout: 4000, exclude: OAUTH_EXCLUDE }).catch(() => null);
+    const confirmed = await clickRemoveAuthenticatorConfirm(page, log);
+    if (confirmed) log('安全设置 · 确认关闭双重验证：移除');
     await sleep(2000);
-    const off = await page.evaluate(() => {
-      const vis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
-      const rows = [...document.querySelectorAll('div,li,section')].filter(vis)
-        .filter((el) => /authenticator/i.test(el.innerText || '') && (el.innerText || '').length < 120)
-        .sort((a, b) => (a.innerText || '').length - (b.innerText || '').length);
-      for (const row of rows) {
-        const sw = [...row.querySelectorAll('[role="switch"],input[type="checkbox"]')].filter(vis)[0];
-        if (sw) return !(sw.getAttribute('aria-checked') === 'true' || sw.checked === true);
-      }
-      return false;
-    }).catch(() => false);
-    log(`安全设置 · 关闭双重验证，第 ${r + 1} 次尝试，${off ? '已关闭' : '仍开启'}`);
-    if (off) return true;
+    const stillOn = await isAuthenticator2faEnabled(page);
+    log(`安全设置 · 关闭双重验证，第 ${r + 1} 次尝试，${stillOn ? '仍开启' : '已关闭'}`);
+    if (!stillOn) return true;
+  }
+  return false;
+}
+
+// 停用已启用的 Authenticator 2FA（强制重设时先调用）。
+async function disable2fa(page, oldSecret, log, { requestCode } = {}) {
+  for (let pass = 0; pass < 2; pass += 1) {
+    if (pass > 0) await refreshSecuritySettings(page, log);
+    if (await disable2faOnce(page, oldSecret, log, { requestCode })) return true;
+    if (pass === 0) log('安全设置 · 首次移除未成功（可能被拦截），刷新后重试', 'yellow');
   }
   return false;
 }
@@ -2448,31 +2671,38 @@ async function step8_setupPasswordAnd2FA(page, { email, password, enable2fa = tr
     }
     await dumpUi(page, '04b-security-again', log);
 
-    // —— 开 2FA —— 幂等检测
-    const twofaAlready = await page.evaluate(() => {
-      const vis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
-      if (/验证器应用已启用|authenticator app enabled/i.test(document.body.innerText || '')) return true;
-      const rows = [...document.querySelectorAll('div,li,section')].filter(vis)
-        .filter((el) => /authenticator/i.test(el.innerText || '') && (el.innerText || '').length < 120)
-        .sort((a, b) => (a.innerText || '').length - (b.innerText || '').length);
-      for (const row of rows) {
-        const sw = [...row.querySelectorAll('[role="switch"],input[type="checkbox"]')].filter(vis)[0];
-        if (sw) return sw.getAttribute('aria-checked') === 'true' || sw.checked === true;
-      }
-      return false;
-    }).catch(() => false);
-
-    if (twofaAlready) {
-      if (!forceReset2fa) {
-        log('安全设置 · 双重验证已开启，跳过');
-        out.twoFactorSet = true;
-        return out;
-      }
-      log('安全设置 · 先关闭已有的双重验证');
-      const disabled = await disable2fa(page, existingTotpSecret, log);
-      if (!disabled) throw new Error('强制重设2FA失败：无法停用已有的验证器（可能缺少旧 secret 或停用流程变更）');
+    // 强制重设：无论检测状态如何，先尝试移除（避免半开/半关页面导致误判）
+    if (forceReset2fa) {
+      log('安全设置 · 强制重设：先尝试移除已有验证器');
+      await disable2fa(page, existingTotpSecret, log, { requestCode });
       await sleep(1500);
       await dumpUi(page, '04c-2fa-disabled', log);
+    }
+
+    // —— 开 2FA —— 幂等检测
+    const twofaAlready = await isAuthenticator2faEnabled(page);
+
+    if (twofaAlready) {
+      const mustReset = shouldForceReset2faWhenAlreadyEnabled({ forceReset2fa, existingTotpSecret });
+      if (!mustReset) {
+        log('安全设置 · 双重验证已开启，跳过');
+        out.twoFactorSet = true;
+        out.twoFactorSecret = String(existingTotpSecret || '').trim();
+        return out;
+      }
+      if (!forceReset2fa) {
+        log(existingTotpSecret
+          ? '安全设置 · 先关闭已有的双重验证（强制重设）'
+          : '安全设置 · 双重验证已开启但本地无密钥，尝试关闭后重新开启');
+        const disabled = await disable2fa(page, existingTotpSecret, log, { requestCode });
+        if (!disabled) {
+          throw new Error(existingTotpSecret
+            ? '强制重设2FA失败：无法停用已有的验证器（可能缺少旧 secret 或停用流程变更）'
+            : '2FA 已开启但本地无密钥：无法关闭已有验证器（通常需要旧 TOTP 或邮箱验证未通过）');
+        }
+        await sleep(1500);
+        await dumpUi(page, '04c-2fa-disabled', log);
+      }
     }
 
     log('安全设置 · 开启双重验证');
@@ -2502,12 +2732,10 @@ async function step8_setupPasswordAnd2FA(page, { email, password, enable2fa = tr
       secretInfo = await extractTotpSecret(page);
     }
     log(`安全设置 · 已获取双重验证密钥：${secretInfo.key || secretInfo.uri || '未获取'}`);
-    const secret = secretInfo.key || secretInfo.uri;
-    if (!secret) throw new Error('开2FA失败：未提取到 TOTP secret（仅二维码/入口异常）');
-
-    out.twoFactorSecret = secretInfo.key || '';
     out.twoFactorUri = secretInfo.uri || '';
-    const code = generateTotpNow(secret);
+    out.twoFactorSecret = totpKeyFromSecretInfo(secretInfo);
+    if (!out.twoFactorSecret) throw new Error('开2FA失败：未提取到 TOTP secret（仅二维码/入口异常）');
+    const code = generateTotpNow(out.twoFactorSecret);
     log(`安全设置 · 填写验证器验证码：${code}`);
     const codeBox = await firstVisible(page, `${S.CODE_INPUT}, ${S.CODE_INPUT_SEGMENTED}`, { timeout: 6000 });
     if (!codeBox) throw new Error('开2FA失败：未找到 TOTP 确认输入框');

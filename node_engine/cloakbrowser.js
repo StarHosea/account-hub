@@ -94,6 +94,11 @@ async function applyNavigatorLocale(context, locale) {
 // fingerprintSeed：固定指纹种子（10000-99999）。同一 seed = 同一指纹，跨会话可复现；
 // 不传则生成一个，并在返回值里带出实际 seed 供存储与后续复用。
 // locale：浏览器语言（如 en-US / ja-JP / en-IN），与 Python identity.region 对齐；显式传入时覆盖 geoip 自动检测。
+function useSystemChrome() {
+  const v = String(process.env.CLOAK_USE_SYSTEM_CHROME || '').trim().toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes';
+}
+
 export async function launchSession(proxyUrl, { headless = false, fingerprintSeed = null, locale = null, timezone = null, acceptLanguage = null, log = () => {} } = {}) {
   const launchContext = await loadCloak();
   const seed = Number.isInteger(fingerprintSeed) && fingerprintSeed > 0
@@ -103,6 +108,12 @@ export async function launchSession(proxyUrl, { headless = false, fingerprintSee
   const resolvedTimezone = resolveTimezone(timezone, resolvedLocale);
   const resolvedAcceptLanguage = String(acceptLanguage || '').trim()
     || (resolvedLocale ? `${resolvedLocale},${resolvedLocale.split('-')[0]};q=0.9,en-US;q=0.8,en;q=0.7` : '');
+
+  if (useSystemChrome()) {
+    const fb = await launchFallbackChromium(proxyUrl, headless, resolvedLocale || 'en-US', resolvedTimezone, resolvedAcceptLanguage, log);
+    fb.seed = seed;
+    return fb;
+  }
 
   if (launchContext) {
     try {

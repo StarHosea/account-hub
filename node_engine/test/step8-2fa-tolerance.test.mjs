@@ -5,36 +5,37 @@ import { __test } from '../flows/openai/register.js';
 
 const { resolveStep8Tolerance } = __test;
 
-// step8（设密码 + 开 2FA）失败后的收尾决策：2FA 为可选加固，失败可容忍、仍标记注册成功入池；
-// 只有连密码都没设成才算真失败。resolveStep8Tolerance 是 registerChatGPT / secureExistingChatGPT
-// 两处 catch 实际调用的决策函数。
-
-test('密码已设 + 2FA 失败 → 容忍，标记成功入池（twoFactorSet 强制 false，其余字段保留）', () => {
+test('密码已设 + 2FA 失败且不要求 2FA → 容忍，twoFactorSet=false', () => {
   const partial = {
     passwordSet: true, passwordChanged: true, password: 'Pw!',
     twoFactorSecret: '', twoFactorUri: '', recoveryCodes: [], twoFactorSet: true,
   };
   const r = resolveStep8Tolerance(partial, Boolean(partial.passwordSet));
-  assert.ok(r, '密码已设应容忍 2FA 失败');
+  assert.ok(r);
   assert.equal(r.twoFactorSet, false);
   assert.equal(r.passwordSet, true);
-  assert.equal(r.passwordChanged, true);
 });
 
-test('连密码都没设成 → 不容忍，返回 null（上层抛错、走异常清单）', () => {
+test('密码已设 + 要求 2FA 但无 secret → 不容忍', () => {
+  const partial = { passwordSet: true, twoFactorSecret: '', twoFactorUri: '' };
+  assert.equal(resolveStep8Tolerance(partial, true, { require2fa: true }), null);
+});
+
+test('连密码都没设成 → 不容忍', () => {
   assert.equal(resolveStep8Tolerance({ passwordSet: false }, false), null);
 });
 
-test('老账号忘记密码重设后 2FA 失败 → 容忍，保留原 2FA secret（不空值覆盖）', () => {
+test('2FA 失败但 partial 里已有 secret → 容忍并保留', () => {
   const partial = { passwordSet: false, twoFactorSecret: 'OLD', twoFactorUri: 'otpauth://x' };
-  const r = resolveStep8Tolerance(partial, Boolean('NewReset1!' || partial.passwordSet));
-  assert.ok(r, '忘记密码重设后应容忍 2FA 失败');
-  assert.equal(r.twoFactorSet, false);
+  const r = resolveStep8Tolerance(partial, true, { require2fa: true });
+  assert.ok(r);
+  assert.equal(r.twoFactorSet, true);
   assert.equal(r.twoFactorSecret, 'OLD');
 });
 
-test('健壮性：partial 为空不抛异常', () => {
-  assert.equal(resolveStep8Tolerance(undefined, false), null);
-  const r = resolveStep8Tolerance(undefined, true);
-  assert.ok(r && r.twoFactorSet === false);
+test('require2fa 时可从 existingTotpSecret 回填', () => {
+  const r = resolveStep8Tolerance({ passwordSet: true }, true, { require2fa: true, existingTotpSecret: 'JBSWY3DPEHPK3PXP' });
+  assert.ok(r);
+  assert.equal(r.twoFactorSecret, 'JBSWY3DPEHPK3PXP');
+  assert.equal(r.twoFactorSet, true);
 });

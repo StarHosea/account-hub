@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from services.account_lifecycle import STAGE_ACTIVATING, STAGE_PLUS_REVIEW, STAGE_REGISTERED
 from services.activation_service import ActivationService, is_activation_eligible
@@ -141,6 +141,35 @@ class ActivationReviewTest(unittest.TestCase):
         self.assertIsNotNone(failed)
         assert failed is not None
         self.assertEqual(failed.get("plus_status"), "激活失败")
+
+    def test_account_claim_rejects_duplicate(self):
+        svc = ActivationService()
+        email_key = "claim@x.com"
+        self.assertTrue(svc._try_claim_account(email_key))
+        self.assertFalse(svc._try_claim_account(email_key))
+        svc._release_account(email_key)
+        self.assertTrue(svc._try_claim_account(email_key))
+        svc._release_account(email_key)
+
+    def test_activate_account_skips_when_account_already_claimed(self):
+        svc = ActivationService()
+        token = "eyJskip"
+        acct = {
+            "email": "skip@x.com",
+            "access_token": token,
+            "stage": STAGE_REGISTERED,
+            "plan": "free",
+            "type": "free",
+        }
+        cfg = {"max_attempts_per_type": 1, "poll_interval": 0.01, "poll_timeout": 0.05}
+        svc._activating_emails.add("skip@x.com")
+        client = MagicMock()
+        with patch("services.activation_service.account_service.get_account", return_value=acct):
+            with patch("services.activation_service.cdk_service.acquire_available") as acquire:
+                ok = svc._activate_account(client, token, cfg)
+        self.assertIsNone(ok)
+        acquire.assert_not_called()
+        svc._release_account("skip@x.com")
 
 
 if __name__ == "__main__":

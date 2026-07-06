@@ -234,26 +234,54 @@ class CdkService:
             item["used_at"] = _now()
             self._save()
 
+    def clear_reservations(self, cdks: list[str] | None = None) -> int:
+        """清除内存中的 CDK 占用锁。
+
+        cdks=None 时清空全部（进程启动对账、激活批次结束）；指定列表时只释放对应 CDK
+        （人工撤销时释放卡在 available 但仍被 _reserved 锁住的遗留占用）。
+        """
+        with self._lock:
+            if cdks is None:
+                cleared = len(self._reserved)
+                self._reserved.clear()
+                return cleared
+            cleared = 0
+            for cdk in cdks:
+                key = str(cdk).strip()
+                if key in self._reserved:
+                    self._reserved.discard(key)
+                    cleared += 1
+            return cleared
+
     def revoke_use(self, cdks: list[str]) -> int:
         """危险操作：批量「撤销使用」——把选中的 CDK 从 used/invalid 复位为 available，
-        清除绑定账号(bound_token)与 used_at，使其可被重新领用。
+        清除绑定账号(bound_token)与 used_at，使其可被重新领用；同时释放内存占用锁。
 
+        对已是 available 但激活线程异常退出后仍被 _reserved 锁住的 CDK，也会释放占用并计入返回数量。
         仅用于**程序异常错误标记了 CDK 使用状态**时的人工纠正；不校验该 CDK 在服务端是否真的可再用。
         返回复位数量。
         """
         revoked = 0
+        need_save = False
         with self._lock:
             for cdk in cdks or []:
                 key = str(cdk).strip()
-                self._reserved.discard(key)
                 item = self._cdks.get(key)
-                if item is None or item.get("status") == STATUS_AVAILABLE:
+                if item is None:
                     continue
-                item["status"] = STATUS_AVAILABLE
-                item["bound_token"] = None
-                item["used_at"] = None
-                revoked += 1
-            if revoked:
+                touched = False
+                if key in self._reserved:
+                    self._reserved.discard(key)
+                    touched = True
+                if item.get("status") != STATUS_AVAILABLE:
+                    item["status"] = STATUS_AVAILABLE
+                    item["bound_token"] = None
+                    item["used_at"] = None
+                    need_save = True
+                    touched = True
+                if touched:
+                    revoked += 1
+            if need_save:
                 self._save()
         return revoked
 

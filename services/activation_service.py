@@ -15,6 +15,7 @@ from services.account_lifecycle import (
     STAGE_REGISTERED,
     apply_stage,
     enrich_account,
+    _norm_email,
 )
 from services.account_service import account_service
 from services.cdk_service import cdk_service
@@ -47,6 +48,9 @@ CDK_TYPES = ("UPI", "IDEL")
 # 已完成 CDK 兑换（含待人工核查）的 stage，下轮激活不再选中。
 _ACTIVATION_DONE_STAGES = frozenset({STAGE_PLUS_ACTIVATED, STAGE_PLUS_REVIEW})
 
+# _attempt 结束轮询的服务端明确终态；其余（pending/unknown）继续轮询直到大兜底。
+_TERMINAL_CLS = frozenset({"success", "fail", "cdk_invalid", "timeout", "cancelled"})
+
 
 def is_activation_eligible(account: dict) -> bool:
     """与 start() → _resolve_targets 默认分支相同的可选中口径。"""
@@ -54,6 +58,10 @@ def is_activation_eligible(account: dict) -> bool:
     if item.get("stage") in _ACTIVATION_DONE_STAGES:
         return False
     if item.get("plus_activated_at"):
+        return False
+    if item.get("plus_redeem_locked"):
+        # 已对该账号提交并被服务端受理过一张 CDK：即便当前档位仍非 Plus（服务端延迟/假失败/超时），
+        # 也不再自动提交第二张卡，避免重复激活烧卡；异议账号转人工核查(review)。
         return False
     if item.get("plus_unavailable"):
         return False
@@ -92,11 +100,14 @@ class ActivationService:
         self._persist_interval = 1e9 if _btype == "git" else 4.0
         self._last_persist_ts = 0.0
         self._stats: dict = self._load_persisted_stats()
+        # 进行中（已派发尚未出终态）的账号：以邮箱为唯一 key（token 刷新后会变）。
+        # 无邮箱时回退 access_token。仅内存态，进程重启后由 reconcile_stuck_activations 复位。
+        self._activating_emails: set[str] = set()
 
     @staticmethod
     def _empty_stats() -> dict:
         # running：在跑并发数（int，UI 展示）；job_running：整个批次是否运行中（bool，决定重启续跑）。
-        return {"total": 0, "done": 0, "success": 0, "fail": 0, "running": 0, "job_running": False,
+        return {"total": 0, "done": 0, "success": 0, "fail": 0, "skipped": 0, "review": 0, "running": 0, "job_running": False,
                 "job_limit": None, "started_at": None, "finished_at": None, "updated_at": None}
 
     def _load_persisted_stats(self) -> dict:
@@ -158,9 +169,11 @@ class ActivationService:
     def get(self) -> dict:
         with self._lock:
             running = bool(self._runner and self._runner.is_alive())
+            stats = dict(self._stats)
+            stats["claiming"] = len(self._activating_emails)
             return {
                 "running": running,
-                "stats": dict(self._stats),
+                "stats": stats,
                 "summary": self.summary(),
                 "logs": self._logs[-300:],
             }
@@ -194,6 +207,38 @@ class ActivationService:
     def _bump(self, **updates) -> None:
         with self._lock:
             self._stats.update(updates)
+            self._stats["updated_at"] = _now()
+        self._persist_stats()
+
+    @staticmethod
+    def _activation_claim_key(token: str, account: dict | None = None) -> str | None:
+        """占用锁唯一键：优先规范化邮箱；无邮箱时回退 access_token。"""
+        acct = account if account is not None else account_service.get_account(token)
+        email = str((acct or {}).get("email") or "").strip()
+        if email:
+            return _norm_email(email)
+        fallback = str((acct or {}).get("access_token") or token or "").strip()
+        return fallback or None
+
+    def _try_claim_account(self, claim_key: str) -> bool:
+        """原子领取账号激活权：同一邮箱同时只允许一条激活链路（顺序试 CDK）。"""
+        key = str(claim_key or "").strip()
+        if not key:
+            return False
+        with self._lock:
+            if key in self._activating_emails:
+                return False
+            self._activating_emails.add(key)
+            return True
+
+    def _release_account(self, claim_key: str) -> None:
+        with self._lock:
+            self._activating_emails.discard(str(claim_key or "").strip())
+
+    def _record_skip(self, email: str, message: str, log_sink=None) -> None:
+        self._append_log(f"[{email}] {message}", "yellow", log_sink)
+        with self._lock:
+            self._stats["skipped"] = int(self._stats.get("skipped") or 0) + 1
             self._stats["updated_at"] = _now()
         self._persist_stats()
 
@@ -277,6 +322,10 @@ class ActivationService:
         if cdk_service.counts().get("available", 0) <= 0:
             self._append_log("已开启注册后自动激活，但当前无可用 CDK，跳过", "yellow", log_sink)
             return False
+        acct = account_service.get_account(token)
+        if not acct or not is_activation_eligible(enrich_account(acct)):
+            self._append_log(f"已跳过自动激活：{token[:8]}… 不满足激活条件", "yellow", log_sink)
+            return False
 
         def _worker():
             client = CdkRedeemClient(cfg["base_url"], cfg["api_key"])
@@ -336,7 +385,7 @@ class ActivationService:
 
     def _run(self, targets: list[str], cfg: dict) -> None:
         client = CdkRedeemClient(cfg["base_url"], cfg["api_key"])
-        done = success = fail = 0
+        done = success = fail = skipped = review = 0
         lock = threading.Lock()
         try:
             with ThreadPoolExecutor(max_workers=cfg["concurrency"]) as executor:
@@ -346,22 +395,43 @@ class ActivationService:
                     if self._stop.is_set():
                         pass
                     try:
-                        ok = future.result()
+                        result = future.result()
                     except Exception as exc:
-                        ok = False
+                        result = False
                         self._append_log(f"激活异常: {exc}", "red")
                     with lock:
                         done += 1
-                        success += 1 if ok else 0
-                        fail += 0 if ok else 1
-                    self._bump(done=done, success=success, fail=fail, running=max(0, min(len(targets) - done, cfg["concurrency"])))
+                        if result is True:
+                            success += 1
+                        elif result == "review":
+                            review += 1
+                        elif result is None:
+                            skipped += 1
+                        else:
+                            fail += 1
+                    self._bump(
+                        done=done,
+                        success=success,
+                        fail=fail,
+                        skipped=skipped,
+                        review=review,
+                        running=max(0, min(len(targets) - done, cfg["concurrency"])),
+                    )
         except AuthError as exc:
             self._append_log(f"{exc}，已停止整轮激活", "red")
         finally:
             client.close()
+            cdk_service.clear_reservations()
         self._bump(running=0, job_running=False, finished_at=_now())
         self._persist_stats(force=True)
-        self._append_log(f"激活任务结束，成功 {success}，失败 {fail}", "yellow")
+        review_final = int(self._stats.get("review") or 0)
+        parts: list[str] = []
+        if skipped:
+            parts.append(f"跳过重复 {skipped}")
+        if review:
+            parts.append(f"转人工核查 {review}")
+        suffix = f"，{ '，'.join(parts)}" if parts else ""
+        self._append_log(f"激活任务结束，成功 {success}，失败 {fail}{suffix}", "yellow")
 
     def _set_account(self, token: str, **fields) -> None:
         fields["plus_updated_at"] = _now()
@@ -422,11 +492,35 @@ class ActivationService:
             if audit:
                 self._end_audit(audit, OUTCOME_REVIEW, msg, token, cdk=audit.cdk, cdk_type=audit.cdk_type, cdk_consumed=audit.cdk_consumed)
 
-    def _activate_account(self, client: CdkRedeemClient, token: str, cfg: dict, log_sink=None, source: str = "batch") -> bool:
-        if self._stop.is_set():
-            return False
-        acct = account_service.get_account(token)
-        email = (acct or {}).get("email") or token[:8]
+    def _activate_account(self, client: CdkRedeemClient, token: str, cfg: dict, log_sink=None, source: str = "batch") -> bool | None | str:
+        claim_key = self._activation_claim_key(token)
+        if not claim_key or not self._try_claim_account(claim_key):
+            acct = account_service.get_account(token)
+            email = (acct or {}).get("email") or token[:8]
+            self._record_skip(email, "已在激活中，跳过重复派发", log_sink)
+            return None
+        try:
+            acct = account_service.get_account(token)
+            email = (acct or {}).get("email") or token[:8]
+            if not acct or not is_activation_eligible(enrich_account(acct)):
+                self._record_skip(email, "不满足激活条件，已跳过", log_sink)
+                return None
+            if self._stop.is_set():
+                return False
+            return self._activate_account_body(client, token, cfg, acct, email, log_sink, source)
+        finally:
+            self._release_account(claim_key)
+
+    def _activate_account_body(
+        self,
+        client: CdkRedeemClient,
+        token: str,
+        cfg: dict,
+        acct: dict,
+        email: str,
+        log_sink,
+        source: str,
+    ) -> bool | None | str:
         audit = ActivationAuditRecorder(
             email=str(email),
             access_token=token,
@@ -441,6 +535,12 @@ class ActivationService:
             max_attempts = int(cfg["max_attempts_per_type"])
             any_attempt = False
 
+            # 提交前预检真实档位：已是 Plus 则直接判成功、打持久锁，绝不再烧卡。
+            # 返回最新 access_token（fetch_remote_info 可能刷新 token），后续用它提交更稳。
+            handled, token = self._preverify_already_plus(token, email, log_sink, audit)
+            if handled:
+                return True
+
             for cdk_type in CDK_TYPES:
                 tried: set[str] = set()
                 while attempts.get(cdk_type, 0) < max_attempts and not self._stop.is_set():
@@ -454,39 +554,18 @@ class ActivationService:
                     audit.cdk = cdk
                     audit.cdk_type = cdk_type
                     any_attempt = True
-                    consumed = False
-                    self._set_account(token, plus_status=STATUS_QUEUED, plus_cdk=cdk, plus_cdk_type=cdk_type, plus_last_message=f"提交 {cdk_type} CDK 兑换")
-                    self._append_log(f"[{email}] 尝试 {cdk_type} CDK（第 {attempts.get(cdk_type, 0) + 1}/{max_attempts} 次）", "", log_sink)
-                    try:
-                        try:
-                            cls, status, message, task_id = self._attempt(client, token, cdk, cfg, log_sink=log_sink, audit=audit)
-                        except AuthError:
-                            raise
-                        except RedeemError as exc:
-                            cls, status, message, task_id = "fail", "error", str(exc), ""
-
-                        if cls == "success":
-                            cdk_service.consume(cdk, token)
-                            consumed = True
-                            audit.cdk_consumed = True
-                            already_activated_at = (account_service.get_account(token) or {}).get("plus_activated_at")
-                            self._set_account(token, plus_status=STATUS_ACTIVATED, plus_task_id=task_id,
-                                              plus_last_message=message or "兑换成功",
-                                              plus_activated_at=already_activated_at or _now())
-                            self._append_log(f"[{email}] 激活成功（{cdk_type}）", "green", log_sink)
-                            self._verify_plan(token, email, log_sink, audit=audit)
-                            return True
-                        if cls == "cdk_invalid":
-                            cdk_service.mark_invalid(cdk)
-                            consumed = True
-                            self._append_log(f"[{email}] CDK {scrub(cdk)} 无效(not_found)，换下一个", "yellow", log_sink)
-                            continue
-                        attempts[cdk_type] = attempts.get(cdk_type, 0) + 1
-                        self._set_account(token, plus_attempts=attempts, plus_last_message=message or status)
-                        self._append_log(f"[{email}] {cdk_type} 第 {attempts[cdk_type]} 次失败：{scrub(message or status)}", "red", log_sink)
-                    finally:
-                        if not consumed:
-                            cdk_service.release(cdk)
+                    outcome = self._redeem_one_cdk(
+                        client, token, cdk, cdk_type, cfg, attempts, max_attempts, email, log_sink, audit)
+                    if outcome == "success":
+                        return True
+                    if outcome == "review":
+                        self._to_review(token, email, last_cdk, last_cdk_type, audit, log_sink)
+                        return "review"
+                    if outcome == "stopped":
+                        break
+                    # outcome == "next_card"：换下一张卡继续（attempts 已按需在单卡逻辑内递增）
+                if self._stop.is_set():
+                    break
 
             summary = "两种类型 CDK 均激活失败，已标记账号不可用" if any_attempt else "无可用 CDK"
             self._set_account(token, plus_status=STATUS_FAILED,
@@ -525,6 +604,165 @@ class ActivationService:
                         patch["plus_task_id"] = None
                     account_service.update_account(token, patch, quiet=True)
 
+    def _preverify_already_plus(self, token: str, email: str, log_sink, audit) -> tuple[bool, str]:
+        """提交前预检真实档位：已是 Plus 直接判成功、不烧卡。
+
+        返回 (handled, latest_token)：handled=True 表示已按「已是 Plus」收尾，调用方直接成功返回；
+        handled=False 表示需继续正常兑换。latest_token 为 fetch_remote_info 刷新后的最新 access_token
+        （可能与传入不同），供后续 submit 使用；查询失败时原样回传，不阻断兑换。
+        """
+        try:
+            acct = account_service.fetch_remote_info(token, event="activation_preverify")
+        except Exception:  # noqa: BLE001 —— 预检失败不应阻断正常兑换
+            return False, token
+        item = enrich_account(acct or {})
+        latest = str(item.get("access_token") or token) or token
+        if str(item.get("type") or "").strip().lower() != "plus":
+            return False, latest
+        msg = "提交前核实已是 Plus，跳过兑换（不烧卡）"
+        self._set_account(latest, plus_redeem_locked=True)
+        account_service.update_account(
+            latest,
+            apply_stage(item, STAGE_PLUS_ACTIVATED, plan="plus",
+                        activated_at=item.get("activated_at") or _now(),
+                        plus_last_message=msg),
+            quiet=True,
+        )
+        self._append_log(f"[{email}] {msg}", "green", log_sink)
+        if audit:
+            audit.record_plan_verify("success", tier="plus")
+            if not audit.finished_at:
+                self._end_audit(audit, OUTCOME_SUCCESS, msg, latest, cdk=None, cdk_type=None, cdk_consumed=False)
+        return True, latest
+
+    def _redeem_one_cdk(self, client: CdkRedeemClient, token: str, cdk: str, cdk_type: str, cfg: dict,
+                        attempts: dict, max_attempts: int, email: str, log_sink, audit) -> str:
+        """对单张 CDK 完成「提交 + 持续轮询 + timeout/failed 原地重试」，返回处置结果：
+
+          success   —— 兑换成功（已 consume、已置激活）
+          next_card —— 该卡不再重试，换下一张卡（失败已计入 attempts / not_found / 重试超上限）
+          review    —— 转人工核查（timeout 重试超限 / 大兜底到点仍 pending），持久锁已在，不再烧卡
+          stopped   —— 收到停止信号
+
+        重试策略：timeout（服务端超时/长时间无终态）走 /cdkey-jobs/retry 复用同卡、不计失败次数、
+        上限 timeout_retry_max；failed 走 retry 复用同卡、上限 failed_retry_max，用尽才换卡并计入
+        max_attempts_per_type。任一次被服务端受理即打 plus_redeem_locked 持久锁，杜绝重复烧卡。
+        """
+        timeout_retry_max = int(cfg.get("timeout_retry_max", 5))
+        failed_retry_max = int(cfg.get("failed_retry_max", 3))
+        timeout_retries = 0
+        failed_retries = 0
+        action = "submit"
+        consumed = False
+        locked = False
+        self._set_account(token, plus_status=STATUS_QUEUED, plus_cdk=cdk, plus_cdk_type=cdk_type,
+                          plus_last_message=f"提交 {cdk_type} CDK 兑换")
+        self._append_log(
+            f"[{email}] 尝试 {cdk_type} CDK（第 {attempts.get(cdk_type, 0) + 1}/{max_attempts} 次）", "", log_sink)
+        try:
+            while not self._stop.is_set():
+                label = "" if action == "submit" else f"#t{timeout_retries}f{failed_retries}"
+                try:
+                    cls, status, message, task_id = self._attempt(
+                        client, token, cdk, cfg, log_sink=log_sink, audit=audit, action=action, label=label)
+                except AuthError:
+                    raise
+                except RedeemError as exc:
+                    cls, status, message, task_id = "fail", "error", scrub(str(exc)), ""
+
+                # 一旦被服务端受理（进入过队列），立刻打持久锁：即便后续判超时/失败也不再烧第二张卡。
+                if cls not in ("rejected", "retry_rejected") and not locked:
+                    self._set_account(token, plus_redeem_locked=True)
+                    locked = True
+
+                if cls == "success":
+                    cdk_service.consume(cdk, token)
+                    consumed = True
+                    audit.cdk_consumed = True
+                    already_activated_at = (account_service.get_account(token) or {}).get("plus_activated_at")
+                    self._set_account(token, plus_status=STATUS_ACTIVATED, plus_task_id=task_id,
+                                      plus_last_message=message or "兑换成功",
+                                      plus_activated_at=already_activated_at or _now())
+                    self._append_log(f"[{email}] 激活成功（{cdk_type}）", "green", log_sink)
+                    self._verify_plan(token, email, log_sink, audit=audit)
+                    return "success"
+
+                if cls == "cdk_invalid":
+                    cdk_service.mark_invalid(cdk)
+                    consumed = True
+                    self._append_log(f"[{email}] CDK {scrub(cdk)} 无效(not_found)，换下一个", "yellow", log_sink)
+                    return "next_card"
+
+                if cls == "timeout":
+                    if timeout_retries < timeout_retry_max:
+                        timeout_retries += 1
+                        if audit:
+                            audit.log(f"服务端超时，复用同卡重入列重试 第 {timeout_retries}/{timeout_retry_max} 次", "warn")
+                        self._append_log(
+                            f"[{email}] {cdk_type} 兑换超时，复用同卡重试 第 {timeout_retries}/{timeout_retry_max} 次", "yellow", log_sink)
+                        action = "retry"
+                        continue
+                    self._append_log(
+                        f"[{email}] {cdk_type} 超时重试已达上限（{timeout_retry_max}），转人工核查", "yellow", log_sink)
+                    return "review"
+
+                if cls == "poll_exhausted":
+                    if self._stop.is_set():
+                        return "stopped"
+                    self._append_log(f"[{email}] {cdk_type} 轮询大兜底到点仍无终态，转人工核查", "yellow", log_sink)
+                    return "review"
+
+                if cls in ("cancelled", "retry_rejected"):
+                    # 任务已取消 / 服务端拒绝重试：retry 不可复用，回退重新 submit 同卡（受 failed 上限保护）。
+                    if failed_retries < failed_retry_max:
+                        failed_retries += 1
+                        if audit:
+                            audit.log(f"{status}，回退重新提交同卡 第 {failed_retries}/{failed_retry_max} 次", "warn")
+                        self._append_log(
+                            f"[{email}] {cdk_type} {scrub(message or status)}，回退重新提交同卡 第 {failed_retries}/{failed_retry_max} 次",
+                            "yellow", log_sink)
+                        action = "submit"
+                        continue
+                    attempts[cdk_type] = attempts.get(cdk_type, 0) + 1
+                    self._set_account(token, plus_attempts=attempts, plus_last_message=message or status)
+                    self._append_log(f"[{email}] {cdk_type} 重试上限，换下一张卡", "red", log_sink)
+                    return "next_card"
+
+                # cls in ("fail", "rejected")：本次失败——先对同一张卡重试，用尽才换卡并计入 attempts。
+                if failed_retries < failed_retry_max:
+                    failed_retries += 1
+                    if audit:
+                        audit.log(
+                            f"兑换失败，复用同卡重试 第 {failed_retries}/{failed_retry_max} 次：{scrub(message or status)}", "warn")
+                    self._append_log(
+                        f"[{email}] {cdk_type} 失败，复用同卡重试 第 {failed_retries}/{failed_retry_max} 次：{scrub(message or status)}",
+                        "yellow", log_sink)
+                    action = "retry" if cls == "fail" else "submit"
+                    continue
+                attempts[cdk_type] = attempts.get(cdk_type, 0) + 1
+                self._set_account(token, plus_attempts=attempts, plus_last_message=message or status)
+                self._append_log(
+                    f"[{email}] {cdk_type} 第 {attempts[cdk_type]} 次失败：{scrub(message or status)}", "red", log_sink)
+                return "next_card"
+            return "stopped"
+        finally:
+            if not consumed:
+                cdk_service.release(cdk)
+
+    def _to_review(self, token: str, email: str, cdk, cdk_type, audit, log_sink) -> None:
+        """把「已受理但未确认成功」的账号转人工核查：保留持久锁，不再自动烧卡。"""
+        msg = "CDK 已提交受理但未确认成功，转人工核查（不再自动烧卡）"
+        acct = account_service.get_account(token)
+        if acct:
+            account_service.update_account(
+                token,
+                apply_stage(enrich_account(acct), STAGE_PLUS_REVIEW, plus_last_message=msg),
+                quiet=True,
+            )
+        self._append_log(f"[{email}] {msg}", "yellow", log_sink)
+        if audit and not audit.finished_at:
+            self._end_audit(audit, OUTCOME_REVIEW, msg, token, cdk=cdk, cdk_type=cdk_type, cdk_consumed=audit.cdk_consumed)
+
     def _log_raw(self, cdk: str, phase: str, js: object, log_sink=None) -> None:
         """把兑换接口的原始响应（脱敏 + 截断）写进激活日志，便于本地定位真实信封结构与状态词。"""
         try:
@@ -533,37 +771,57 @@ class ActivationService:
             text = str(js)
         self._append_log(f"[{scrub(cdk)}] {phase} 原始响应: {scrub(text[:800])}", "", log_sink)
 
-    def _attempt(self, client: CdkRedeemClient, token: str, cdk: str, cfg: dict, log_sink=None, audit: ActivationAuditRecorder | None = None) -> tuple[str, str, str, str]:
-        """一次提交 + 轮询到终态。返回 (cls, status, message, task_id)。
+    def _attempt(self, client: CdkRedeemClient, token: str, cdk: str, cfg: dict, log_sink=None,
+                 audit: ActivationAuditRecorder | None = None, action: str = "submit", label: str = "") -> tuple[str, str, str, str]:
+        """提交一次（首次 submit / 后续 retry 复用同卡）+ 持续轮询查激活结果，直到服务端明确终态。
 
-        判定以「响应里该 CDK 对应的 item.status」为准：只要能在响应中定位到该项，就按 item 状态分类，
-        **忽略外层信封 code**（不同服务端成功码可能是 0 / 200 等，不能据此直接判失败——这正是旧逻辑把
-        每次提交都误判为失败、导致「查不到成功状态 / CDK 不消耗 / 刷新才发现已是 Plus」的根因）。
-        仅当响应里完全没有该项时，才回退用信封 code/msg 判断是否硬错误，否则视为已受理并进入轮询。
+        返回 (cls, status, message, task_id)，cls 取值：
+          - success / fail / timeout / cdk_invalid / cancelled —— 服务端明确状态（见 classify）
+          - poll_exhausted —— 轮询到 poll_timeout 大兜底仍未出终态（一直 pending），应转人工核查
+          - rejected —— 提交未被受理（信封 code!=0 等硬错误），任务可能未建，调用方回退重新 submit
+          - retry_rejected —— action=retry 但服务端未受理重试（retried=false），调用方回退重新 submit
+
+        判定以「响应里该 CDK 对应的 item.status」为准，忽略外层信封成功码；仅当响应里完全没有该项时，
+        才回退用信封 code 判硬错误。timeout/cancelled 现为独立终态（不再混入 fail），交由上层原地重试。
         """
-        js = client.submit(
-            cdk,
-            token,
-            exchange_cb=(lambda meta: audit.record_http("cdk_submit", meta)) if audit else None,
-        )
-        self._log_raw(cdk, "submit", js, log_sink)
-        it = item_for_cdk(js, cdk)
-        task_id = item_task_id(it)
-        status = ""
-        if it is not None:
-            status = item_status(it)
-            cls = classify(status)
-            self._reflect_progress(token, it)
-            if cls in ("success", "fail", "cdk_invalid"):
-                return cls, status, item_message(it), task_id
+        if action == "retry":
+            js = client.retry(
+                [cdk],
+                exchange_cb=(lambda meta: audit.record_http(f"cdk_retry{label}", meta)) if audit else None,
+            )
+            self._log_raw(cdk, f"retry{label}", js, log_sink)
+            rit = item_for_cdk(js, cdk)
+            if not cdk_redeem_client.item_retried(rit):
+                reason = item_message(rit) or "重试未受理（found/retried=false）"
+                return "retry_rejected", "retry_rejected", reason, item_task_id(rit)
+            task_id = item_task_id(rit)
+            status = ""
+            js_for_poll: object = js
         else:
-            code = cdk_redeem_client.env_code(js)
-            if code not in (None, 0):
-                return "fail", f"code={code}", cdk_redeem_client.env_msg(js) or "envelope code!=0", ""
+            js = client.submit(
+                cdk,
+                token,
+                exchange_cb=(lambda meta: audit.record_http("cdk_submit", meta)) if audit else None,
+            )
+            self._log_raw(cdk, "submit", js, log_sink)
+            it = item_for_cdk(js, cdk)
+            task_id = item_task_id(it)
+            status = ""
+            js_for_poll = js
+            if it is not None:
+                status = item_status(it)
+                cls = classify(status)
+                self._reflect_progress(token, it)
+                if cls in _TERMINAL_CLS:
+                    return cls, status, item_message(it), task_id
+            else:
+                code = cdk_redeem_client.env_code(js)
+                if code not in (None, 0):
+                    return "rejected", f"code={code}", cdk_redeem_client.env_msg(js) or "envelope code!=0", ""
 
         deadline = time.time() + float(cfg["poll_timeout"])
         interval = float(cfg["poll_interval"])
-        last_js: object = js
+        last_js: object = js_for_poll
         polled = 0
         while time.time() < deadline and not self._stop.is_set():
             time.sleep(interval)
@@ -585,13 +843,14 @@ class ActivationService:
                 status = item_status(sit)
                 self._reflect_progress(token, sit)
                 cls = classify(status)
-                if cls in ("success", "fail", "cdk_invalid"):
+                if cls in _TERMINAL_CLS:
                     if polled != 1:
                         self._log_raw(cdk, f"status(final,{status or '空'})", sjs, log_sink)
                     return cls, status, item_message(sit), item_task_id(sit) or task_id
-            # sit 为空：可能完成后已从队列消失，也可能仍在处理；继续轮询直到超时。
-        self._log_raw(cdk, "timeout", last_js, log_sink)
-        return "fail", status or "timeout", "兑换超时（仍在排队/处理）", task_id
+            # sit 为空：可能完成后已从队列消失，也可能仍在处理；继续轮询直到大兜底。
+        # 到点仍未出终态（一直 pending）或被停止：不判失败、不换卡，交上层转人工核查。
+        self._log_raw(cdk, "poll_exhausted", last_js, log_sink)
+        return "poll_exhausted", status or "pending", "轮询大兜底到点仍未出终态（仍在排队/处理）", task_id
 
     def _reflect_progress(self, token: str, it: dict | None) -> None:
         if not isinstance(it, dict):

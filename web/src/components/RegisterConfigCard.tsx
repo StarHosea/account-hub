@@ -1,9 +1,9 @@
-import { useState } from "react";
-import { Card, Button, Input, InputNumber, Select, Switch, TextArea, Typography, Space, Toast, Spin, Radio, RadioGroup } from "@douyinfe/semi-ui-19";
+import { Card, Button, Input, InputNumber, Select, Switch, TextArea, Typography, Space, Toast, Radio, RadioGroup } from "@douyinfe/semi-ui-19";
 import { IconSave, IconRefresh, IconLink } from "@douyinfe/semi-icons";
 
 import { useSettingsStore } from "@/store/settings";
 import { copyToClipboard } from "@/lib/clipboard";
+import ActivationConfigCard from "@/components/ActivationConfigCard";
 import {
   DEFAULT_HTTP_PROXY,
   DEFAULT_IPWEB_ACCOUNT_ID,
@@ -57,13 +57,10 @@ export default function RegisterConfigCard() {
   const setProviderType = useSettingsStore((s) => s.setRegisterProviderType);
   const updateProvider = useSettingsStore((s) => s.updateRegisterProvider);
   const save = useSettingsStore((s) => s.saveRegister);
-  const saveActivation = useSettingsStore((s) => s.saveActivationConfig);
   const activationConfig = useSettingsStore((s) => s.activationConfig);
   const setActivationAutoActivate = useSettingsStore((s) => s.setActivationAutoActivate);
-  const setActivationField = useSettingsStore((s) => s.setActivationConfigField);
   const loadRegister = useSettingsStore((s) => s.loadRegister);
   const isLoadingRegister = useSettingsStore((s) => s.isLoadingRegister);
-  const [savingActivation, setSavingActivation] = useState(false);
 
   if (!config) return null;
 
@@ -76,22 +73,9 @@ export default function RegisterConfigCard() {
   const handleSave = async () => {
     try {
       await save();
-      if (activationConfig) await saveActivation({ silent: true });
       Toast.success("注册配置已保存");
     } catch (e) {
       Toast.error(e instanceof Error ? e.message : "保存失败");
-    }
-  };
-
-  const handleSaveActivation = async () => {
-    setSavingActivation(true);
-    try {
-      await saveActivation();
-      Toast.success("激活设置已保存");
-    } catch (e) {
-      Toast.error(e instanceof Error ? e.message : "保存失败");
-    } finally {
-      setSavingActivation(false);
     }
   };
 
@@ -231,49 +215,7 @@ export default function RegisterConfigCard() {
         </div>
       </Card>
 
-      <Card
-        id="settings-activation"
-        title="激活设置"
-        style={{ marginBottom: 16 }}
-        headerExtraContent={
-          <Button
-            icon={<IconSave />}
-            theme="solid"
-            type="primary"
-            size="small"
-            onClick={() => void handleSaveActivation()}
-            loading={savingActivation}
-            disabled={!activationConfig}
-          >
-            保存
-          </Button>
-        }
-      >
-        {!activationConfig ? (
-          <Spin />
-        ) : (
-          <>
-            <div style={{ marginBottom: 14 }}>
-              <Text style={{ display: "block", marginBottom: 6 }}>
-                CDK API Key{activationConfig.has_api_key ? "（已配置，可留空不改）" : ""}
-              </Text>
-              <Input
-                mode="password"
-                value={activationConfig.api_key ?? ""}
-                onChange={(v) => setActivationField("api_key", v)}
-                placeholder={activationConfig.has_api_key ? "••••••（已配置）" : "填写 CDK 兑换 API Key"}
-              />
-            </div>
-            <div style={{ marginBottom: 14 }}>
-              <Text style={{ display: "block", marginBottom: 6 }}>CDK API 地址</Text>
-              <Input value={activationConfig.base_url ?? ""} onChange={(v) => setActivationField("base_url", v)} />
-            </div>
-            <Text type="tertiary" size="small">
-              并发数、激活数量等运行参数请在{navRef("activator")}页设置；注册成功后自动激活请在上方「注册配置」中设置。
-            </Text>
-          </>
-        )}
-      </Card>
+      <ActivationConfigCard registerRunning={running} />
 
       <Card id="settings-static-cache" title="缓存设置" style={{ marginBottom: 16 }}>
         <Text type="tertiary" style={{ display: "block", marginBottom: 12 }}>

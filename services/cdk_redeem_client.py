@@ -11,15 +11,23 @@ from curl_cffi import requests
 # ----------------------------- 状态分类（移植自参考脚本 redeem.py，大小写不敏感） ----------------------------- #
 STATUS_SUCCESS = {"success", "succeeded", "completed", "complete", "ok"}
 STATUS_FAIL = {
-    "failed", "fail", "timeout", "error", "rejected", "invalid",
+    "failed", "fail", "error", "rejected", "invalid",
     "token-invalidated", "token_invalidated", "token-invalid", "invalidated",
-    "access-token-invalid", "access_token_invalid", "cancelled", "canceled",
+    "access-token-invalid", "access_token_invalid",
 }
+# timeout：服务端「兑换超时/仍在处理」的独立终态。不当失败——对同一张 CDK 走
+# /cdkey-jobs/retry 重入列继续等（不计失败次数）。详见 activation_service 单卡重试循环。
+STATUS_TIMEOUT = {"timeout"}
+# cancelled：任务已取消。retry 接口不可复用（文档要求改用提交接口重新 submit 同卡）。
+STATUS_CANCELLED = {"cancelled", "canceled"}
 STATUS_CDK_INVALID = {"not_found", "notfound"}
 STATUS_PENDING = {"pending_dispatch", "dispatched", "running", "queued", "processing", "pending", "waiting"}
 
 SUBMIT_PATH = "/api/external/cdkey-redeems"
 STATUS_PATH = "/api/external/cdkey-redeems/status"
+# 任务接口：取消/重试走 /cdkey-jobs（与提交/查询的 /cdkey-redeems 路径不同，同一把 API Key）。
+JOBS_RETRY_PATH = "/api/external/cdkey-jobs/retry"
+JOBS_CANCEL_PATH = "/api/external/cdkey-jobs/cancel"
 
 NET_RETRIES = 3
 BACKOFF_BASE = 1.5
@@ -37,10 +45,14 @@ def scrub(text: object) -> str:
 
 
 def classify(status: str) -> str:
-    """状态字符串 → success / fail / cdk_invalid / pending / unknown。"""
+    """状态字符串 → success / timeout / cancelled / fail / cdk_invalid / pending / unknown。"""
     st = (status or "").strip().lower()
     if st in STATUS_SUCCESS:
         return "success"
+    if st in STATUS_TIMEOUT:
+        return "timeout"
+    if st in STATUS_CANCELLED:
+        return "cancelled"
     if st in STATUS_FAIL:
         return "fail"
     if st in STATUS_CDK_INVALID:
@@ -109,6 +121,16 @@ def item_task_id(it: object) -> str:
         if it.get(key):
             return str(it.get(key))
     return ""
+
+
+def item_retried(it: object) -> bool:
+    """/cdkey-jobs/retry 逐条结果：本次是否成功重新入列。"""
+    return bool(isinstance(it, dict) and it.get("retried"))
+
+
+def item_found(it: object) -> bool:
+    """/cdkey-jobs/* 逐条结果：是否找到该任务。"""
+    return bool(isinstance(it, dict) and it.get("found"))
 
 
 def queue_ahead(it: object) -> int | None:
@@ -300,6 +322,21 @@ class CdkRedeemClient:
     def query_status(self, cdks: list[str], exchange_cb=None) -> dict | None:
         body = {"cdkeys": [c.strip() for c in cdks]}
         return self._request("POST", STATUS_PATH, body, exchange_cb=exchange_cb)
+
+    def retry(self, cdks: list[str], exchange_cb=None) -> dict | None:
+        """重试任务：一键复用已绑定的 access_token 重新入列（POST /cdkey-jobs/retry）。
+
+        用于 timeout / failed 时对**同一张 CDK** 原地重试，不换新卡、不重占 access_token。
+        逐条结果在 data.items（found / retried / reason）；retried=false（如任务已取消/不可操作）
+        时调用方应回退为重新 submit 同卡。
+        """
+        body = {"cdkeys": [c.strip() for c in cdks]}
+        return self._request("POST", JOBS_RETRY_PATH, body, exchange_cb=exchange_cb)
+
+    def cancel(self, cdks: list[str], exchange_cb=None) -> dict | None:
+        """取消任务（POST /cdkey-jobs/cancel）。逐条结果在 data.items（found / cancelled / reason）。"""
+        body = {"cdkeys": [c.strip() for c in cdks]}
+        return self._request("POST", JOBS_CANCEL_PATH, body, exchange_cb=exchange_cb)
 
     def close(self) -> None:
         try:

@@ -6,8 +6,9 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
+from services.account_lifecycle import enrich_account
 from services.account_service import account_service
-from services.activation_service import STATUS_UNACTIVATED, activation_service
+from services.activation_service import activation_service, is_activation_eligible
 from services.cdk_redeem_client import AuthError, CdkRedeemClient, scrub
 from services.cdk_service import cdk_service
 from services.config import config
@@ -161,9 +162,9 @@ class RunService:
     # ----------------------------- 运行 ----------------------------- #
     def _unactivated_tokens(self) -> list[str]:
         return [
-            a.get("access_token")
+            str(enrich_account(a).get("access_token") or "")
             for a in account_service.list_accounts()
-            if a.get("plus_status", STATUS_UNACTIVATED) == STATUS_UNACTIVATED and a.get("access_token")
+            if is_activation_eligible(a) and a.get("access_token")
         ]
 
     def _run(self, target: int, replenish: bool, cfg: dict) -> None:
@@ -221,6 +222,7 @@ class RunService:
             self._append_log(f"运行异常：{exc}", "red")
         finally:
             client.close()
+            cdk_service.clear_reservations()
         self._bump(running=0, job_running=False, phase="完成", finished_at=_now())
         self._persist_stats(force=True)
         self._append_log(f"运行结束：注册 {registered}，激活成功 {activated}", "green" if activated >= target else "yellow")
@@ -254,7 +256,7 @@ class RunService:
             futures = [ex.submit(activation_service._activate_account, client, t, cfg, _sink) for t in tokens]
             for fut in as_completed(futures):
                 try:
-                    if fut.result():
+                    if fut.result() is True:
                         success += 1
                 except Exception as exc:  # noqa: BLE001
                     self._append_log(f"激活异常：{exc}", "red")

@@ -82,12 +82,20 @@ function LogView({ logs }: { logs: LogEntry[] }) {
       }}
     >
       {logs.length ? (
-        logs.map((l, i) => (
-          <div key={i} style={{ color: LEVEL_COLOR[l.level] || "var(--semi-color-text-1)" }}>
-            <span style={{ color: "var(--semi-color-text-2)" }}>{fmtTime(l.time)} </span>
-            {l.text}
-          </div>
-        ))
+        logs.map((l, i) => {
+          const isSkip = l.text.includes("跳过");
+          return (
+            <div key={i} style={{ color: LEVEL_COLOR[l.level] || "var(--semi-color-text-1)" }}>
+              <span style={{ color: "var(--semi-color-text-2)" }}>{fmtTime(l.time)} </span>
+              {isSkip ? (
+                <Tag color="orange" size="small" style={{ marginRight: 6, verticalAlign: "middle" }}>
+                  跳过
+                </Tag>
+              ) : null}
+              {l.text}
+            </div>
+          );
+        })
       ) : (
         <Text type="tertiary">暂无日志</Text>
       )}
@@ -218,6 +226,13 @@ export default function ActivatorPage() {
     return Number.isFinite(p) ? Math.min(100, Math.max(0, p)) : 0;
   })();
 
+  const jobSuccess = act?.stats.success ?? 0;
+  const jobFail = act?.stats.fail ?? 0;
+  const jobSkipped = act?.stats.skipped ?? 0;
+  const jobReview = act?.stats.review ?? 0;
+  const jobClaiming = act?.stats.claiming ?? 0;
+  const showJobStats = activationRunning || jobSuccess > 0 || jobFail > 0 || jobSkipped > 0 || jobReview > 0;
+
   const activatingAccounts = useMemo(
     () => accounts.filter((a) => a.plus_status === "排队中" || a.plus_status === "激活中"),
     [accounts],
@@ -318,28 +333,17 @@ export default function ActivatorPage() {
         <OverviewCard label="可用激活码" value={cdkAvailable} danger={cdkAvailable === 0} />
       </div>
 
-      <Card title="任务配置" style={{ marginBottom: 16 }}>
+      <Card title="任务控制" style={{ marginBottom: 16 }}>
         <ResourceZeroWarning hints={activationResourceHints} />
         <Space wrap spacing="loose" align="end">
           <div>
-            <Text style={{ display: "block", marginBottom: 6 }}>并发数</Text>
-            <InputNumber
-              min={1}
-              max={10}
-              value={concurrency}
-              onChange={(v) => setActivationConfigField("concurrency", String(v ?? 1))}
-              disabled={activationRunning}
-              style={{ width: 140 }}
-            />
-          </div>
-          <div>
-            <Text style={{ display: "block", marginBottom: 6 }}>激活上限（0 表示不限）</Text>
+            <Text style={{ display: "block", marginBottom: 6 }}>本轮激活上限（0 表示不限）</Text>
             <InputNumber
               min={0}
               value={target}
               onChange={(v) => setActivationConfigField("target", String(v ?? 0))}
               disabled={activationRunning}
-              style={{ width: 140 }}
+              style={{ width: 180 }}
             />
           </div>
           {activationRunning ? (
@@ -375,6 +379,48 @@ export default function ActivatorPage() {
             stroke={activationRunning ? "var(--semi-color-success)" : undefined}
             showInfo
           />
+          {showJobStats ? (
+            <Space wrap spacing={12} style={{ marginTop: 8 }}>
+              <Text type="tertiary" size="small">
+                本轮成功 <Text strong>{jobSuccess}</Text>
+              </Text>
+              <Text type="tertiary" size="small">
+                失败 <Text strong>{jobFail}</Text>
+              </Text>
+              {jobSkipped > 0 ? (
+                <Text type="tertiary" size="small">
+                  跳过重复 <Text strong style={{ color: "var(--semi-color-warning)" }}>{jobSkipped}</Text>
+                </Text>
+              ) : null}
+              {jobReview > 0 ? (
+                <Text type="tertiary" size="small">
+                  转人工核查 <Text strong style={{ color: "var(--semi-color-warning)" }}>{jobReview}</Text>
+                </Text>
+              ) : null}
+              {jobClaiming > 0 ? (
+                <Text type="tertiary" size="small">
+                  占用中账号 <Text strong style={{ color: "var(--semi-color-primary)" }}>{jobClaiming}</Text>
+                </Text>
+              ) : null}
+            </Space>
+          ) : null}
+          {activationRunning ? (
+            <Text type="tertiary" size="small" style={{ display: "block", marginTop: 6 }}>
+              同一免费账号同时只允许一条激活链路；重复派发会被跳过，不会重复消耗 CDK。并发、轮询与重试策略请在
+              <Link to="/settings#settings-activation" style={{ margin: "0 4px" }}>
+                系统设置 → 激活设置
+              </Link>
+              中配置。
+            </Text>
+          ) : (
+            <Text type="tertiary" size="small" style={{ display: "block", marginTop: 6 }}>
+              并发、轮询间隔、大兜底时长、同卡重试等参数请在
+              <Link to="/settings#settings-activation" style={{ margin: "0 4px" }}>
+                系统设置 → 激活设置
+              </Link>
+              中配置（当前并发 {concurrency}）。
+            </Text>
+          )}
         </div>
       </Card>
 

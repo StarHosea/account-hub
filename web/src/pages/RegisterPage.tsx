@@ -139,8 +139,8 @@ export default function RegisterPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const loadAbnormal = useCallback(async (q = abnormalQuery) => {
-    setAbnormalLoading(true);
+  const loadAbnormal = useCallback(async (q = abnormalQuery, options?: { silent?: boolean }) => {
+    if (!options?.silent) setAbnormalLoading(true);
     try {
       const r = await fetchRegisterAbnormal({ q: q || undefined, page_size: 200 });
       setAbnormal(r.items);
@@ -148,7 +148,7 @@ export default function RegisterPage() {
     } catch {
       // 静默：SSE/轮询会再拉
     } finally {
-      setAbnormalLoading(false);
+      if (!options?.silent) setAbnormalLoading(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [abnormalQuery]);
@@ -171,7 +171,7 @@ export default function RegisterPage() {
     const timer = setInterval(() => {
       if (document.visibilityState !== "visible") return;
       pullResources();
-      void loadAbnormal();
+      void loadAbnormal(undefined, { silent: true });
     }, 5000);
     return () => clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps

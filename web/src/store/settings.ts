@@ -91,7 +91,7 @@ type SettingsStore = {
   loadActivationConfig: () => Promise<void>;
   setActivationConfig: (config: ActivationConfig) => void;
   setActivationConfigField: (
-    key: "base_url" | "api_key" | "concurrency" | "poll_interval" | "poll_timeout" | "max_attempts_per_type" | "target",
+    key: "base_url" | "api_key" | "concurrency" | "poll_interval" | "poll_timeout" | "max_attempts_per_type" | "timeout_retry_max" | "failed_retry_max" | "target",
     value: string,
   ) => void;
   setActivationAutoActivate: (value: boolean) => void;
@@ -531,9 +531,11 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       const data = await updateActivationConfig({
         base_url: String(activationConfig.base_url || "").trim(),
         concurrency: Math.max(1, Number(activationConfig.concurrency) || 1),
-        poll_interval: Math.max(1, Number(activationConfig.poll_interval) || 1),
-        poll_timeout: Math.max(1, Number(activationConfig.poll_timeout) || 1),
+        poll_interval: Math.max(1, Number(activationConfig.poll_interval) || 5),
+        poll_timeout: Math.max(30, Number(activationConfig.poll_timeout) || 3600),
         max_attempts_per_type: Math.max(1, Number(activationConfig.max_attempts_per_type) || 1),
+        timeout_retry_max: Math.max(0, Number(activationConfig.timeout_retry_max) || 0),
+        failed_retry_max: Math.max(0, Number(activationConfig.failed_retry_max) || 0),
         auto_activate_after_register: Boolean(activationConfig.auto_activate_after_register),
         target: Math.max(0, Number(activationConfig.target) || 0),
         // 仅在用户填写了新 api_key 时提交（写入式字段）

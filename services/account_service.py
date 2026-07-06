@@ -137,7 +137,7 @@ class AccountService:
         不动 plus_unavailable 及「已激活/激活失败」终态。同时把 stage 从 activating 复位为 registered。
         返回复位数量。
         """
-        from services.account_lifecycle import STAGE_ACTIVATING, STAGE_REGISTERED, apply_stage, enrich_account
+        from services.account_lifecycle import STAGE_ACTIVATING, STAGE_PLUS_REVIEW, STAGE_REGISTERED, apply_stage, enrich_account
 
         reset = 0
         for acct in self.list_accounts():
@@ -152,6 +152,16 @@ class AccountService:
             stuck_plus = item.get("plus_status") in ("排队中", "激活中")
             stuck_stage = str(item.get("stage")) == STAGE_ACTIVATING
             if not stuck_plus and not stuck_stage:
+                continue
+            if item.get("plus_redeem_locked"):
+                # 重启前已提交并被服务端受理过 CDK：绝不复位为可激活（否则会用第二张卡重复激活），
+                # 转人工核查并保留持久锁。服务端真实结果留待人工/后续核实确认。
+                patch = apply_stage(
+                    {**item, "plus_last_message": "重启前已提交 CDK，转人工核查（防重复烧卡）"},
+                    STAGE_PLUS_REVIEW,
+                )
+                self.update_account(token, patch, quiet=True)
+                reset += 1
                 continue
             patch: dict = {
                 "plus_status": "未激活",
@@ -1433,6 +1443,7 @@ class AccountService:
                     STAGE_REGISTERED,
                     plan=PLAN_FREE,
                     plus_unavailable=False,
+                    plus_redeem_locked=False,
                     plus_activated_at=None,
                     activated_at=None,
                     plus_last_message=None,

@@ -831,6 +831,32 @@ def worker(index: int) -> dict:
         log(f"任务 {index} {err}，耗时 {cost:.1f} 秒", "red")
         return {"ok": False, "index": index, "error": err}
 
+    def _abort_stopped() -> dict:
+        """手动停止：已领邮箱的任务记入异常清单，避免「失败数」与清单条数不一致。"""
+        nonlocal mailbox_settled
+        err = "注册任务已停止（手动终止）"
+        email = str((mailbox or {}).get("address") or "").strip()
+        fetch_url = str((mailbox or {}).get("fetch_url") or "")
+        if mailbox is not None and email and not mailbox_settled:
+            try:
+                register_abnormal_service.add(
+                    email,
+                    fetch_url=fetch_url,
+                    reason=err,
+                    **_proxy_diag_fields(acct_proxy, identity, exit_ip),
+                )
+                mail_provider.mark_mailbox_result(mailbox, success=False, error=err)
+                mailbox_settled = True
+                log(f"{email} 注册已停止，已记入异常清单", "yellow")
+            except Exception:
+                pass
+        cost = time.time() - start
+        with stats_lock:
+            stats["done"] += 1
+            stats["fail"] += 1
+        log(f"任务{index} 注册任务已停止，跳过启动浏览器", "yellow")
+        return {"ok": False, "index": index, "error": err}
+
     verb = _mailbox_verb()
     try:
         if _remaining_task_seconds(deadline_at) <= 0:
@@ -852,11 +878,7 @@ def worker(index: int) -> dict:
             return {"ok": False, "index": index, "error": str(exc)}
 
         if is_stop_requested():
-            with stats_lock:
-                stats["done"] += 1
-                stats["fail"] += 1
-            log(f"任务{index} 注册任务已停止，跳过启动浏览器", "yellow")
-            return {"ok": False, "index": index, "error": "注册任务已停止", "stop_run": True}
+            return _abort_stopped()
 
         if _remaining_task_seconds(deadline_at) <= 0:
             return _fail_timeout()
@@ -864,11 +886,7 @@ def worker(index: int) -> dict:
         identity = build_identity(enabled_regions=config.get("regions") or ["US"])
         acct_proxy, exit_ip = _acquire_working_proxy(identity, index)
         if is_stop_requested():
-            with stats_lock:
-                stats["done"] += 1
-                stats["fail"] += 1
-            log(f"任务{index} 注册任务已停止，跳过启动浏览器", "yellow")
-            return {"ok": False, "index": index, "error": "注册任务已停止", "stop_run": True}
+            return _abort_stopped()
         _log_proxy_assignment(index, identity, acct_proxy, exit_ip)
         browser_proxy = _browser_proxy_url(acct_proxy, index)
 
@@ -887,11 +905,7 @@ def worker(index: int) -> dict:
         step(index, f"已分配邮箱：{email}")
 
         if is_stop_requested():
-            with stats_lock:
-                stats["done"] += 1
-                stats["fail"] += 1
-            log(f"任务{index} 注册任务已停止，跳过启动浏览器", "yellow")
-            return {"ok": False, "index": index, "error": "注册任务已停止", "stop_run": True}
+            return _abort_stopped()
 
         if _remaining_task_seconds(deadline_at) <= 0:
             return _fail_timeout()

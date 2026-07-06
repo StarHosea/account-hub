@@ -325,6 +325,12 @@ export type ActivationStats = {
   done: number;
   success: number;
   fail: number;
+  /** 因账号已在激活中或不满足条件而跳过的次数（不计入失败） */
+  skipped?: number;
+  /** 本轮转人工核查的账号数 */
+  review?: number;
+  /** 当前被占用、正在激活流程中的账号数（内存态） */
+  claiming?: number;
   running: number;
   started_at?: string | null;
   finished_at?: string | null;
@@ -356,6 +362,10 @@ export type ActivationConfig = {
   poll_interval: number;
   poll_timeout: number;
   max_attempts_per_type: number;
+  // 服务端 timeout：同卡重入列重试上限（不计失败次数），超限转人工核查
+  timeout_retry_max: number;
+  // 服务端 failed：同卡重试上限，用尽才换下一张卡
+  failed_retry_max: number;
   api_key: string;
   has_api_key: boolean;
   auto_activate_after_register: boolean;
@@ -907,6 +917,8 @@ export async function updateActivationConfig(updates: Partial<{
   poll_interval: number;
   poll_timeout: number;
   max_attempts_per_type: number;
+  timeout_retry_max: number;
+  failed_retry_max: number;
   auto_activate_after_register: boolean;
   target: number;
 }>) {

@@ -8,10 +8,11 @@ from __future__ import annotations
 - 手机号 reserved_at 预占残留
 
 本模块在 api/app.py 的 lifespan 里、**先于**任务续跑执行，把这些中间态复位成可重跑的干净态。
-CDK 的「进行中」占用是纯内存态（cdk_service._reserved），重启即自愈，无需对账。
+CDK 的「进行中」占用是纯内存态（cdk_service._reserved）；进程未重启时可能残留，启动时显式清空。
 """
 
 from services.account_service import account_service
+from services.cdk_service import cdk_service
 from services.mailbox_service import mailbox_service
 from services.phone_service import phone_service
 
@@ -19,7 +20,8 @@ from services.phone_service import phone_service
 def startup_recover() -> dict:
     """对账清理并返回各项计数。幂等：可安全重复调用。"""
     activations = account_service.reconcile_stuck_activations()
+    cdks = cdk_service.clear_reservations()
     mailboxes = mailbox_service.reconcile_in_use()
     phones = phone_service.reconcile_reserved()
-    print(f"[recover] activations reset={activations}, mailboxes freed={mailboxes}, phones released={phones}")
-    return {"activations": activations, "mailboxes": mailboxes, "phones": phones}
+    print(f"[recover] activations reset={activations}, cdks released={cdks}, mailboxes freed={mailboxes}, phones released={phones}")
+    return {"activations": activations, "cdks": cdks, "mailboxes": mailboxes, "phones": phones}

@@ -223,8 +223,14 @@ class ConfigStore:
             "api_key": str(os.getenv("CDK_API_KEY") or raw.get("api_key") or "").strip(),
             "concurrency": max(1, min(10, int(raw.get("concurrency") or 10))),
             "poll_interval": max(1.0, float(raw.get("poll_interval") or 5.0)),
-            "poll_timeout": max(30.0, float(raw.get("poll_timeout") or 1800.0)),
+            # 单张卡轮询查激活结果的大兜底时长：默认 1h。到点仍无终态（一直 pending）
+            # 转人工核查(review)，不判失败、不换卡。改小只会更早打断长排队的正常兑换。
+            "poll_timeout": max(30.0, float(raw.get("poll_timeout") or 3600.0)),
             "max_attempts_per_type": max(1, int(raw.get("max_attempts_per_type") or 3)),
+            # 服务端 timeout：同一张卡重入列重试上限（不计入失败次数），超限转 review。
+            "timeout_retry_max": max(0, int(raw.get("timeout_retry_max") or 5)),
+            # 服务端 failed：同一张卡重试上限，用尽才换下一张卡并计入 max_attempts_per_type。
+            "failed_retry_max": max(0, int(raw.get("failed_retry_max") or 3)),
             "auto_activate_after_register": bool(raw.get("auto_activate_after_register")),
             # 一键运行编排：目标激活数（消耗 CDK 数）、账号不足是否自动补注册
             "target": max(0, int(raw.get("target") or 0)),
@@ -234,7 +240,7 @@ class ConfigStore:
     def update_cdk_activation(self, updates: dict) -> dict:
         current = self.data.get("cdk_activation")
         current = dict(current) if isinstance(current, dict) else {}
-        for key in ("base_url", "api_key", "concurrency", "poll_interval", "poll_timeout", "max_attempts_per_type", "auto_activate_after_register", "target", "auto_replenish"):
+        for key in ("base_url", "api_key", "concurrency", "poll_interval", "poll_timeout", "max_attempts_per_type", "timeout_retry_max", "failed_retry_max", "auto_activate_after_register", "target", "auto_replenish"):
             if key in updates and updates[key] is not None:
                 current[key] = updates[key]
         self.data["cdk_activation"] = current

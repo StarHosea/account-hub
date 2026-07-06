@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 from services.account_lifecycle import PLAN_FREE, STAGE_PLUS_REVIEW, STAGE_REGISTERED, enrich_account
 from services.account_service import AccountService
+from services.activation_service import is_activation_eligible
 from services.cdk_service import STATUS_AVAILABLE, STATUS_USED
 from test.utils import InMemoryStorage
 
@@ -42,6 +43,17 @@ class RevokeActivationTest(unittest.TestCase):
         self.assertIsNone(item.get("plus_cdk"))
         self.assertIsNone(item.get("plus_last_message"))
         self.assertIsNone(item.get("last_activation_audit_id"))
+
+    def test_revoke_activation_clears_redeem_lock(self):
+        acct = self._review_account()
+        acct["plus_redeem_locked"] = True
+        self.svc._accounts["eyJreview"] = acct
+        with patch("services.activation_audit_service.activation_audit_service.delete_by_access_tokens", return_value=0):
+            result = self.svc.revoke_activation(["eyJreview"], revoke_cdk=False)
+        self.assertEqual(result["updated"], 1)
+        item = enrich_account(self.svc._accounts["eyJreview"])
+        self.assertFalse(item.get("plus_redeem_locked"))
+        self.assertTrue(is_activation_eligible(item))
 
     def test_revoke_activation_revokes_cdk(self):
         self.svc._accounts["eyJreview"] = self._review_account(cdk="CDK-ABC")
@@ -89,6 +101,26 @@ class RevokeActivationCdkIntegrationTest(unittest.TestCase):
             self.assertEqual(revoked, 1)
             self.assertEqual(svc._cdks["CDK-1"]["status"], STATUS_AVAILABLE)
             self.assertIsNone(svc._cdks["CDK-1"]["bound_token"])
+
+    def test_revoke_use_releases_stale_reservation(self):
+        from services.cdk_service import CdkService
+
+        svc = CdkService()
+        svc._cdks = {
+            "CDK-2": {
+                "cdk": "CDK-2",
+                "type": "IDEL",
+                "status": STATUS_AVAILABLE,
+                "bound_token": None,
+                "used_at": None,
+                "imported_at": "2026-01-01T00:00:00+00:00",
+                "note": "",
+            }
+        }
+        svc._reserved.add("CDK-2")
+        revoked = svc.revoke_use(["CDK-2"])
+        self.assertEqual(revoked, 1)
+        self.assertNotIn("CDK-2", svc._reserved)
 
 
 if __name__ == "__main__":

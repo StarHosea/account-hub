@@ -11,6 +11,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from services.register import mail_provider, openai_register  # noqa: E402
+from services.register_abnormal_service import register_abnormal_service  # noqa: E402
 from services.register_service import RegisterService  # noqa: E402
 
 
@@ -22,13 +23,17 @@ class RegisterMailboxStopTest(unittest.TestCase):
     def test_worker_skips_browser_when_stop_requested(self):
         mailbox = {"provider": mail_provider.API_MAILBOX_TYPE, "address": "a@b.com", "fetch_url": "http://x"}
         with mock.patch.object(mail_provider, "create_mailbox", return_value=mailbox):
-            with mock.patch.object(openai_register, "_acquire_working_proxy", return_value=("", "")):
-                with mock.patch.object(openai_register, "_run_browser_job") as browser_job:
-                    openai_register.request_stop()
-                    result = openai_register.worker(1)
+            with mock.patch.object(mail_provider, "mark_mailbox_result") as mark_result:
+                with mock.patch.object(register_abnormal_service, "add") as add_abnormal:
+                    with mock.patch.object(openai_register, "_acquire_working_proxy", return_value=("", "")):
+                        with mock.patch.object(openai_register, "_run_browser_job") as browser_job:
+                            openai_register.request_stop()
+                            result = openai_register.worker(1)
         browser_job.assert_not_called()
         self.assertFalse(result.get("ok"))
-        self.assertTrue(result.get("stop_run"))
+        self.assertNotIn("stop_run", result)
+        add_abnormal.assert_called_once()
+        mark_result.assert_called_once()
 
     def test_mailbox_shortage_does_not_kill_in_flight_browsers(self):
         with tempfile.TemporaryDirectory() as tmp:

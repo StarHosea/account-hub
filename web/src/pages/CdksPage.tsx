@@ -44,8 +44,8 @@ const { Text } = Typography;
 const PAGE_SIZE = 10;
 
 const STATUS_TAG: Record<CdkStatus, { text: string; color: string }> = {
-  available: { text: "激活中", color: "blue" },
-  used: { text: "已激活", color: "green" },
+  available: { text: "可用", color: "green" },
+  used: { text: "已激活", color: "blue" },
   invalid: { text: "无效", color: "red" },
 };
 
@@ -271,7 +271,7 @@ export default function CdksPage() {
         style={{ width: isMobile ? "100%" : 130 }}
         optionList={[
           { label: "全部状态", value: "" },
-          { label: "激活中", value: "available" },
+          { label: "可用", value: "available" },
           { label: "已激活", value: "used" },
           { label: "无效", value: "invalid" },
         ]}
@@ -317,7 +317,7 @@ export default function CdksPage() {
               </Popconfirm>
               <Popconfirm
                 title={`⚠️ 撤销选中的 ${selected.length} 个 CDK 的使用状态？`}
-                content="危险操作：把 CDK 从「已用/无效」复位为「可用」并清除账号绑定，之后可被重新领用。仅在程序异常错误标记了使用状态时使用，请确认后再操作。"
+                content="危险操作：把 CDK 从「已用/无效」复位为「可用」并清除账号绑定；若 CDK 显示可用但仍被激活线程遗留占用，也会一并释放。仅在程序异常错误标记了使用状态时使用，请确认后再操作。"
                 okType="danger"
                 okText="确认撤销"
                 onConfirm={() => void handleRevokeUse(selected)}

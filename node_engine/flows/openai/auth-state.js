@@ -134,7 +134,7 @@ export async function collectSignals(page) {
           if (codeInput?.getAttribute('aria-invalid') === 'true') return true;
           return false;
         })(),
-        forgotOrWelcomeBack: /忘记了密码|忘记密码|forgot password|欢迎回来|welcome back/i.test(text),
+        forgotOrWelcomeBack: /忘记了密码|忘记密码|forgot password|お忘れ|パスワードをお忘れ|欢迎回来|welcome back/i.test(text),
         checkInbox: /检查你的收件箱|输入.*验证码|check your inbox|enter the code|verification code/i.test(text),
         mfaAuthenticator: /验证器应用|输入验证器|authenticator|two-factor|双重验证|验证你的身份|一次性验证码|一次性密码/i.test(text),
         mfaEmailHint: /检查你的收件箱|查看你的邮箱|邮件已发送|邮箱验证码|电子邮件.*验证码|check your inbox|sent.*email|email.*code|verification code/i.test(text),

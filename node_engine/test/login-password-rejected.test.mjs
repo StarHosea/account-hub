@@ -11,6 +11,13 @@ test('WRONG_LOGIN_PASSWORD_PATTERN matches OpenAI login error copy', () => {
   assert.doesNotMatch('How can I help you today', S.WRONG_LOGIN_PASSWORD_PATTERN);
 });
 
+test('FORGOT_PASSWORD_PATTERN matches ja/zh/en forgot-password links', () => {
+  assert.match('Forgot password?', S.FORGOT_PASSWORD_PATTERN);
+  assert.match('忘记了密码？', S.FORGOT_PASSWORD_PATTERN);
+  assert.match('パスワードをお忘れですか？', S.FORGOT_PASSWORD_PATTERN);
+  assert.doesNotMatch('パスワードを表示します', S.FORGOT_PASSWORD_PATTERN);
+});
+
 test('waitForLoginPasswordOutcome returns rejected when error appears quickly', async () => {
   const beforeUrl = 'https://auth.openai.com/log-in/password';
   let polls = 0;

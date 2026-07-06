@@ -278,31 +278,16 @@ def _extract_visible_ui(html: str) -> dict:
     }
 
 
-def _extract_manifest_code_capture(manifest: list[dict]) -> dict:
-    """从 manifest 提取验证码填码审计（register-04*）。"""
-    row = None
-    for step_pref in ("register-04-code-invalid", "register-04-code-filled"):
-        for candidate in reversed(manifest):
-            if str(candidate.get("stepId") or "") == step_pref:
-                row = candidate
-                break
-        if row:
-            break
-    if not row:
-        for candidate in reversed(manifest):
-            step_id = str(candidate.get("stepId") or "")
-            if step_id.startswith("register-04"):
-                row = candidate
-                break
-    if not row:
-        return {}
+def _row_to_code_capture(row: dict) -> dict:
     capture = {
         "stepId": str(row.get("stepId") or ""),
         "note": str(row.get("note") or ""),
         "codePurpose": row.get("codePurpose"),
         "code": row.get("code"),
+        "codeNeedAt": row.get("codeNeedAt"),
         "codeReceivedAt": row.get("codeReceivedAt"),
         "resendRounds": row.get("resendRounds"),
+        "round": row.get("round"),
         "codeInputMode": row.get("codeInputMode"),
         "codeInputCount": row.get("codeInputCount"),
         "codeReadback": row.get("codeReadback"),
@@ -312,6 +297,92 @@ def _extract_manifest_code_capture(manifest: list[dict]) -> dict:
         "invalidHintText": row.get("invalidHintText"),
     }
     return {k: v for k, v in capture.items() if v not in (None, "")}
+
+
+def _extract_code_capture_from_manifest(
+    manifest: list[dict],
+    *,
+    prefer_ids: tuple[str, ...] = (),
+    step_prefix: str = "",
+    invalid_prefix: str = "",
+) -> dict:
+    row = None
+    for step_pref in prefer_ids:
+        for candidate in reversed(manifest):
+            if str(candidate.get("stepId") or "") == step_pref:
+                row = candidate
+                break
+        if row:
+            break
+    if not row and invalid_prefix:
+        for candidate in reversed(manifest):
+            step_id = str(candidate.get("stepId") or "")
+            if step_id.startswith(invalid_prefix):
+                row = candidate
+                break
+    if not row and step_prefix:
+        for candidate in reversed(manifest):
+            step_id = str(candidate.get("stepId") or "")
+            if step_id.startswith(step_prefix):
+                row = candidate
+                break
+    if not row:
+        return {}
+    return _row_to_code_capture(row)
+
+
+def _extract_manifest_code_capture(manifest: list[dict]) -> dict:
+    """从 manifest 提取验证码填码审计（register-04*）。"""
+    return _extract_code_capture_from_manifest(
+        manifest,
+        prefer_ids=("register-04-code-invalid", "register-04-code-filled"),
+        step_prefix="register-04",
+    )
+
+
+def _extract_manifest_second_code_capture(manifest: list[dict]) -> dict:
+    """从 manifest 提取二次邮箱验证码审计（register-05b*）。"""
+    return _extract_code_capture_from_manifest(
+        manifest,
+        invalid_prefix="register-05b-second-code-invalid-",
+        step_prefix="register-05b-second-code-",
+    )
+
+
+def _append_code_capture_lines(lines: list[str], code_capture: dict, *, heading: str) -> None:
+    if not code_capture:
+        return
+    lines.extend(["", heading, ""])
+    if code_capture.get("round") is not None:
+        lines.append(f"- 轮次: `{code_capture.get('round')}`")
+    if code_capture.get("code"):
+        lines.append(f"- 验证码: `{code_capture.get('code')}`")
+    if code_capture.get("codeNeedAt"):
+        lines.append(f"- 请求取码时刻: `{code_capture.get('codeNeedAt')}`")
+    if code_capture.get("codeReceivedAt"):
+        lines.append(f"- 收件时间: `{code_capture.get('codeReceivedAt')}`")
+    if code_capture.get("codePurpose"):
+        lines.append(f"- 用途: `{code_capture.get('codePurpose')}`")
+    if code_capture.get("resendRounds") is not None:
+        lines.append(f"- 重发轮次: `{code_capture.get('resendRounds')}`")
+    if code_capture.get("codeInputMode"):
+        lines.append(
+            f"- 输入结构: `{code_capture.get('codeInputMode')}`"
+            f"（{code_capture.get('codeInputCount') or '—'} 格）"
+        )
+    if code_capture.get("codeReadback") is not None:
+        lines.append(
+            f"- 填回值: `{code_capture.get('codeReadback')}`"
+            f"（匹配: `{code_capture.get('codeReadbackMatches')}`）"
+        )
+    if code_capture.get("submitMethod"):
+        lines.append(f"- 提交方式: `{code_capture.get('submitMethod')}`")
+    if code_capture.get("chromeErrorRecovered") is not None:
+        lines.append(f"- chrome-error 恢复: `{code_capture.get('chromeErrorRecovered')}`")
+    if code_capture.get("invalidHintText"):
+        lines.append(f"- 页面错误提示: `{code_capture.get('invalidHintText')}`")
+    if code_capture.get("note"):
+        lines.append(f"- note: {code_capture.get('note')}")
 
 
 def _extract_manifest_capture(manifest: list[dict]) -> dict:
@@ -429,6 +500,7 @@ def build_brief(email: str, request: Request | None = None) -> dict:
     visible_ui = _extract_visible_ui(last_html)
     manifest_capture = _extract_manifest_capture(manifest)
     code_capture = _extract_manifest_code_capture(manifest)
+    second_code_capture = _extract_manifest_second_code_capture(manifest)
     goto_retries = _extract_goto_retries(manifest)
     proxy = _proxy_from_abnormal(abnormal)
     if isinstance(manifest_capture.get("auth_ui"), dict):
@@ -492,6 +564,7 @@ def build_brief(email: str, request: Request | None = None) -> dict:
         "manifest_tail": tail,
         "manifest_capture": manifest_capture,
         "code_capture": code_capture,
+        "second_code_capture": second_code_capture,
         "goto_retries": goto_retries,
         "proxy": proxy,
         "visible_ui": visible_ui,
@@ -541,6 +614,7 @@ def build_brief_markdown(email: str = "", request: Request | None = None) -> str
     ui = brief.get("visible_ui") if isinstance(brief.get("visible_ui"), dict) else {}
     capture = brief.get("manifest_capture") if isinstance(brief.get("manifest_capture"), dict) else {}
     code_capture = brief.get("code_capture") if isinstance(brief.get("code_capture"), dict) else {}
+    second_code_capture = brief.get("second_code_capture") if isinstance(brief.get("second_code_capture"), dict) else {}
     goto_retries = brief.get("goto_retries") if isinstance(brief.get("goto_retries"), list) else []
     proxy = brief.get("proxy") if isinstance(brief.get("proxy"), dict) else {}
     logs = brief.get("logs_tail") if isinstance(brief.get("logs_tail"), list) else []
@@ -610,34 +684,8 @@ def build_brief_markdown(email: str = "", request: Request | None = None) -> str
         if post_btns:
             lines.append(f"- 等待后按钮: {', '.join(f'`{b}`' for b in post_btns[:12])}")
 
-    if code_capture:
-        lines.extend(["", "## 邮箱验证码采集（manifest）", ""])
-        if code_capture.get("code"):
-            lines.append(f"- 验证码: `{code_capture.get('code')}`")
-        if code_capture.get("codeReceivedAt"):
-            lines.append(f"- 收件时间: `{code_capture.get('codeReceivedAt')}`")
-        if code_capture.get("codePurpose"):
-            lines.append(f"- 用途: `{code_capture.get('codePurpose')}`")
-        if code_capture.get("resendRounds") is not None:
-            lines.append(f"- 重发轮次: `{code_capture.get('resendRounds')}`")
-        if code_capture.get("codeInputMode"):
-            lines.append(
-                f"- 输入结构: `{code_capture.get('codeInputMode')}`"
-                f"（{code_capture.get('codeInputCount') or '—'} 格）"
-            )
-        if code_capture.get("codeReadback") is not None:
-            lines.append(
-                f"- 填回值: `{code_capture.get('codeReadback')}`"
-                f"（匹配: `{code_capture.get('codeReadbackMatches')}`）"
-            )
-        if code_capture.get("submitMethod"):
-            lines.append(f"- 提交方式: `{code_capture.get('submitMethod')}`")
-        if code_capture.get("chromeErrorRecovered") is not None:
-            lines.append(f"- chrome-error 恢复: `{code_capture.get('chromeErrorRecovered')}`")
-        if code_capture.get("invalidHintText"):
-            lines.append(f"- 页面错误提示: `{code_capture.get('invalidHintText')}`")
-        if code_capture.get("note"):
-            lines.append(f"- note: {code_capture.get('note')}")
+    _append_code_capture_lines(lines, code_capture, heading="## 邮箱验证码采集（manifest）")
+    _append_code_capture_lines(lines, second_code_capture, heading="## 二次邮箱验证码采集（manifest）")
 
     if goto_retries:
         lines.extend(["", "## 打开页面重试（manifest）", ""])
@@ -756,13 +804,76 @@ def diag_meta(request: Request | None = None) -> dict:
     }
 
 
-def recording_html_path(email: str) -> Path | None:
+def _safe_recording_filename(name: str) -> str | None:
+    """仅允许存证目录内的单文件名（防路径穿越）。"""
+    base = Path(str(name or "").strip()).name
+    if not base or base in {".", ".."}:
+        return None
+    if base != str(name or "").strip():
+        return None
+    if "/" in base or "\\" in base or ".." in base:
+        return None
+    if not re.fullmatch(r"[0-9]{3}-[a-zA-Z0-9._-]+\.(html|png)", base):
+        return None
+    return base
+
+
+def _recording_dir_for_email(email: str) -> Path | None:
     abnormal = _abnormal_item(email)
-    record_dir = find_recording_dir(email, str((abnormal or {}).get("recording_path") or ""))
+    return find_recording_dir(email, str((abnormal or {}).get("recording_path") or ""))
+
+
+def recording_asset_url(email: str, filename: str, request: Request | None = None) -> str:
+    safe = _safe_recording_filename(filename)
+    if not safe:
+        return ""
+    q_email = quote(str(email or "").strip(), safe="")
+    q_file = quote(safe, safe="")
+    return _abs_url(f"/api/register/diag/asset?email={q_email}&file={q_file}", request)
+
+
+def rewrite_recording_html(body: str, email: str, request: Request | None = None) -> str:
+    """将 recording.html 内 manifest 的相对 html/png 路径改为可访问的 asset URL。"""
+    if not body:
+        return body
+
+    def _replacer(match: re.Match[str]) -> str:
+        key, filename = match.group(1), match.group(2)
+        url = recording_asset_url(email, filename, request)
+        if not url:
+            return match.group(0)
+        return f'"{key}":"{url}"'
+
+    return re.sub(r'"(html|png)":"([^"]+)"', _replacer, body)
+
+
+def recording_html_path(email: str) -> Path | None:
+    record_dir = _recording_dir_for_email(email)
     if not record_dir:
         return None
     path = record_dir / "recording.html"
     return path if path.is_file() else None
+
+
+def read_recording_html(email: str, request: Request | None = None) -> str | None:
+    path = recording_html_path(email)
+    if not path:
+        return None
+    body = path.read_text(encoding="utf-8")
+    return rewrite_recording_html(body, email, request)
+
+
+def recording_asset_path(email: str, filename: str) -> Path | None:
+    safe = _safe_recording_filename(filename)
+    if not safe:
+        return None
+    record_dir = _recording_dir_for_email(email)
+    if not record_dir:
+        return None
+    path = record_dir / safe
+    if not path.is_file() or not _is_under_record_root(path):
+        return None
+    return path
 
 
 def screenshot_path(email: str) -> Path | None:

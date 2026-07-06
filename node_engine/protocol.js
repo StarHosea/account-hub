@@ -36,11 +36,13 @@ export function log(message, level = 'info') {
 
 // 请求一个验证码：发 need_code 并阻塞，直到 Python 回一条 code。
 // code 为 null 时抛错（取码超时），由上层流程决定失败。
-export function requestCode(purpose = 'register') {
+export function requestCode(purpose = 'register', options = {}) {
   if (_stopped) return Promise.reject(new Error('已收到停止指令'));
-  emit({ type: 'need_code', purpose, ts: new Date().toISOString() });
+  const needCodeAt = new Date().toISOString();
+  const extra = options && typeof options === 'object' ? options : {};
+  emit({ type: 'need_code', purpose, ts: needCodeAt, ...extra });
   return new Promise((resolve, reject) => {
-    _pendingCode = { resolve, reject };
+    _pendingCode = { resolve, reject, needCodeAt };
   });
 }
 
@@ -71,6 +73,7 @@ function handleCommand(cmd) {
         p.resolve({
           code,
           receivedAt: cmd.received_at == null ? null : String(cmd.received_at),
+          needCodeAt: p.needCodeAt || null,
         });
       } else {
         p.reject(new Error('取码超时（Python 侧未拿到验证码）'));

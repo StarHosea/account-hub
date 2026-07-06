@@ -72,6 +72,25 @@ def _serialize_received_at(value: Any) -> str | None:
     return text or None
 
 
+def _merge_after_received_at(
+    request_cutoff: datetime | None,
+    *,
+    use_mailbox_baseline: bool,
+    mail_config: dict,
+    mailbox: dict,
+) -> datetime | None:
+    """合并 need_code 时刻截止线与信箱当前最新邮件时间（取更晚者）。"""
+    after = request_cutoff
+    if not use_mailbox_baseline:
+        return after
+    baseline = mail_provider.peek_received_at(mail_config, mailbox)
+    if not isinstance(baseline, datetime):
+        return after
+    if after is None:
+        return baseline
+    return max(after, baseline)
+
+
 def fulfill_need_code(
     mail_config: dict | None,
     mailbox: dict | None,
@@ -79,6 +98,7 @@ def fulfill_need_code(
     ts: str | None = None,
     purpose: str = "register",
     round_timeout: float | None = None,
+    use_mailbox_baseline: bool = False,
 ) -> dict[str, str] | None:
     """响应一次 need_code：按请求时间过滤旧码并轮询取新验证码。
 
@@ -92,7 +112,12 @@ def fulfill_need_code(
         return None
     conf = mail_config_with_defaults(mail_config)
     conf["wait_timeout"] = float(round_timeout if round_timeout is not None else ROUND_WAIT_TIMEOUT)
-    after = cutoff_from_request(ts)
+    after = _merge_after_received_at(
+        cutoff_from_request(ts),
+        use_mailbox_baseline=use_mailbox_baseline,
+        mail_config=conf,
+        mailbox=mailbox,
+    )
     detail = mail_provider.wait_for_code_detail(conf, mailbox, after_received_at=after)
     if not detail:
         return None

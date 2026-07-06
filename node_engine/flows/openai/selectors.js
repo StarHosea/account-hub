@@ -37,7 +37,7 @@ export const CODE_INPUT = [
   'input[placeholder*="验证码"]',
   'input[placeholder*="コード"]',
   'input[aria-label*="验证码"]',
-  'input[inputmode="numeric"]',
+  'input[aria-label*="コード"]',
 ].join(', ');
 
 // 分格验证码输入（每格 maxlength=1）
@@ -48,7 +48,9 @@ export const NAME_INPUT = [
   'input[autocomplete="name"]',
   'input[placeholder*="name" i]',
   'input[placeholder*="姓名"]',
+  'input[placeholder*="氏名"]',
   'input[aria-label*="name" i]',
+  'input[aria-label*="氏名"]',
 ].join(', ');
 
 export const FIRST_NAME_INPUT = [
@@ -79,6 +81,13 @@ export const CONTINUE_TEXTS = [
   'continue', 'next', 'sign up', 'create account', 'agree', 'submit',
   '继续', '下一步', '注册', '创建账号', '同意', '提交',
   '続ける', '続行', '次へ', '登録', '同意', 'サインアップ',
+];
+
+// 资料页「完成账户创建」主按钮（en/zh/ja；与 CONTINUE_TEXTS 分离避免误点中间态「继续」）
+export const PROFILE_SUBMIT_TEXTS = [
+  '完成账户创建', '完成帐户创建', '创建账号', '创建帐户', '创建账户',
+  'create account', 'finish', 'done', "i'm 18",
+  'アカウントの作成を完了する', 'アカウント', '作成を完了', '登録を完了',
 ];
 
 // 出现这些文案代表注册基本成功（进入 chatgpt 主界面）

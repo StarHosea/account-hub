@@ -423,20 +423,21 @@ async function waitForCodePage(page, log, { timeoutMs = 120000 } = {}) {
   return Boolean(loc);
 }
 
-// 判断当前是否停在"验证码输入页"（含 auth.openai.com 裸 CSS 的 email-verification）。
+// 判断当前是否停在"验证码输入页"（auth.openai.com/email-verification）。
 async function isOnCodePage(page) {
   try {
     const url = page.url();
-    const urlHit = /\/email-verification(?:[/?#]|$)|auth\.openai\.com/i.test(url);
-    if (!urlHit) return false;
+    if (!/\/email-verification(?:[/?#]|$)/i.test(url)) return false;
     const dom = await page.evaluate((sel) => {
       const visible = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
+      const isProfileAge = (el) => el?.getAttribute('name') === 'age' || el?.getAttribute('name') === 'name';
       const one = document.querySelector(sel.code);
+      const hasCodeInput = visible(one) && !isProfileAge(one);
       const seg = document.querySelectorAll(sel.seg);
-      const hasInput = visible(one) || (seg.length >= 4 && visible(seg[0]));
+      const hasSeg = seg.length >= 4 && visible(seg[0]);
       const txt = document.body?.innerText || '';
-      const hasHint = /检查你的收件箱|输入.*验证码|check your inbox|enter the code|verification code/i.test(txt);
-      return hasInput || hasHint;
+      const hasHint = /检查你的收件箱|输入.*验证码|check your inbox|enter the code|verification code|コードを入力|受信トレイ/i.test(txt);
+      return hasCodeInput || hasSeg || hasHint;
     }, { code: S.CODE_INPUT, seg: S.CODE_INPUT_SEGMENTED });
     return dom;
   } catch {
@@ -677,8 +678,34 @@ async function fillBirthday(page, { year, month, day }, log) {
     const nowYear = new Date().getFullYear();
     const age = Math.max(18, nowYear - Number(year));
     const loc = page.locator('input[name="age"]').first();
-    await loc.click({ delay: 40 }).catch(() => {});
-    await loc.pressSequentially(String(age), { delay: 80 }).catch(() => {});
+    const want = String(age);
+    const readAge = async () => String((await loc.inputValue().catch(() => '')) || '').trim();
+    const setAgeNative = async () => page.evaluate(({ a }) => {
+      const el = document.querySelector('input[name="age"]');
+      if (!el) return false;
+      el.focus();
+      el.value = String(a);
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return String(el.value || '').trim() === String(a);
+    }, { a: age }).catch(() => false);
+
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      await loc.click({ delay: 40 }).catch(() => {});
+      await loc.fill('').catch(() => {});
+      await loc.fill(want).catch(() => {});
+      if ((await readAge()) === want) break;
+      await loc.fill('').catch(() => {});
+      await loc.pressSequentially(want, { delay: 80 }).catch(() => {});
+      if ((await readAge()) === want) break;
+      if (await setAgeNative() && (await readAge()) === want) break;
+      if (attempt < 3) await sleep(300);
+    }
+    const got = await readAge();
+    if (got !== want) {
+      log(`年龄填写失败，期望 ${want} 实际 ${got || '(空)'}`, 'warn');
+      return false;
+    }
     log(`已填写年龄 ${age}`);
     return true;
   }
@@ -1496,15 +1523,24 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
   log('注册 · 填写姓名和生日');
   await fillProfile(page, { firstName, lastName, birthday }, log);
   await checkConsentIfAny(page, log);
+  const profileFields = await assertProfileReady(page, log);
+  await mark('register-05-profile-filled', `age=${profileFields.age || '-'} birthday=${profileFields.birthday || '-'}`);
 
-  const submitTexts = [
-    '完成账户创建', '完成帐户创建', '完成', '创建账号', '创建帐户', '创建账户',
-    'create account', 'finish', 'done', 'agree', "i'm 18", '同意', '继续', 'continue', 'next', '下一步',
-  ];
-  const submitted = await humanClickByText(page, submitTexts, { timeout: 12000, exclude: OAUTH_EXCLUDE, awaitPageLoad: true, log });
-  log('注册 · 已提交个人资料');
+  const urlBeforeProfile = page.url();
+  const submitted = await humanClickByText(page, S.PROFILE_SUBMIT_TEXTS, { timeout: 12000, exclude: OAUTH_EXCLUDE, awaitPageLoad: true, log });
+  if (!submitted) {
+    await snapshot(page, 'profile-submit-miss', log);
+    throw new Error('资料页未找到提交按钮');
+  }
+  log(`注册 · 已提交个人资料（${submitted}）`);
   await sleep(3000);
-  await mark('register-05-profile-submitted', '资料已提交');
+  const urlAfterProfile = page.url();
+  if (/\/about-you(?:[/?#]|$)/i.test(urlAfterProfile)) {
+    await assertProfileReady(page, log).catch((e) => {
+      throw new Error(`资料提交后仍停在资料页：${e.message}`);
+    });
+  }
+  await mark('register-05-profile-submitted', `submit=${submitted} urlBefore=${urlBeforeProfile} urlAfter=${urlAfterProfile}`);
 
   await humanClickByText(page, ['agree', 'continue', '同意', '继续', 'okay', 'ok', 'got it', 'stay logged out'], { timeout: 6000, exclude: OAUTH_EXCLUDE, awaitPageLoad: true, log }).catch(() => {});
 
@@ -1513,12 +1549,15 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
     const onCodePage = await isOnCodePage(page);
     if (!onCodePage) break;
     log(`注册 · 需要再次验证邮箱，第 ${round} 次`);
-    await humanClickByText(page, ['重新发送电子邮件', '重新发送', 'resend email', 'resend', '重新发送邮件'], { timeout: 6000, exclude: OAUTH_EXCLUDE }).catch(() => {});
+    await mark(`register-05b-second-code-${round}`, `round=${round} url=${page.url()}`);
+    await humanClickByText(page, RESEND_CODE_TEXTS, { timeout: 6000, exclude: OAUTH_EXCLUDE }).catch(() => {});
     const code2 = await requestCodeWithResend(page, requestCode, log, { purpose: 'register' });
     await fillCode(page, code2, log);
     await submitCodeForm(page, log, { code: code2 });
     await sleep(4000);
-    if (!isChromeErrorUrl(page.url()) && await detectInvalidCode(page)) throw new Error('二次验证码无效');
+    if (!isChromeErrorUrl(page.url()) && await isOnCodePage(page) && await detectInvalidCode(page)) {
+      throw new Error('二次验证码无效');
+    }
   }
 
   // 步骤6：等待注册成功
@@ -1797,6 +1836,54 @@ async function detectPostCodeBranch(page, log, { timeoutMs = 20000 } = {}) {
   return 'register'; // 超时保守回退，避免误伤真新号
 }
 
+async function readProfileFields(page) {
+  return page.evaluate((nameSel) => {
+    const vis = (el) => {
+      if (!el) return false;
+      const r = el.getBoundingClientRect();
+      const s = getComputedStyle(el);
+      return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+    };
+    const val = (sel) => {
+      const el = document.querySelector(sel);
+      return el && vis(el) ? String(el.value || '').trim() : '';
+    };
+    let name = '';
+    for (const sel of nameSel.split(',').map((s) => s.trim()).filter(Boolean)) {
+      const el = document.querySelector(sel);
+      if (el && vis(el) && String(el.value || '').trim()) {
+        name = String(el.value || '').trim();
+        break;
+      }
+    }
+    if (!name) {
+      name = [val('input[name="firstName"]'), val('input[name="lastName"]')].filter(Boolean).join(' ');
+    }
+    const hidden = (sel) => String(document.querySelector(sel)?.value || '').trim();
+    const age = val('input[name="age"]');
+    const birthday = hidden('input[name="birthday"]');
+    const ageInvalid = document.querySelector('input[name="age"]')?.getAttribute('aria-invalid') === 'true';
+    const birthdayInvalid = document.querySelector('input[name="birthday"]')?.getAttribute('aria-invalid') === 'true';
+    const body = document.body?.innerText || '';
+    const ageHint = /valid age|有效.*年龄|有効な年齢|enter a valid age/i.test(body);
+    return { name, age, birthday, ageInvalid, birthdayInvalid, ageHint };
+  }, S.NAME_INPUT).catch(() => ({ name: '', age: '', birthday: '', ageInvalid: false, birthdayInvalid: false, ageHint: false }));
+}
+
+async function assertProfileReady(page, log) {
+  const f = await readProfileFields(page);
+  const hasName = Boolean(f.name);
+  const hasAge = Boolean(f.age);
+  const hasBirthday = Boolean(f.birthday);
+  if (!hasName) throw new Error('资料页姓名未填写');
+  if (!hasAge && !hasBirthday) throw new Error('资料页生日/年龄未填写');
+  if (f.ageInvalid || f.birthdayInvalid || f.ageHint) {
+    throw new Error(`资料页校验未通过：age=${f.age || '(空)'} birthday=${f.birthday || '(空)'}`);
+  }
+  if (log) log(`资料页就绪：name=${f.name} age=${f.age || '-'} birthday=${f.birthday || '-'}`);
+  return f;
+}
+
 async function fillProfile(page, { firstName, lastName, birthday }, log) {
   const full = await firstVisible(page, S.NAME_INPUT, { timeout: 8000 });
   if (full) {
@@ -1826,6 +1913,10 @@ export const __test = {
   waitForPageFullyLoaded,
   isLoginPasswordRejected,
   waitForLoginPasswordOutcome,
+  isOnCodePage,
+  readProfileFields,
+  assertProfileReady,
+  fillBirthday,
 };
 
 async function checkConsentIfAny(page, log) {

@@ -88,3 +88,27 @@ test('detectInvalidCode：正常收码页不误判', async () => {
   const page = mockPage({ body: '检查你的收件箱\n输入验证码' });
   assert.equal(await detectInvalidCode(page), false);
 });
+
+test('detectInvalidCode：资料页 age 的 aria-invalid 不误判', async () => {
+  const page = {
+    async evaluate(fn, args) {
+      const ageInput = {
+        getAttribute: (n) => (n === 'aria-invalid' ? 'true' : n === 'name' ? 'age' : null),
+        getBoundingClientRect: () => ({ width: 100, height: 40 }),
+      };
+      const doc = {
+        body: { innerText: '続けるには有効な年齢を入力してください' },
+        querySelectorAll(sel) {
+          if (sel.includes('name="code"') || sel.includes('one-time-code')) return [];
+          if (sel.includes('input') || sel.includes('totp')) return [ageInput];
+          return [];
+        },
+        querySelector: () => null,
+      };
+      globalThis.document = doc;
+      globalThis.getComputedStyle = () => ({ visibility: 'visible', display: 'block' });
+      return fn(args);
+    },
+  };
+  assert.equal(await detectInvalidCode(page), false);
+});

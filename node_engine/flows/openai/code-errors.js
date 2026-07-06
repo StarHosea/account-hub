@@ -22,7 +22,6 @@ const CODE_FIELD_SELECTOR = [
   'input[placeholder*="验证码"]',
   'input[placeholder*="コード"]',
   'input[aria-label*="验证码"]',
-  'input[inputmode="numeric"]',
   '#totp_otp',
   'input[name="totp_otp"]',
 ].join(', ');

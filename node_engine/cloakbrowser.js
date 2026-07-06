@@ -75,6 +75,21 @@ function resolveTimezone(timezone, locale) {
   return LOCALE_IANA_TZ[loc] || null;
 }
 
+/** 显式 locale 时同步 navigator.language，避免本机 zh-CN 泄漏到 auth 页。 */
+async function applyNavigatorLocale(context, locale) {
+  const loc = String(locale || '').trim();
+  if (!loc) return;
+  await context.addInitScript((l) => {
+    try {
+      Object.defineProperty(navigator, 'language', { get: () => l, configurable: true });
+      Object.defineProperty(navigator, 'languages', {
+        get: () => [l, l.split('-')[0], 'en-US', 'en'],
+        configurable: true,
+      });
+    } catch { /* ignore */ }
+  }, loc);
+}
+
 // 返回统一句柄 { mode, seed, browser, context, close() }。
 // fingerprintSeed：固定指纹种子（10000-99999）。同一 seed = 同一指纹，跨会话可复现；
 // 不传则生成一个，并在返回值里带出实际 seed 供存储与后续复用。
@@ -109,6 +124,7 @@ export async function launchSession(proxyUrl, { headless = false, fingerprintSee
       }
       if (proxyUrl) opts.proxy = proxyUrl;
       const context = await launchContext(opts);
+      if (resolvedLocale) await applyNavigatorLocale(context, resolvedLocale);
       const browser = context.browser();
       const localeNote = resolvedLocale || (proxyUrl ? 'geoip 自动' : 'en-US');
       const tzNote = resolvedTimezone ? `，tz=${resolvedTimezone}` : '';
@@ -176,6 +192,7 @@ async function launchFallbackChromium(proxyUrl, headless, locale, timezone, acce
   await context.addInitScript(() => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
   });
+  if (locale) await applyNavigatorLocale(context, locale);
   log('浏览器已启动（备用模式）');
   return {
     mode: 'chromium-fallback',

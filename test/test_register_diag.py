@@ -181,6 +181,70 @@ class RegisterDiagServiceTest(unittest.TestCase):
             self.assertIn("继续", brief["visible_ui"]["buttons"])
             self.assertIn("brief", brief["urls"])
 
+    def test_build_brief_prefers_engine_error_over_generic_abnormal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            record_dir = Path(tmp)
+            manifest = [
+                {
+                    "seq": 7,
+                    "stepId": "register-05-profile-submitted",
+                    "ts": 7,
+                    "note": "资料已提交",
+                    "url": "https://auth.openai.com/about-you",
+                    "pageState": "new_needs_profile",
+                    "confidence": "high",
+                    "html": "007-register-05-profile-submitted.html",
+                    "png": "007-register-05-profile-submitted.png",
+                },
+                {
+                    "seq": 8,
+                    "stepId": "final-error-scene",
+                    "ts": 8,
+                    "note": "二次验证码无效",
+                    "url": "https://auth.openai.com/about-you",
+                    "pageState": "new_needs_profile",
+                    "confidence": "high",
+                    "html": "008-final-error-scene.html",
+                    "png": "008-final-error-scene.png",
+                },
+            ]
+            (record_dir / "manifest.jsonl").write_text(
+                "\n".join(json.dumps(row, ensure_ascii=False) for row in manifest),
+                encoding="utf-8",
+            )
+            (record_dir / "008-final-error-scene.html").write_text(
+                "<html><body><p>続けるには有効な年齢を入力してください</p></body></html>",
+                encoding="utf-8",
+            )
+            (record_dir / "008-final-error-scene.png").write_bytes(b"png")
+
+            abnormal = mock.Mock()
+            abnormal.list_items.return_value = [{
+                "email": "b@b.com",
+                "reason": "浏览器引擎未返回结果（进程可能被终止或超时）",
+                "fetch_url": "http://mail",
+                "recording_path": str(record_dir),
+                "created_at": "2026-01-01T00:00:00+00:00",
+            }]
+            with mock.patch("services.register_diag_service.register_abnormal_service", abnormal):
+                brief = build_brief("b@b.com")
+
+            self.assertEqual(brief["reason"], "二次验证码无效")
+            self.assertEqual(brief["engine_error"], "二次验证码无效")
+            self.assertIn("浏览器引擎未返回结果", brief["abnormal_reason"])
+            self.assertEqual(brief["failed_step"], "register-05-profile-submitted")
+
+    def test_extract_visible_ui_japanese_age_hint(self):
+        html = """
+        <html><body>
+        <p>続けるには有効な年齢を入力してください</p>
+        <button>アカウントの作成を完了する</button>
+        </body></html>
+        """
+        ui = _extract_visible_ui(html)
+        self.assertTrue(any("有効な年齢" in hint for hint in ui["hints"]))
+        self.assertIn("アカウントの作成を完了する", ui["buttons"])
+
     def test_find_recording_dir_by_email_prefix(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

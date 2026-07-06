@@ -30,6 +30,8 @@ const url = args.url || 'https://chatgpt.com/';
 await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 90000 }).catch((e) => log(`打开 ${url} 异常：${e?.message || e}`, 'warn'));
 
 log(`✅ 浏览器就绪（${session.mode}，seed=${session.seed}）`);
+const resolvedLocale = args.locale || process.env.CLOAK_LOCALE || '';
+if (resolvedLocale) log(`   locale=${resolvedLocale}（Accept-Language + navigator.language）`);
 log(`   CDP endpoint: http://127.0.0.1:${port}`);
 log(`   驱动示例：CLOAK_CDP_PORT=${port} node scripts/cdp-drive.mjs snapshot`);
 log('   保持存活中，Ctrl-C 退出并关闭浏览器…');

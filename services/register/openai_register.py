@@ -654,6 +654,26 @@ def _next_worker_line(proc: subprocess.Popen, out_q: queue.Queue, deadline_at: f
         return item
 
 
+def _drain_worker_events(out_q: queue.Queue) -> list[dict]:
+    """进程已退出时排空 stdout 队列，避免 Node 已 emit error 但未读。"""
+    events: list[dict] = []
+    while True:
+        try:
+            item = out_q.get_nowait()
+        except queue.Empty:
+            break
+        if item is None:
+            continue
+        line = str(item).strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except Exception:
+            continue
+    return events
+
+
 def _run_browser_job(
     index: int,
     email: str,
@@ -736,6 +756,17 @@ def _run_browser_job(
                 err_msg = err_msg or _timeout_error_message()
                 break
             if raw_line is None:
+                for evt in _drain_worker_events(out_q):
+                    etype = evt.get("type")
+                    if etype == "log":
+                        step(index, str(evt.get("message") or ""), _level_color(evt.get("level")))
+                    elif etype == "result":
+                        data = evt.get("data") or {}
+                        recording_dir = str(evt.get("recordingDir") or recording_dir or "")
+                    elif etype == "error":
+                        err_msg = str(evt.get("message") or "注册失败")
+                        partial = evt.get("partial") or {}
+                        recording_dir = str(evt.get("recordingDir") or recording_dir or "")
                 break
             line = str(raw_line).strip()
             if not line:

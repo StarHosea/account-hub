@@ -258,6 +258,7 @@ def _extract_visible_ui(html: str) -> dict:
     hint_keys = (
         "错误", "失败", "无效", "error", "invalid", "try again", "captcha", "验证",
         "rate", "limit", "blocked", "unusual", "异常", "重试", "无法", "不能",
+        "有効な年齢", "年齢", "コードが正しく", "不正確なコード", "valid age",
     )
     hints: list[str] = []
     for ln in lines:
@@ -421,16 +422,31 @@ def build_brief(email: str, request: Request | None = None) -> dict:
     if failed_step == "final-error-scene" and len(manifest) >= 2:
         failed_step = str(manifest[-2].get("stepId") or failed_step)
 
+    failed_note = str(last.get("note") or "")
+    abnormal_reason = str((abnormal or {}).get("reason") or "")
+    engine_error = failed_note if str(last.get("stepId") or "") == "final-error-scene" else ""
+    reason = abnormal_reason
+    generic_reasons = ("浏览器引擎未返回结果", "register_error", "注册失败")
+    if engine_error and (
+        not reason
+        or any(g in reason for g in generic_reasons)
+    ):
+        reason = engine_error
+    elif engine_error and engine_error not in reason:
+        reason = f"{reason}（引擎：{engine_error}）" if reason else engine_error
+
     brief = {
         "ok": True,
         "email": email,
-        "reason": str((abnormal or {}).get("reason") or ""),
+        "reason": reason,
+        "engine_error": engine_error or None,
+        "abnormal_reason": abnormal_reason or None,
         "fetch_url": str((abnormal or {}).get("fetch_url") or ""),
         "created_at": str((abnormal or {}).get("created_at") or ""),
         "recording_path": str(record_dir) if record_dir else "",
         "recording_steps": len(manifest),
         "failed_step": failed_step,
-        "failed_note": str(last.get("note") or ""),
+        "failed_note": failed_note,
         "url": str(last.get("url") or ""),
         "pageState": last.get("pageState"),
         "confidence": last.get("confidence"),

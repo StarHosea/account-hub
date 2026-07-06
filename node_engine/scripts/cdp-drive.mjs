@@ -43,6 +43,15 @@ try {
     case 'url':
       out({ url: page.url(), title: await page.title().catch(() => '') });
       break;
+    case 'lang': {
+      const info = await page.evaluate(() => ({
+        htmlLang: document.documentElement.lang || '',
+        navigatorLanguage: navigator.language || '',
+        languages: navigator.languages ? [...navigator.languages] : [],
+      }));
+      out(info);
+      break;
+    }
     case 'snapshot': {
       const info = await page.evaluate(`(() => {
         const vis = ${VIS};

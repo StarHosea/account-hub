@@ -14,6 +14,7 @@ from services.register_diag_service import (
     brief_latest,
     build_brief,
     build_brief_markdown,
+    delete_recordings_for_emails,
     diag_meta,
     list_diag_entries,
     recording_html_path,
@@ -160,13 +161,21 @@ def create_router() -> APIRouter:
     @router.delete("/api/register/abnormal")
     async def delete_register_abnormal(body: RegisterAbnormalDeleteRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        removed = register_abnormal_service.delete(body.emails)
-        logs_removed = register_service.clear_logs_for_emails(body.emails)
+        emails = [str(email or "").strip() for email in body.emails if str(email or "").strip()]
+        recording_hints = {
+            email: str((register_abnormal_service.peek(email) or {}).get("recording_path") or "")
+            for email in emails
+        }
+        recordings = delete_recordings_for_emails(emails, hints=recording_hints)
+        removed = register_abnormal_service.delete(emails)
+        logs_removed = register_service.clear_logs_for_emails(emails)
         return {
             "items": register_abnormal_service.list_items(),
             "stats": register_abnormal_service.stats(),
             "removed": removed,
             "logs_removed": logs_removed,
+            "recordings_removed": recordings["dirs_removed"],
+            "bytes_freed": recordings["bytes_freed"],
         }
 
     @router.get("/api/register/abnormal/export")

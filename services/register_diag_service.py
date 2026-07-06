@@ -4,6 +4,7 @@ import base64
 import io
 import json
 import re
+import shutil
 import zipfile
 from pathlib import Path
 from urllib.parse import quote
@@ -70,6 +71,37 @@ def _safe_email_prefix(email: str) -> str:
     return re.sub(r"[^a-zA-Z0-9._-]+", "-", str(email or "").strip())[:40]
 
 
+def _is_under_record_root(path: Path) -> bool:
+    root = resolve_record_root()
+    if not root.is_dir():
+        return False
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _all_recording_dirs(email: str, hint: str = "") -> list[Path]:
+    """返回某邮箱的全部诊断存证目录（同邮箱多次注册可能有多个）。"""
+    found: dict[str, Path] = {}
+
+    hint_raw = str(hint or "").strip()
+    if hint_raw:
+        hinted = Path(hint_raw)
+        if hinted.is_dir() and _is_under_record_root(hinted):
+            found[str(hinted.resolve())] = hinted.resolve()
+
+    root = resolve_record_root()
+    if root.is_dir():
+        prefix = f"{_safe_email_prefix(email)}-"
+        for candidate in root.iterdir():
+            if candidate.is_dir() and candidate.name.startswith(prefix):
+                found[str(candidate.resolve())] = candidate.resolve()
+
+    return list(found.values())
+
+
 def find_recording_dir(email: str, hint: str = "") -> Path | None:
     hint_raw = str(hint or "").strip()
     if hint_raw:
@@ -77,15 +109,57 @@ def find_recording_dir(email: str, hint: str = "") -> Path | None:
         if hinted.is_dir():
             return hinted
 
-    root = resolve_record_root()
-    if not root.is_dir():
+    dirs = _all_recording_dirs(email)
+    if not dirs:
         return None
+    return max(dirs, key=lambda p: p.stat().st_mtime)
 
-    prefix = f"{_safe_email_prefix(email)}-"
-    candidates = [p for p in root.iterdir() if p.is_dir() and p.name.startswith(prefix)]
-    if not candidates:
-        return None
-    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+def _dir_size(path: Path) -> int:
+    total = 0
+    for file_path in path.rglob("*"):
+        if file_path.is_file():
+            try:
+                total += file_path.stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def delete_recordings_for_emails(
+    emails: list[str],
+    *,
+    hints: dict[str, str] | None = None,
+) -> dict[str, int]:
+    """删除指定邮箱的全部诊断存证目录，返回删除目录数与释放字节数。"""
+    hints = hints or {}
+    dirs_removed = 0
+    bytes_freed = 0
+    seen: set[str] = set()
+
+    for raw_email in emails or []:
+        email = str(raw_email or "").strip()
+        if not email:
+            continue
+        hint = (
+            hints.get(email)
+            or hints.get(email.lower())
+            or ""
+        )
+        for record_dir in _all_recording_dirs(email, hint):
+            key = str(record_dir.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            size = _dir_size(record_dir)
+            try:
+                shutil.rmtree(record_dir)
+            except OSError:
+                continue
+            dirs_removed += 1
+            bytes_freed += size
+
+    return {"dirs_removed": dirs_removed, "bytes_freed": bytes_freed}
 
 
 def _load_manifest(record_dir: Path) -> list[dict]:

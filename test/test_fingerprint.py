@@ -96,6 +96,7 @@ class BuildIdentityTest(unittest.TestCase):
         self.assertEqual(idn.region.ipweb_country, "JP")
         self.assertTrue(idn.accept_language.startswith("ja-JP"))
         self.assertEqual(idn.browser_locale, "ja-JP")
+        self.assertEqual(idn.browser_timezone, "Asia/Tokyo")
         self.assertEqual(idn.sentinel_language, "ja-JP")
         self.assertEqual(idn.gmt_offset, "GMT+0900")
         self.assertEqual(idn.tz_label, "Japan Standard Time")

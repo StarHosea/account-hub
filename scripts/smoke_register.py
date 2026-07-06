@@ -81,8 +81,8 @@ def main() -> int:
 
     # 2) 配置注册机：只跑 1 号、单线程、用你的代理
     regions = [r.strip() for r in os.getenv("SMOKE_REGIONS", "US").split(",") if r.strip()] or ["US"]
+    http_proxy = (os.getenv("SMOKE_HTTP_PROXY") or "http://127.0.0.1:7890").strip()
     updates = {
-        "proxy": proxy,
         "total": 1,
         "threads": 1,
         "regions": regions,
@@ -91,9 +91,23 @@ def main() -> int:
         "headless": _env_bool("SMOKE_HEADLESS", False),
         "register_timeout": int(os.getenv("SMOKE_TIMEOUT", "360")),
     }
+    # 本地 Clash/Surge 7890：无 ipweb 串时用固定 HTTP 代理，避免仍走 register.json 里的 ipweb US 段。
+    if proxy and ("ipweb.cc" in proxy or proxy.startswith("B_")):
+        updates["proxy"] = proxy
+    elif proxy:
+        updates["proxy"] = proxy
+        updates["proxy_mode"] = "http"
+        updates["http_proxy"] = proxy
+        updates["ipweb_rotate"] = False
+    else:
+        updates["proxy"] = http_proxy
+        updates["proxy_mode"] = "http"
+        updates["http_proxy"] = http_proxy
+        updates["ipweb_rotate"] = False
     register_service.update(updates)
     print(f"[smoke] 注册机配置：total=1 threads=1 regions={regions} ipweb_rotate={updates['ipweb_rotate']} "
-          f"headless={updates['headless']} enable_2fa={updates['enable_2fa']} 代理={'有' if proxy else '无'}")
+          f"headless={updates['headless']} enable_2fa={updates['enable_2fa']} "
+          f"proxy_mode={updates.get('proxy_mode', 'ipweb')} 代理={'有' if updates.get('proxy') else '无'}")
 
     # 3) 启动并跟日志/进度直到结束
     register_service.start()

@@ -26,7 +26,7 @@ test('recoverFromChromeError 在错误页刷新一次即恢复', async () => {
   const did = await recoverFromChromeError(page, (m, lvl) => logs.push([lvl, m]), { max: 3 });
   assert.equal(did, true);
   assert.equal(reloads, 1);
-  assert.match(logs.map((l) => l[1]).join('\n'), /浏览器加载错误页/);
+  assert.match(logs.map((l) => l[1]).join('\n'), /页面加载失败，正在刷新/);
 });
 
 // 正常页：不刷新，返回 false

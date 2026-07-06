@@ -450,6 +450,7 @@ const CODE_POLL_MAX_ROUNDS = 4;
 
 const RESEND_CODE_TEXTS = [
   '重新发送电子邮件', '重新发送', '重新发送邮件', '重新发送验证码',
+  'resend email', 'resend', '再送信', 'メールを再送信',
   'resend email', 'resend', 'send again', "didn't get", '未收到',
 ];
 
@@ -522,7 +523,7 @@ async function openWithRetry(page, url, log, { attempts = 3, recorder = NOOP_REC
       await page.goto(url, { waitUntil: 'commit', timeout: 90000 });
       await waitForDomReady(page, { timeoutMs: 45000 }).catch(() => {});
       await page.waitForFunction(
-        () => /免费注册|sign up|登录|log ?in/i.test(document.body?.innerText || ''),
+        () => /免费注册|sign up|登录|log ?in|無料でサインアップ|ログイン/i.test(document.body?.innerText || ''),
         { timeout: 30000 }
       ).catch(() => {});
       const txt = await pageText(page);
@@ -1086,7 +1087,7 @@ async function isMfaEmailChallenge(page) {
     const hasInput = vis(document.querySelector(sel.code)) || [...document.querySelectorAll(sel.seg)].some(vis);
     const hasTotpInput = vis(document.querySelector('#totp_otp, input[name="totp_otp"]'));
     // 邮箱收码页提示（含 email-otp 页的「输入我们刚刚向…发送的验证码」，及「未收到电子邮件？重新发送」）。
-    const hasEmailHint = /检查你的收件箱|查看你的邮箱|邮件已发送|邮箱验证码|电子邮件.*验证码|刚刚向.*发送|未收到电子邮件|重新发送|check your inbox|sent.*email|email.*code|verification code|we just sent|didn't get.*email/i.test(text);
+    const hasEmailHint = /检查你的收件箱|查看你的邮箱|邮件已发送|邮箱验证码|电子邮件.*验证码|刚刚向.*发送|未收到电子邮件|重新发送|check your inbox|sent.*email|email.*code|verification code|we just sent|didn't get.*email|受信トレイ|メール.*送信|確認コード|届きません|再送信/i.test(text);
     return hasInput && hasEmailHint && !hasTotpInput;
   }, { code: S.CODE_INPUT, seg: S.CODE_INPUT_SEGMENTED }).catch(() => false);
 }
@@ -1099,10 +1100,12 @@ async function tryLoginMfaEmailFallback(page, requestCode, log) {
   const emailTexts = [
     '电子邮件', '通过电子邮件', '使用邮箱', '邮箱验证码', '发送电子邮件', '发送验证码', '发送邮件',
     'email', 'email a code', 'send code', 'send an email', 'send email', 'use email', 'email verification',
+    'メール', 'Eメール', 'メールで確認', 'メールで続行', 'メールにコードを送信',
   ];
   const switchTexts = [
     '改用其他方式', '其他方式', '其他方法', '选择其他方式', '试试其他方式', '尝试其他方法', '无法使用验证器', '使用其他方法',
     'try another method', 'use another method', 'choose another method', 'another method', 'more options', 'lost access',
+    '他の方法', '別の方法', '別の認証方法', '他の認証方法',
   ];
 
   for (let round = 1; round <= 3; round += 1) {
@@ -1333,7 +1336,7 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
     for (let attempt = 1; attempt <= 2 && !emailInput && remainingMs(step2Deadline) > 0; attempt += 1) {
       const clicked = await clickHomeAuthButton(page, {
         testId: S.SIGNUP_BUTTON_TESTID,
-        texts: ['免费注册', 'sign up for free', 'sign up', '注册', '登録', 'get started', 'create account'],
+        texts: ['免费注册', 'sign up for free', 'sign up', '注册', '登録', '無料でサインアップ', 'get started', 'create account'],
       });
       if (!clicked) missStreak += 1;
       else missStreak = 0;
@@ -1347,13 +1350,13 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
         log('注册 · 注册按钮已点击，等待邮箱输入框出现');
         await clickHomeAuthButton(page, {
           testId: S.SIGNUP_BUTTON_TESTID,
-          texts: ['免费注册', 'sign up for free', 'sign up', '注册'],
+          texts: ['免费注册', 'sign up for free', 'sign up', '注册', '無料でサインアップ'],
         });
         emailInput = await waitForAuthEmailInput(page, { timeout: capTimeout(8000, step2Deadline) });
       }
       if (!emailInput) {
         const em = await humanClickByText(page, [
-          'continue with email', 'use email', '使用邮箱', 'メールで続ける',
+          'continue with email', 'use email', '使用邮箱', 'メールで続ける', 'メール アドレス',
           '通过电子邮件', '继续使用电子邮件', '使用电子邮件', '电子邮件地址', '用邮箱继续',
         ], { timeout: capTimeout(4000, step2Deadline), exclude: OAUTH_EXCLUDE });
         await mark(`register-02b-after-use-email-${attempt}`, `点「使用邮箱」兜底「${em || '未命中'}」后`);

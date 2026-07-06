@@ -54,6 +54,13 @@ function toPlaywrightProxy(proxyUrl) {
   }
 }
 
+// 与 Python identity.region 对齐的 IANA 时区；显式 locale 时一并传入，避免 geoip 按代理出口（如本机 7890→CN）覆盖语言。
+const LOCALE_IANA_TZ = {
+  'en-US': 'America/New_York',
+  'ja-JP': 'Asia/Tokyo',
+  'en-IN': 'Asia/Kolkata',
+};
+
 function resolveLocale(locale, proxyUrl) {
   const v = String(locale || '').trim();
   if (v) return v;
@@ -61,33 +68,51 @@ function resolveLocale(locale, proxyUrl) {
   return proxyUrl ? null : 'en-US';
 }
 
+function resolveTimezone(timezone, locale) {
+  const tz = String(timezone || '').trim();
+  if (tz) return tz;
+  const loc = String(locale || '').trim();
+  return LOCALE_IANA_TZ[loc] || null;
+}
+
 // 返回统一句柄 { mode, seed, browser, context, close() }。
 // fingerprintSeed：固定指纹种子（10000-99999）。同一 seed = 同一指纹，跨会话可复现；
 // 不传则生成一个，并在返回值里带出实际 seed 供存储与后续复用。
 // locale：浏览器语言（如 en-US / ja-JP / en-IN），与 Python identity.region 对齐；显式传入时覆盖 geoip 自动检测。
-export async function launchSession(proxyUrl, { headless = false, fingerprintSeed = null, locale = null, log = () => {} } = {}) {
+export async function launchSession(proxyUrl, { headless = false, fingerprintSeed = null, locale = null, timezone = null, acceptLanguage = null, log = () => {} } = {}) {
   const launchContext = await loadCloak();
   const seed = Number.isInteger(fingerprintSeed) && fingerprintSeed > 0
     ? fingerprintSeed
     : Math.floor(Math.random() * 90000) + 10000;
   const resolvedLocale = resolveLocale(locale, proxyUrl);
+  const resolvedTimezone = resolveTimezone(timezone, resolvedLocale);
+  const resolvedAcceptLanguage = String(acceptLanguage || '').trim()
+    || (resolvedLocale ? `${resolvedLocale},${resolvedLocale.split('-')[0]};q=0.9,en-US;q=0.8,en;q=0.7` : '');
 
   if (launchContext) {
     try {
+      // 显式 locale 时关闭 geoip：本机 7890 出口常为 CN，geoip/WebRTC IP 会把 navigator.language 拉回 zh-CN。
+      const useExplicitLocale = Boolean(resolvedLocale);
       const opts = {
-        geoip: true,             // 按出口 IP 匹配时区/语言（需 mmdb-lib）
-        humanize: true,          // 拟人化鼠标/键盘/滚动
-        headless,                // 反爬场景建议 false（服务器上用 Xvfb 有头）
+        geoip: !useExplicitLocale,
+        humanize: true,
+        headless,
         viewport: { width: 1280, height: 800 },
-        // 固定指纹种子 + Docker 加固参数（buildArgs 按键去重，用户 args 覆盖默认）
         args: [`--fingerprint=${seed}`, ...HARDENING_ARGS, ...cdpArgs()],
       };
       if (resolvedLocale) opts.locale = resolvedLocale;
-      if (proxyUrl) opts.proxy = proxyUrl; // 带账号密码的完整代理地址
+      if (resolvedTimezone) opts.timezone = resolvedTimezone;
+      if (resolvedAcceptLanguage) {
+        opts.contextOptions = {
+          extraHTTPHeaders: { 'Accept-Language': resolvedAcceptLanguage },
+        };
+      }
+      if (proxyUrl) opts.proxy = proxyUrl;
       const context = await launchContext(opts);
       const browser = context.browser();
       const localeNote = resolvedLocale || (proxyUrl ? 'geoip 自动' : 'en-US');
-      log(`浏览器已启动（seed=${seed}，locale=${localeNote}${proxyUrl ? '，出口走代理' : '，直连'}）`);
+      const tzNote = resolvedTimezone ? `，tz=${resolvedTimezone}` : '';
+      log(`浏览器已启动（seed=${seed}，locale=${localeNote}${tzNote}${proxyUrl ? '，出口走代理' : '，直连'}）`);
       return {
         mode: 'cloakbrowser',
         seed,
@@ -108,13 +133,13 @@ export async function launchSession(proxyUrl, { headless = false, fingerprintSee
     log(`浏览器加载失败（${_loadError?.message || _loadError}），正在切换备用模式`);
   }
 
-  const fb = await launchFallbackChromium(proxyUrl, headless, resolvedLocale || 'en-US', log);
+  const fb = await launchFallbackChromium(proxyUrl, headless, resolvedLocale || 'en-US', resolvedTimezone, resolvedAcceptLanguage, log);
   fb.seed = seed; // 回退模式无真实指纹，仍记录 seed 保持数据结构一致
   return fb;
 }
 
 // 回退：playwright-core + 系统 Chrome / 自带 chromium（无 stealth 指纹，仅用于跑通链路）。
-async function launchFallbackChromium(proxyUrl, headless, locale, log) {
+async function launchFallbackChromium(proxyUrl, headless, locale, timezone, acceptLanguage, log) {
   const { chromium } = await import('playwright-core');
   const pwProxy = toPlaywrightProxy(proxyUrl);
   const launchOpts = {
@@ -143,6 +168,8 @@ async function launchFallbackChromium(proxyUrl, headless, locale, log) {
     proxy: pwProxy,
     viewport: { width: 1280, height: 800 },
     locale: locale || 'en-US',
+    ...(timezone ? { timezoneId: timezone } : {}),
+    ...(acceptLanguage ? { extraHTTPHeaders: { 'Accept-Language': acceptLanguage } } : {}),
     userAgent:
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
   });

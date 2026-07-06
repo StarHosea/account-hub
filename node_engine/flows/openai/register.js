@@ -733,14 +733,15 @@ async function forgotPasswordFlow({ page, email, requestCode, log, recorder = NO
   log(`重设密码 · 已生成新密码：${newPassword}`);
   const mark = (id, meta) => recorder.record(id, typeof meta === 'string' ? { note: meta } : meta).catch(() => {});
   // 1) 点"忘记了密码？"
-  const moved1 = await clickButtonRobust(page, /忘记了密码|忘记密码|forgot/i, { timeout: 8000, log });
+  const moved1 = await clickButtonRobust(page, S.FORGOT_PASSWORD_PATTERN, { timeout: 8000, log });
   log(`重设密码 · 点击忘记密码，${moved1 ? '页面已跳转' : '页面未变化'}`);
+  await mark('forgot-01-click', { note: moved1 ? 'forgot-link-moved' : 'forgot-link-no-move', url: page.url() });
   await sleep(2000);
   await snapshot(page, 'forgot-01-after-click', log);
 
   // 2) 重置密码确认页："点击继续以重置 X 的密码" → 点"继续"发送重置码
   if (/reset-password/i.test(page.url())) {
-    const moved2 = await clickButtonRobust(page, /继续|continue|发送|send/i, { timeout: 12000, tries: 4, reloadOnFail: true, log });
+    const moved2 = await clickButtonRobust(page, S.RESET_CONTINUE_PATTERN, { timeout: 12000, tries: 4, reloadOnFail: true, log });
     log(`重设密码 · 点击继续发送重置邮件，${moved2 ? '页面已跳转' : '页面未变化'}`);
     await throwIfRateLimited(page, log);
     await sleep(2500);
@@ -770,7 +771,7 @@ async function forgotPasswordFlow({ page, email, requestCode, log, recorder = NO
     if (/new-password|reset-password\/|create-password/i.test(url)) return true;
     const pw = document.querySelectorAll('input[type="password"]');
     const t = document.body.innerText || '';
-    return pw.length >= 2 || /新密码|设置密码|重新输入.*密码|create.*password|new password/i.test(t);
+    return pw.length >= 2 || new RegExp(S.NEW_PASSWORD_PAGE_PATTERN.source, 'i').test(t);
   }).catch(() => false);
   if (!onNewPwdPage) {
     await snapshot(page, 'forgot-no-pwd-form', log);
@@ -785,7 +786,7 @@ async function forgotPasswordFlow({ page, email, requestCode, log, recorder = NO
   await waitForPageFullyLoaded(page, { log });
   await all.nth(Math.max(0, n - 1)).press('Enter').catch(() => {});
   await page.waitForFunction((u) => location.href !== u, beforeSet, { timeout: 5000 }).catch(() => {});
-  if (page.url() === beforeSet) await clickButtonRobust(page, /继续|保存|重置|确认|continue|save|reset|confirm/i, { timeout: 8000, log });
+  if (page.url() === beforeSet) await clickButtonRobust(page, S.RESET_SAVE_PATTERN, { timeout: 8000, log });
   await sleep(3500);
   await snapshot(page, 'forgot-04-after-set', log);
 
@@ -793,10 +794,10 @@ async function forgotPasswordFlow({ page, email, requestCode, log, recorder = NO
   //    每次跳转后先 waitForAuthReady 等页面 hydrate 完成再操作（避免点击/输入落空）。
   await waitForAuthReady(page);
   const onResetDone = /reset-password\/success/i.test(page.url())
-    || await page.evaluate(() => /重置.*成功|密码.*(已|修改|重置).*成功|password.*(reset|changed|updated)/i.test(document.body?.innerText || '')).catch(() => false);
+    || await page.evaluate((reSrc) => new RegExp(reSrc, 'i').test(document.body?.innerText || ''), S.RESET_SUCCESS_PATTERN.source).catch(() => false);
   if (onResetDone || /reset-password/i.test(page.url())) {
     log('重设密码 · 密码已更新，返回登录页');
-    const movedLogin = await clickButtonRobust(page, /^登录$|登 ?录|log ?in|sign ?in/i, { timeout: 8000, tries: 3, log });
+    const movedLogin = await clickButtonRobust(page, S.LOGIN_LINK_PATTERN, { timeout: 8000, tries: 3, log });
     if (!movedLogin || !/\/log-in/i.test(page.url())) {
       // 兜底：直接点 href 指向 /log-in 的链接
       await page.evaluate(() => {
@@ -820,7 +821,7 @@ async function forgotPasswordFlow({ page, email, requestCode, log, recorder = NO
       await pwd.press('Enter').catch(() => {});
       await page.waitForFunction((u) => location.href !== u, beforeLogin, { timeout: 8000 }).catch(() => {});
       if (page.url() === beforeLogin) {
-        await humanClickByText(page, ['继续', 'continue', '登录', 'log in', 'sign in'], { timeout: 6000, exclude: OAUTH_EXCLUDE, awaitPageLoad: true, log }).catch(() => {});
+        await humanClickByText(page, [...S.CONTINUE_TEXTS, '登录', 'log in', 'sign in', 'ログイン'], { timeout: 6000, exclude: OAUTH_EXCLUDE, awaitPageLoad: true, log }).catch(() => {});
         await page.waitForFunction((u) => location.href !== u, beforeLogin, { timeout: 8000 }).catch(() => {});
       }
       await sleep(2500);
@@ -979,7 +980,7 @@ export async function loginChatGPT({ page, email, chatgptUrl = 'https://chatgpt.
           break;
         }
         if (outcome !== 'navigated' && page.url() === beforeUrl) {
-          const btn = page.locator('button:has-text("继续"), button:has-text("Continue")').first();
+          const btn = page.locator('button:has-text("继续"), button:has-text("Continue"), button:has-text("続行")').first();
           await waitForPageFullyLoaded(page, { log });
           await btn.click({ timeout: 6000 }).catch(() => {});
           outcome = await waitForLoginPasswordOutcome(page, beforeUrl, { timeoutMs: 5000 });
@@ -1019,7 +1020,7 @@ export async function loginChatGPT({ page, email, chatgptUrl = 'https://chatgpt.
       }
     } else {
       log('登录 · 未提供密码，改为邮箱验证码登录');
-      await humanClickByText(page, ['改用验证码', '使用验证码', '通过电子邮件', 'email a code', 'send code', '发送验证码', 'use a code', 'verification code'], { timeout: 6000, exclude: OAUTH_EXCLUDE }).catch(() => {});
+      await humanClickByText(page, S.LOGIN_OTP_TEXTS, { timeout: 6000, exclude: OAUTH_EXCLUDE }).catch(() => {});
     }
     // 密码未提交成功且没进到收码页 → 忘记密码重设兜底
     if (!passwordSubmitted) {

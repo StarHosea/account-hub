@@ -167,6 +167,11 @@ class RegisterAbnormalService:
                 cleaned += 1
         return cleaned
 
+    def peek(self, email: str) -> dict | None:
+        with self._lock:
+            item = self._items.get(_norm_email(email))
+            return dict(item) if item else None
+
     def delete(self, emails: list[str]) -> int:
         removed = 0
         with self._lock:

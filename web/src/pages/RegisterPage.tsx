@@ -219,10 +219,17 @@ export default function RegisterPage() {
   const handleDeleteAbnormal = async () => {
     if (!selectedAbnormal.length) return;
     try {
-      await deleteRegisterAbnormal(selectedAbnormal);
+      const result = await deleteRegisterAbnormal(selectedAbnormal);
       setSelectedAbnormal([]);
       await loadAbnormal();
-      Toast.success("已删除所选异常账号");
+      const freedMb = result.bytes_freed ? (result.bytes_freed / (1024 * 1024)).toFixed(1) : "";
+      const detail =
+        result.recordings_removed && freedMb
+          ? `，已清理 ${result.recordings_removed} 份诊断存证（约 ${freedMb} MB）`
+          : result.recordings_removed
+            ? `，已清理 ${result.recordings_removed} 份诊断存证`
+            : "";
+      Toast.success(`已删除所选异常账号${detail}`);
     } catch (e) {
       Toast.error(e instanceof Error ? e.message : "删除失败");
     }

@@ -1127,7 +1127,14 @@ export async function fetchRegisterAbnormal(params: RegisterAbnormalListParams =
 }
 
 export async function deleteRegisterAbnormal(emails: string[]) {
-  return httpRequest<{ items: RegisterAbnormal[]; stats: RegisterAbnormalStats; removed: number }>(
+  return httpRequest<{
+    items: RegisterAbnormal[];
+    stats: RegisterAbnormalStats;
+    removed: number;
+    logs_removed?: number;
+    recordings_removed?: number;
+    bytes_freed?: number;
+  }>(
     "/api/register/abnormal",
     { method: "DELETE", body: { emails } },
   );

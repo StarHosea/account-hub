@@ -59,7 +59,7 @@ def create_router() -> APIRouter:
         elif status == "used":
             items = [m for m in items if m.get("used")]
         elif status == "unused":
-            items = [m for m in items if not m.get("used") and not m.get("in_use")]
+            items = [m for m in items if mailbox_service.is_available_email(str(m.get("email") or ""))]
 
         total = len(items)
         return {

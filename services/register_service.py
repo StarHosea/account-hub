@@ -500,11 +500,8 @@ class RegisterService:
     def _stop_for_mailbox_shortage(self, *, pool_stop_logged: list[bool]) -> None:
         with self._lock:
             self._config["enabled"] = False
-        try:
-            # 邮箱池空：只拦新任务，不杀已在跑的浏览器（避免误报 page.evaluate 关闭）。
-            openai_register.signal_stop_new_tasks()
-        except Exception as exc:  # noqa: BLE001
-            self._append_log(f"停止后续注册任务时出错：{exc}", "red")
+        # 仅停止 _run 循环继续 submit 新 worker；不 signal_stop_new_tasks。
+        # 否则并发下后启动的任务取不到邮箱时会误拦已领到邮箱、尚未开浏览器的在途任务。
         if not pool_stop_logged[0]:
             pool_stop_logged[0] = True
             self._append_log("邮箱不足，已停止提交新任务；在途注册将继续完成", "yellow")

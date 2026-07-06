@@ -32,7 +32,7 @@ class RegisterMailboxStopTest(unittest.TestCase):
 
     def test_mailbox_shortage_does_not_kill_in_flight_browsers(self):
         with tempfile.TemporaryDirectory() as tmp:
-            svc = RegisterService(Path(tmp) / "register.json")
+            svc = RegisterService()
             svc.update({"total": 3, "threads": 2, "enabled": True})
 
             with mock.patch.object(openai_register, "worker", return_value={"ok": True, "index": 1}):
@@ -41,12 +41,36 @@ class RegisterMailboxStopTest(unittest.TestCase):
                         with mock.patch.object(mail_provider, "is_api_pool_exhausted", return_value=True):
                             svc._run()
 
-            signal_stop.assert_called()
+            signal_stop.assert_not_called()
             request_stop.assert_not_called()
+
+    def test_run_does_not_signal_stop_when_worker_reports_pool_exhausted(self):
+        """后启动 worker 取不到邮箱时，只停 submit，不 signal 误伤已领到邮箱的在途 worker。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = RegisterService()
+            svc.update({"total": 10, "threads": 3, "enabled": True})
+
+            def fake_worker(index: int) -> dict:
+                if index == 1:
+                    return {"ok": True, "index": index}
+                return {
+                    "ok": False,
+                    "index": index,
+                    "error": mail_provider.MAILBOX_POOL_EXHAUSTED_MSG,
+                    "stop_run": True,
+                }
+
+            with mock.patch.object(openai_register, "worker", side_effect=fake_worker):
+                with mock.patch.object(openai_register, "signal_stop_new_tasks") as signal_stop:
+                    with mock.patch.object(mail_provider, "is_api_pool_exhausted", return_value=False):
+                        svc._run()
+
+            signal_stop.assert_not_called()
+            self.assertFalse(svc.get()["enabled"])
 
     def test_run_stops_after_mailbox_exhausted_without_launching_more(self):
         with tempfile.TemporaryDirectory() as tmp:
-            svc = RegisterService(Path(tmp) / "register.json")
+            svc = RegisterService()
             svc.update({"total": 5, "threads": 1, "enabled": True})
 
             calls = {"n": 0}
@@ -69,13 +93,13 @@ class RegisterMailboxStopTest(unittest.TestCase):
                             svc._run()
 
             self.assertEqual(calls["n"], 2)
-            signal_stop.assert_called()
+            signal_stop.assert_not_called()
             request_stop.assert_not_called()
             self.assertFalse(svc.get()["enabled"])
 
     def test_resume_skips_when_pool_exhausted(self):
         with tempfile.TemporaryDirectory() as tmp:
-            svc = RegisterService(Path(tmp) / "register.json")
+            svc = RegisterService()
             svc.update({"enabled": True, "total": 5})
             with mock.patch.object(mail_provider, "is_api_pool_exhausted", return_value=True):
                 with mock.patch.object(svc, "start") as start:
@@ -85,7 +109,7 @@ class RegisterMailboxStopTest(unittest.TestCase):
 
     def test_start_refuses_when_pool_exhausted(self):
         with tempfile.TemporaryDirectory() as tmp:
-            svc = RegisterService(Path(tmp) / "register.json")
+            svc = RegisterService()
             svc.update({"enabled": False, "total": 3})
             with mock.patch.object(mail_provider, "is_api_pool_exhausted", return_value=True):
                 out = svc.start()

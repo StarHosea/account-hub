@@ -82,7 +82,20 @@ class AcquireUnusedTests(unittest.TestCase):
             if nxt is not None:
                 self.assertNotEqual(nxt["email"], first["email"])
 
-    def test_mark_used_bad_permanently_removes(self) -> None:
+    def test_mark_used_false_clears_cooldown(self) -> None:
+        first = self.svc.acquire_unused()
+        self.svc.release(first["email"], cooldown_seconds=60)
+        self.assertFalse(self.svc._is_available(self.svc._mailboxes[first["email"].lower()]))
+        self.svc.mark_used([first["email"]], False)
+        self.assertTrue(self.svc._is_available(self.svc._mailboxes[first["email"].lower()]))
+        self.assertEqual(self.svc.stats()["unused"], 3)
+
+    def test_stats_unused_matches_is_available(self) -> None:
+        first = self.svc.acquire_unused()
+        self.svc.release(first["email"], cooldown_seconds=60)
+        stats = self.svc.stats()
+        self.assertEqual(stats["unused"], 2)  # 另外两个仍可用
+        self.assertEqual(stats["cooldown"], 1)
         first = self.svc.acquire_unused()
         self.svc.mark_used_bad(first["email"], note="疑似已注册")
         # 标坏后无论如何都不应再领到它。

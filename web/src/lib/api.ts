@@ -191,6 +191,7 @@ export type MailboxStats = {
   used: number;
   unused: number;
   in_use: number;
+  cooldown?: number;
 };
 
 type MailboxListPayload = {

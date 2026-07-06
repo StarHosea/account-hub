@@ -148,7 +148,7 @@ class MailboxService:
             lines = [
                 f"{item['email']}---{item['fetch_url']}"
                 for item in self._mailboxes.values()
-                if not (only_unused and (item.get("used") or item.get("in_use")))
+                if not (only_unused and not self._is_available(item))
             ]
             return "\n".join(lines)
 
@@ -157,7 +157,19 @@ class MailboxService:
             total = len(self._mailboxes)
             used = sum(1 for m in self._mailboxes.values() if m["used"])
             in_use = sum(1 for m in self._mailboxes.values() if m.get("in_use") and not m["used"])
-            return {"total": total, "used": used, "unused": total - used - in_use, "in_use": in_use}
+            available = sum(1 for m in self._mailboxes.values() if self._is_available(m))
+            cooling = sum(
+                1
+                for m in self._mailboxes.values()
+                if not m["used"] and not m.get("in_use") and self._in_cooldown(m)
+            )
+            return {
+                "total": total,
+                "used": used,
+                "unused": available,
+                "in_use": in_use,
+                "cooldown": cooling,
+            }
 
     # ----------------------------- 写操作 ----------------------------- #
 
@@ -207,6 +219,7 @@ class MailboxService:
                 if not used:
                     item["account_token"] = None
                     item["registered_at"] = None
+                    item["cooldown_until"] = None
                 item["in_use"] = False
                 item["in_use_at"] = None
                 changed += 1
@@ -216,19 +229,28 @@ class MailboxService:
 
     # ----------------------------- 注册机用 ----------------------------- #
 
+    def is_available_email(self, email: str) -> bool:
+        with self._lock:
+            item = self._mailboxes.get(_norm_email(email))
+            return item is not None and self._is_available(item)
+
+    def _in_cooldown(self, item: dict) -> bool:
+        cooldown_until = str(item.get("cooldown_until") or "")
+        if not cooldown_until:
+            return False
+        try:
+            cd = datetime.fromisoformat(cooldown_until)
+            cd = cd if cd.tzinfo else cd.replace(tzinfo=timezone.utc)
+            return datetime.now(timezone.utc) < cd
+        except Exception:
+            return False
+
     def _is_available(self, item: dict) -> bool:
         if item["used"]:
             return False
         # 环境类失败释放后的冷却期：未到点则暂不可领用。
-        cooldown_until = str(item.get("cooldown_until") or "")
-        if cooldown_until:
-            try:
-                cd = datetime.fromisoformat(cooldown_until)
-                cd = cd if cd.tzinfo else cd.replace(tzinfo=timezone.utc)
-                if datetime.now(timezone.utc) < cd:
-                    return False
-            except Exception:
-                pass  # 冷却时间戳非法：忽略冷却，按占用态逻辑继续判断
+        if self._in_cooldown(item):
+            return False
         if item.get("in_use"):
             in_use_at = str(item.get("in_use_at") or "")
             if not in_use_at:

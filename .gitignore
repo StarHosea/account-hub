@@ -10,7 +10,6 @@ web_dist
 .venv
 .idea
 data
-config.json
 edit
 
 docker-compose-local.yml

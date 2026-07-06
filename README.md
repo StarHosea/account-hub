@@ -25,11 +25,19 @@ cd account-hub
 docker compose up -d
 ```
 
-启动前请先在 `config.json` 中设置 `auth-key`，也可以在 `docker-compose.yml` 中通过环境变量覆盖。
+启动前请设置环境变量 `ACCOUNT_HUB_AUTH_KEY`，或在管理后台「基础设置」中配置 auth-key（写入 PostgreSQL）。
+
+本地开发需先启动 PostgreSQL：
+
+```bash
+bash scripts/postgres_up.sh
+export ACCOUNT_HUB_AUTH_KEY=your_secret_key_here
+uv run main.py
+```
 
 - Web 面板：`http://localhost:3000`
 - API 地址：`http://localhost:3000/v1`
-- 数据目录：`./data`
+- 数据目录：`./data`（诊断/录制等运行时文件；业务数据存 PostgreSQL）
 
 ### 本地开发
 
@@ -58,21 +66,23 @@ docker compose down
 docker compose up -d
 ```
 
-### 存储后端配置
+### 存储
 
-支持通过环境变量 `STORAGE_BACKEND` 切换存储方式：
+业务数据统一存储在 **PostgreSQL**（账号、CDK、邮箱、注册/激活状态、平台设置等）。操作日志与激活审计同库。
 
-- `json` - 本地 JSON 文件（默认）
-- `sqlite` - 本地 SQLite 数据库
-- `postgres` - 外部 PostgreSQL（需配置 `DATABASE_URL`）
-- `git` - Git 私有仓库（需配置 `GIT_REPO_URL` 和 `GIT_TOKEN`）
+本地 PostgreSQL：
 
-示例：使用 PostgreSQL
+```bash
+bash scripts/postgres_up.sh
+# 默认连接：postgresql://account_hub:account_hub@127.0.0.1:5433/account_hub
+```
 
-```yaml
-environment:
-  - STORAGE_BACKEND=postgres
-  - DATABASE_URL=postgresql://user:password@host:5432/dbname
+生产环境在 `.env` 或 compose 中配置 `DATABASE_URL` 即可（见 `deploy/README.md`）。
+
+从旧版 JSON 文件一次性导入：
+
+```bash
+python scripts/migrate_storage.py --import data/
 ```
 
 ## 功能

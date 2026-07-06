@@ -3,7 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 
-# 平台配置在存储后端中的统一 state 键（db → settings 表，git → config.json）
+# 平台配置在 PostgreSQL settings 表中的统一 state 键
 PLATFORM_CONFIG_STATE_KEY = "config"
 
 

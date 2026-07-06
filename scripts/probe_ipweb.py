@@ -6,12 +6,11 @@
   .venv/bin/python scripts/probe_ipweb.py --proxy 'gate2.ipweb.cc:7778:B_88059_IN_...:pass' --rounds 3
   .venv/bin/python scripts/probe_ipweb.py --regions US,JP,IN
 
-从 data/register.json 读取 proxy / ipweb_rotate / ip_duration / ip_probe_retries（可用 CLI 覆盖）。
+从 PostgreSQL register 状态读取 proxy / ipweb_rotate / ip_duration / ip_probe_retries（可用 CLI 覆盖）。
 """
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
@@ -31,9 +30,11 @@ from services.register.openai_register import (  # noqa: E402
 
 
 def _load_register_defaults() -> dict:
-    path = ROOT / "data" / "register.json"
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        from services.config import config
+
+        data = config.get_storage_backend().load_state("register")
+        return data if isinstance(data, dict) else {}
     except Exception:
         return {}
 
@@ -51,7 +52,7 @@ def main() -> int:
 
     proxy_raw = (args.proxy or "").strip()
     if not proxy_raw:
-        print("错误：请通过 --proxy 或 data/register.json 提供 IPWeb 代理", file=sys.stderr)
+        print("错误：请通过 --proxy 或 PostgreSQL register 配置提供 IPWeb 代理", file=sys.stderr)
         return 1
 
     parsed = fp.parse_proxy(proxy_raw)

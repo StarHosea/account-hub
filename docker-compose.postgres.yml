@@ -4,7 +4,6 @@
 # 连接：postgresql://account_hub:account_hub@127.0.0.1:5433/account_hub
 #
 # 应用侧环境变量示例：
-#   STORAGE_BACKEND=postgres
 #   DATABASE_URL=postgresql://account_hub:account_hub@127.0.0.1:5433/account_hub
 
 services:

@@ -28,7 +28,6 @@ for _ in $(seq 1 30); do
     echo "[postgres] 就绪"
     echo
     echo "连接串（复制到运行环境）："
-    echo "  STORAGE_BACKEND=postgres"
     echo "  DATABASE_URL=postgresql://account_hub:account_hub@127.0.0.1:5433/account_hub"
     exit 0
   fi

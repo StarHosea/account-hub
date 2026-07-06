@@ -738,30 +738,47 @@ async function forgotPasswordFlow({ page, email, requestCode, log, recorder = NO
   log(`重设密码 · 点击忘记密码，${moved1 ? '页面已跳转' : '页面未变化'}`);
   await mark('forgot-01-click', { note: moved1 ? 'forgot-link-moved' : 'forgot-link-no-move', url: page.url() });
   await sleep(2000);
+  if (await clickRetryIfError(page, log)) {
+    await mark('forgot-01-retry', { note: 'reset-password 错误页已点重试', url: page.url() });
+    await sleep(2000);
+  }
   await snapshot(page, 'forgot-01-after-click', log);
 
   // 2) 重置密码确认页："点击继续以重置 X 的密码" → 点"继续"发送重置码
   if (/reset-password/i.test(page.url())) {
+    if (await clickRetryIfError(page, log)) {
+      await mark('forgot-02-retry', { note: '确认页错误页已点重试', url: page.url() });
+      await sleep(2000);
+    }
     const moved2 = await clickButtonRobust(page, S.RESET_CONTINUE_PATTERN, { timeout: 12000, tries: 4, reloadOnFail: true, log });
     log(`重设密码 · 点击继续发送重置邮件，${moved2 ? '页面已跳转' : '页面未变化'}`);
     await throwIfRateLimited(page, log);
     await sleep(2500);
+    if (await clickRetryIfError(page, log)) {
+      await mark('forgot-02-retry', { note: '继续后错误页已点重试', url: page.url() });
+      await sleep(2000);
+    }
+    await mark('forgot-02-continue', { note: moved2 ? 'continue-moved' : 'continue-no-move', url: page.url() });
     await snapshot(page, 'forgot-02-after-continue', log);
+  } else {
+    await mark('forgot-02-skip', { note: '非 reset-password URL，跳过继续', url: page.url() });
   }
 
   // 3) 收码页 → 向 Python 请求重置码填码
   const codeReady = await firstVisible(page, `${S.CODE_INPUT}, ${S.CODE_INPUT_SEGMENTED}`, { timeout: 40000 });
   if (codeReady) {
+    await mark('forgot-03-pre-code', { note: '收码框已出现', url: page.url() });
     log('重设密码 · 等待邮箱验证码');
     const code = await requestCodeWithResend(page, requestCode, log, { purpose: 'login' });
     await fillCode(page, code, log);
     await submitCodeForm(page, log, { code });
     await sleep(3500);
     await snapshot(page, 'forgot-03-after-code', log);
-    await mark('forgot-03-code', '忘记密码：重置码已提交');
+    await mark('forgot-03-code', { note: '忘记密码：重置码已提交', url: page.url() });
   } else {
     await throwIfRateLimited(page, log);
     log('重设密码 · 未出现验证码输入页，继续尝试');
+    await mark('forgot-03-no-code', { note: '等待收码框超时', url: page.url() });
     await snapshot(page, 'forgot-02b-no-code', log);
   }
 
@@ -775,6 +792,7 @@ async function forgotPasswordFlow({ page, email, requestCode, log, recorder = NO
     return pw.length >= 2 || new RegExp(S.NEW_PASSWORD_PAGE_PATTERN.source, 'i').test(t);
   }).catch(() => false);
   if (!onNewPwdPage) {
+    await mark('forgot-04-no-pwd-page', { note: '未到新密码页', url: page.url() });
     await snapshot(page, 'forgot-no-pwd-form', log);
     throw new Error(`忘记密码流程：未到新密码页（当前 ${page.url()}），重置码/确认步骤可能失败`);
   }
@@ -789,6 +807,7 @@ async function forgotPasswordFlow({ page, email, requestCode, log, recorder = NO
   await page.waitForFunction((u) => location.href !== u, beforeSet, { timeout: 5000 }).catch(() => {});
   if (page.url() === beforeSet) await clickButtonRobust(page, S.RESET_SAVE_PATTERN, { timeout: 8000, log });
   await sleep(3500);
+  await mark('forgot-04-password-set', { note: '新密码已提交', url: page.url() });
   await snapshot(page, 'forgot-04-after-set', log);
 
   // 5) 重设成功页（/reset-password/success）不会自动登录：需点"登录"回登录页，再用新密码登录。
@@ -808,6 +827,7 @@ async function forgotPasswordFlow({ page, email, requestCode, log, recorder = NO
       await page.waitForFunction(() => /\/log-in/i.test(location.href), { timeout: 8000 }).catch(() => {});
     }
     await waitForAuthReady(page);
+    await mark('forgot-05-back-login', { note: '已返回登录页', url: page.url() });
   }
 
   // 6) 登录页用刚设的新密码登录（session 记得邮箱，通常直达 /log-in/password）。
@@ -847,7 +867,7 @@ async function forgotPasswordFlow({ page, email, requestCode, log, recorder = NO
     }
   }
   await snapshot(page, 'forgot-06-after-relogin', log);
-  await mark('forgot-06-relogin', '忘记密码：已用新密码重登');
+  await mark('forgot-06-relogin', { note: '忘记密码：已用新密码重登', url: page.url() });
   return newPassword;
 }
 
@@ -1632,11 +1652,11 @@ async function clickRetryIfError(page, log, { max = 3, cooldownMs = 4000 } = {})
     const found = await page.evaluate(() => {
       const vis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
       const text = document.body?.innerText || '';
-      const isErr = /网络.*(异常|错误)|network error|出了点问题|something went wrong|请稍后.*重试/i.test(text);
+      const isErr = /网络.*(异常|错误)|network error|出了点问题|something went wrong|请稍后.*重试|不明なエラー|unknown error|"code":\s*"invalid_type"/i.test(text);
       let btn = document.querySelector('[data-dd-action-name="Try again"]');
       if (!(btn && vis(btn))) {
         btn = [...document.querySelectorAll('button,[role="button"]')].filter(vis)
-          .find((b) => /^(重试|再试一次|重新尝试|try again|retry)$/i.test((b.innerText || '').trim()));
+          .find((b) => /^(重试|再试一次|重新尝试|try again|retry|もう一度試す)$/i.test((b.innerText || '').trim()));
       }
       if (btn && vis(btn) && isErr) { btn.setAttribute('data-reg-retry', '1'); return { isErr: true }; }
       return null;

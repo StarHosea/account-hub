@@ -346,7 +346,7 @@ export default function RegisterPage() {
         <OverviewCard label="进行中" value={registerInProgress} />
         <OverviewCard label="活跃浏览器" value={activeBrowsers} danger={activeBrowsers > 0} />
         <OverviewCard label="成功" value={registerStats?.success ?? 0} />
-        <OverviewCard label="失败" value={registerStats?.fail ?? 0} />
+        <OverviewCard label="失败" value={abnormalTotal} />
       </div>
 
       <Card title="任务配置" style={{ marginBottom: 16 }}>

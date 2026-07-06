@@ -162,6 +162,26 @@ def delete_recordings_for_emails(
     return {"dirs_removed": dirs_removed, "bytes_freed": bytes_freed}
 
 
+def delete_all_recordings() -> dict[str, int]:
+    """删除存证目录下的全部诊断现场，返回删除目录数与释放字节数。"""
+    root = resolve_record_root()
+    dirs_removed = 0
+    bytes_freed = 0
+    if not root.is_dir():
+        return {"dirs_removed": 0, "bytes_freed": 0}
+    for entry in list(root.iterdir()):
+        if not entry.is_dir() or not _is_under_record_root(entry):
+            continue
+        size = _dir_size(entry)
+        try:
+            shutil.rmtree(entry)
+        except OSError:
+            continue
+        dirs_removed += 1
+        bytes_freed += size
+    return {"dirs_removed": dirs_removed, "bytes_freed": bytes_freed}
+
+
 def _load_manifest(record_dir: Path) -> list[dict]:
     manifest = record_dir / "manifest.jsonl"
     if not manifest.is_file():

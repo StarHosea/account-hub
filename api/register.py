@@ -161,10 +161,12 @@ def create_router() -> APIRouter:
     async def delete_register_abnormal(body: RegisterAbnormalDeleteRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
         removed = register_abnormal_service.delete(body.emails)
+        logs_removed = register_service.clear_logs_for_emails(body.emails)
         return {
             "items": register_abnormal_service.list_items(),
             "stats": register_abnormal_service.stats(),
             "removed": removed,
+            "logs_removed": logs_removed,
         }
 
     @router.get("/api/register/abnormal/export")

@@ -472,7 +472,7 @@ export default function RegisterPage() {
                   </Button>
                   <Popconfirm
                     title="确认删除所选异常账号？"
-                    content={`将删除 ${selectedAbnormal.length} 条记录`}
+                    content={`将删除 ${selectedAbnormal.length} 条异常记录及对应注册日志`}
                     onConfirm={() => void handleDeleteAbnormal()}
                   >
                     <Button icon={<IconDelete />} size="small" type="danger" disabled={!selectedAbnormal.length}>

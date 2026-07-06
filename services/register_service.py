@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import threading
 import time
 import uuid
@@ -16,6 +17,31 @@ from services.register import mail_provider, openai_register, fingerprint
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+_TASK_INDEX_RE = re.compile(r"(?:\[任务(\d+)\]|任务\s*(\d+))")
+
+
+def _task_indices_from_text(text: str) -> set[int]:
+    out: set[int] = set()
+    for match in _TASK_INDEX_RE.finditer(str(text or "")):
+        raw = match.group(1) or match.group(2)
+        if raw:
+            out.add(int(raw))
+    return out
+
+
+def _log_entry_matches_emails(entry: dict, needles: set[str], task_indices: set[int]) -> bool:
+    text = str(entry.get("text") or "")
+    lower = text.lower()
+    if any(needle in lower for needle in needles):
+        return True
+    if not task_indices:
+        return False
+    for index in task_indices:
+        if re.search(rf"\[任务{index}\]|任务\s*{index}\b", text):
+            return True
+    return False
 
 
 def _default_mail() -> dict:
@@ -391,6 +417,28 @@ class RegisterService:
             self._logs = []
             self._save()
             return self.get()
+
+    def clear_logs_for_emails(self, emails: list[str]) -> int:
+        """删除与指定邮箱相关的注册日志（含同任务号的 [任务N] 步骤日志）。"""
+        needles = {str(email or "").strip().lower() for email in emails if str(email or "").strip()}
+        if not needles:
+            return 0
+        with self._lock:
+            task_indices: set[int] = set()
+            for entry in self._logs:
+                text = str(entry.get("text") or "")
+                if any(needle in text.lower() for needle in needles):
+                    task_indices |= _task_indices_from_text(text)
+            before = len(self._logs)
+            self._logs = [
+                entry
+                for entry in self._logs
+                if not _log_entry_matches_emails(entry, needles, task_indices)
+            ]
+            removed = before - len(self._logs)
+            if removed:
+                self._save()
+            return removed
 
     def _append_log(self, text: str, color: str = "") -> None:
         with self._lock:

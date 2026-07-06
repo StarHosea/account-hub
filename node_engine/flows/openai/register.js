@@ -1541,20 +1541,11 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
   }
   const codeResult = await requestCodeWithResend(page, requestCode, log, { purpose: 'register', needCodeOptions });
   const fillAudit = await fillCode(page, codeResult.code, log);
-  const submitHit = await humanClickByText(page, S.CONTINUE_TEXTS, { timeout: 10000, exclude: OAUTH_EXCLUDE, awaitPageLoad: true, log });
+  // submitCodeForm 内含 Enter/继续/form 提交、chrome-error 自愈、网络异常点「重试」
+  await submitCodeForm(page, log, { code: codeResult.code });
   await sleep(3000);
-  let chromeErrorRecovered = false;
-  // 提交后落到浏览器错误页 → 刷新重填同码再提交（否则会被误判为"验证码无效"）
-  if (await recoverFromChromeError(page, log) && await hasVisibleCodeInput(page)) {
-    chromeErrorRecovered = true;
-    log('注册 · 页面加载异常，刷新后重新填写验证码', 'warn');
-    await fillCode(page, codeResult.code, log);
-    await submitCodeForm(page, log, { code: codeResult.code });
-    await sleep(3000);
-  }
   const codeAudit = buildCodeAuditFromResult(codeResult, fillAudit, {
-    submitMethod: submitHit ? `continue:${submitHit}` : 'continue-miss',
-    chromeErrorRecovered,
+    submitMethod: 'form-submit',
   });
   await mark('register-04-code-filled', { note: buildCodeAuditNote(codeAudit), ...codeAudit });
 
@@ -1578,6 +1569,10 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
 
   // 步骤5：资料（姓名 + 生日）
   log('注册 · 填写姓名和生日');
+  if (await clickRetryIfError(page, log)) {
+    log('注册 · 进入资料页前检测到网络异常（fail fetch 等），已点重试', 'warn');
+    await sleep(3000);
+  }
   await fillProfile(page, { firstName, lastName, birthday }, log);
   await checkConsentIfAny(page, log);
   const profileFields = await assertProfileReady(page, log);
@@ -1782,7 +1777,7 @@ async function clickRetryIfError(page, log, { max = 3, cooldownMs = 4000 } = {})
     const found = await page.evaluate(() => {
       const vis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
       const text = document.body?.innerText || '';
-      const isErr = /网络.*(异常|错误)|network error|出了点问题|something went wrong|请稍后.*重试|不明なエラー|unknown error|"code":\s*"invalid_type"/i.test(text);
+      const isErr = /网络.*(异常|错误)|network error|出了点问题|something went wrong|请稍后.*重试|不明なエラー|unknown error|fail.*fetch|failed to fetch|"code":\s*"invalid_type"/i.test(text);
       let btn = document.querySelector('[data-dd-action-name="Try again"]');
       if (!(btn && vis(btn))) {
         btn = [...document.querySelectorAll('button,[role="button"]')].filter(vis)

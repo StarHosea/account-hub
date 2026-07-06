@@ -2261,7 +2261,7 @@ class OpenAIBackendAPI:
         })
         exc = ImagePollTimeoutError(
             f"ChatGPT 生图超时（已等待 {timeout_secs} 秒）。"
-            f"当前超时阈值可在 config.json 中调大 image_poll_timeout_secs，"
+            f"当前超时阈值可在管理后台「基础设置」中调大 image_poll_timeout_secs，"
             f"也可能是账号被限流或生图队列拥堵导致。"
         )
         if last_task_error:

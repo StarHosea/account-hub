@@ -1,7 +1,6 @@
 # 服务器部署用 compose（140.238.56.209，~/apps/account-hub/docker-compose.yml 的版本记录）
 #
 # 敏感值不入库，放在同目录 .env（chmod 600）：
-#   STORAGE_BACKEND=postgres
 #   DATABASE_URL=postgresql://account_hub:<password>@sub2api-postgres:5432/account_hub
 #   ACCOUNT_HUB_AUTH_KEY=<key>
 #

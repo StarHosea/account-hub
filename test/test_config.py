@@ -1,48 +1,24 @@
-import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
 
-ROOT_DIR = Path(__file__).resolve().parents[1]
-ROOT_CONFIG_FILE = ROOT_DIR / "config.json"
-
-
 class ConfigLoadingTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls._created_root_config = False
-        if not ROOT_CONFIG_FILE.exists():
-            ROOT_CONFIG_FILE.write_text(json.dumps({"auth-key": "test-auth"}), encoding="utf-8")
-            cls._created_root_config = True
-
-        from services import config as config_module
-
-        cls.config_module = config_module
-
-    @classmethod
-    def tearDownClass(cls) -> None:
-        if cls._created_root_config and ROOT_CONFIG_FILE.exists():
-            ROOT_CONFIG_FILE.unlink()
-
-    def test_load_settings_ignores_directory_config_path(self) -> None:
+    def test_load_settings_requires_env_auth_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             base_dir = Path(tmp_dir)
             data_dir = base_dir / "data"
-            config_dir = base_dir / "config.json"
             os_auth_key = "env-auth"
 
-            config_dir.mkdir()
+            from services import config as module
 
-            module = self.config_module
             old_base_dir = module.BASE_DIR
             old_data_dir = module.DATA_DIR
-            old_config_file = module.CONFIG_FILE
             old_env_auth_key = module.os.environ.get("ACCOUNT_HUB_AUTH_KEY")
             try:
                 module.BASE_DIR = base_dir
                 module.DATA_DIR = data_dir
-                module.CONFIG_FILE = config_dir
                 module.os.environ["ACCOUNT_HUB_AUTH_KEY"] = os_auth_key
 
                 settings = module._load_settings()
@@ -51,11 +27,24 @@ class ConfigLoadingTests(unittest.TestCase):
             finally:
                 module.BASE_DIR = old_base_dir
                 module.DATA_DIR = old_data_dir
-                module.CONFIG_FILE = old_config_file
                 if old_env_auth_key is None:
                     module.os.environ.pop("ACCOUNT_HUB_AUTH_KEY", None)
                 else:
                     module.os.environ["ACCOUNT_HUB_AUTH_KEY"] = old_env_auth_key
+
+    def test_load_settings_rejects_missing_auth_key(self) -> None:
+        from services import config as module
+
+        old_env_auth_key = module.os.environ.get("ACCOUNT_HUB_AUTH_KEY")
+        try:
+            module.os.environ.pop("ACCOUNT_HUB_AUTH_KEY", None)
+            with self.assertRaises(ValueError):
+                module._load_settings()
+        finally:
+            if old_env_auth_key is None:
+                module.os.environ.pop("ACCOUNT_HUB_AUTH_KEY", None)
+            else:
+                module.os.environ["ACCOUNT_HUB_AUTH_KEY"] = old_env_auth_key
 
 
 if __name__ == "__main__":

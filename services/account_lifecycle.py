@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import shutil
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
@@ -445,12 +444,6 @@ def migrate_legacy(account_service, mailbox_service) -> int:
 
     backup_dir = DATA_DIR / "backup_before_lifecycle"
     backup_dir.mkdir(parents=True, exist_ok=True)
-    accounts_file = DATA_DIR / "accounts.json"
-    mailbox_file = DATA_DIR / "mailboxes.json"
-    if accounts_file.exists():
-        shutil.copy2(accounts_file, backup_dir / "accounts.json")
-    if mailbox_file.exists():
-        shutil.copy2(mailbox_file, backup_dir / "mailboxes.json")
 
     changed = 0
     with account_service._lock:

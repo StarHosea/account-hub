@@ -1,16 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
 import os
-import sys
 from pathlib import Path
 
 from services.storage.base import PLATFORM_CONFIG_STATE_KEY, StorageBackend
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
-CONFIG_FILE = BASE_DIR / "config.json"
 VERSION_FILE = BASE_DIR / "VERSION"
 
 DEFAULT_BACKUP_INCLUDE = {
@@ -142,30 +139,13 @@ def _is_invalid_auth_key(value: object) -> bool:
     return _normalize_auth_key(value) == ""
 
 
-def _read_json_object(path: Path, *, name: str) -> dict[str, object]:
-    if not path.exists():
-        return {}
-    if path.is_dir():
-        print(
-            f"Warning: {name} at '{path}' is a directory, ignoring it and falling back to other configuration sources.",
-            file=sys.stderr,
-        )
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
 def _load_settings() -> LoadedSettings:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    raw_config = _read_json_object(CONFIG_FILE, name="config.json")
-    auth_key = _normalize_auth_key(os.getenv("ACCOUNT_HUB_AUTH_KEY") or raw_config.get("auth-key"))
+    auth_key = _normalize_auth_key(os.getenv("ACCOUNT_HUB_AUTH_KEY"))
     if _is_invalid_auth_key(auth_key):
         raise ValueError(
             "❌ auth-key 未设置！\n"
-            "请在环境变量 ACCOUNT_HUB_AUTH_KEY 中设置，或者在 config.json 中填写 auth-key。"
+            "请在环境变量 ACCOUNT_HUB_AUTH_KEY 中设置。"
         )
 
     return LoadedSettings(
@@ -174,8 +154,7 @@ def _load_settings() -> LoadedSettings:
 
 
 class ConfigStore:
-    def __init__(self, path: Path):
-        self.path = path
+    def __init__(self) -> None:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         self._storage_backend: StorageBackend | None = None
         self.data = self._load()
@@ -185,8 +164,7 @@ class ConfigStore:
                 "请按以下任意一种方式解决：\n"
                 "1. 在 Render 的 Environment 变量中添加：\n"
                 "   ACCOUNT_HUB_AUTH_KEY = your_real_auth_key\n"
-                "2. 或者在 config.json 中填写：\n"
-                '   "auth-key": "your_real_auth_key"'
+                "2. 或在管理后台「基础设置」中填写 auth-key（写入 PostgreSQL）"
             )
 
     def _load(self) -> dict[str, object]:
@@ -202,8 +180,7 @@ class ConfigStore:
 
     @property
     def auth_key(self) -> str:
-        file_auth = _normalize_auth_key(_read_json_object(CONFIG_FILE, name="config.json").get("auth-key"))
-        return _normalize_auth_key(os.getenv("ACCOUNT_HUB_AUTH_KEY") or self.data.get("auth-key") or file_auth)
+        return _normalize_auth_key(os.getenv("ACCOUNT_HUB_AUTH_KEY") or self.data.get("auth-key"))
 
     @property
     def admin_path(self) -> str:
@@ -246,10 +223,6 @@ class ConfigStore:
         self.data["cdk_activation"] = current
         self._save()
         return self.cdk_activation
-
-    @property
-    def accounts_file(self) -> Path:
-        return DATA_DIR / "accounts.json"
 
     @property
     def image_poll_timeout_secs(self) -> int:
@@ -431,4 +404,4 @@ def save_backup_state(state: dict[str, object]) -> dict[str, object]:
     return normalized
 
 
-config = ConfigStore(CONFIG_FILE)
+config = ConfigStore()

@@ -31,7 +31,7 @@ class AuthKeyModel(Base):
 
 
 class SettingModel(Base):
-    """平台配置数据模型（单行 JSON 存储 config.json 的内容）"""
+    """平台配置数据模型（单行 JSON 列存储平台设置）"""
     __tablename__ = "settings"
 
     key = Column(String(255), primary_key=True)
@@ -321,18 +321,10 @@ class DatabaseStorageBackend(StorageBackend):
 
     def get_backend_info(self) -> dict[str, Any]:
         """获取存储后端信息"""
-        db_type = "unknown"
-        if "sqlite" in self.database_url:
-            db_type = "sqlite"
-        elif "postgresql" in self.database_url or "postgres" in self.database_url:
-            db_type = "postgresql"
-        elif "mysql" in self.database_url:
-            db_type = "mysql"
-        
         return {
-            "type": "database",
-            "db_type": db_type,
-            "description": f"数据库存储 ({db_type})",
+            "type": "postgresql",
+            "db_type": "postgresql",
+            "description": "PostgreSQL 数据库存储",
             "database_url": self._mask_password(self.database_url),
         }
 

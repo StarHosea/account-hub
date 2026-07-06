@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-+ [优化] 平台配置（基础设置等）改为持久化到存储后端（sqlite/postgres 入库、json 后端写 data/settings.json、git 写仓库），不再依赖仓库根目录的 config.json。首次启动自动将旧的 config.json 迁移进后端；config.json 仅保留为种子与 auth-key 兜底。
++ [变更] 业务数据存储统一为 PostgreSQL，移除 JSON / Git / SQLite 存储后端；auth-key 仅通过环境变量或管理后台配置。
 
 ## 1.4.1 - 2026-06-03
 

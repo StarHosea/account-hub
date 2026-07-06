@@ -107,6 +107,18 @@ export const RESET_CONTINUE_PATTERN = /继续|continue|发送|send|続行|続け
 export const RESET_SAVE_PATTERN = /继续|保存|重置|确认|continue|save|reset|confirm|続行|保存|リセット|確認/i;
 export const RESET_SUCCESS_PATTERN = /重置.*成功|密码.*(已|修改|重置).*成功|password.*(reset|changed|updated)|パスワード.*(変更|更新|リセット).*成功/i;
 export const NEW_PASSWORD_PAGE_PATTERN = /新密码|设置密码|重新输入.*密码|create.*password|new password|新しいパスワード|パスワードを(設定|再入力)/i;
+
+// 安全设置页：密码是否已设置（en/zh/ja；供 auth-state / step8 hasExistingPassword 共用）
+export const SETTINGS_PASSWORD_LABEL = '密码|password|パスワード';
+export const SETTINGS_PASSWORD_MASK_PATTERN = `(?:${SETTINGS_PASSWORD_LABEL})\\s*[\\*•●·∗]{3,}`;
+export const SETTINGS_PASSWORD_ROW_PATTERN = SETTINGS_PASSWORD_LABEL;
+export const SETTINGS_PASSWORD_CURRENT_PATTERN = '当前密码|现有密码|current password|enter your (current|existing) password';
+export const SETTINGS_PASSWORD_MANAGE_BTN_PATTERN = '更改|编辑|管理|更新|編集|change|edit|manage|update';
+export const SETTINGS_PASSWORD_ADD_BTN_PATTERN = '添加|设置|创建|追加|^add$|^set|^create';
+export const SETTINGS_PASSWORD_UNSET_PATTERN = '设置密码|创建密码|create password|set password|パスワードを(設定|作成)';
+export const SETTINGS_IN_SECURITY_PATTERN = 'account security|账户安全与登录|帐户安全与登录|セキュリティとログイン|セキュリティ';
+export const SETTINGS_ON_SECURITY_HINT_PATTERN = '设置密码|create password|多重验证|multi-factor|two-factor|パスワード|二要素|セキュリティ';
+
 export const LOGIN_LINK_PATTERN = /^登录$|登 ?录|log ?in|sign ?in|ログイン/i;
 export const LOGIN_OTP_TEXTS = [
   '改用验证码', '使用验证码', '通过电子邮件', 'email a code', 'send code', '发送验证码', 'use a code', 'verification code',

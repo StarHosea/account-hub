@@ -2114,25 +2114,34 @@ async function disable2fa(page, oldSecret, log) {
 //   2) 密码所在行的操作按钮是「更改/编辑/管理/更新 change/edit/manage/update」而非「添加/设置/创建」；
 //   3) 页面出现「当前密码 / current password」等要求输入现有密码的字样。
 async function hasExistingPassword(page) {
-  return page.evaluate(() => {
+  return page.evaluate((p) => {
     const vis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
     const t = document.body?.innerText || '';
     const MASK = '[\\*•●·∗]{3,}';
-    if (new RegExp('(密码|password)\\s*' + MASK, 'i').test(t)) return true;
-    if (/当前密码|现有密码|current password|enter your (current|existing) password/i.test(t)) return true;
+    if (new RegExp(p.settingsPasswordMask, 'i').test(t)) return true;
+    if (new RegExp(p.settingsPasswordCurrent, 'i').test(t)) return true;
+    const rowRe = new RegExp(p.settingsPasswordRow, 'i');
+    const manageRe = new RegExp(p.settingsPasswordManageBtn, 'i');
+    const addRe = new RegExp(p.settingsPasswordAddBtn, 'i');
     const rows = [...document.querySelectorAll('div,li,section,tr')].filter(vis)
       .map((el) => ({ el, txt: (el.innerText || '').replace(/\s+/g, ' ').trim() }))
-      .filter((x) => x.txt && x.txt.length < 140 && /密码|password/i.test(x.txt.slice(0, 24)))
+      .filter((x) => x.txt && x.txt.length < 140 && rowRe.test(x.txt.slice(0, 24)))
       .sort((a, b) => a.txt.length - b.txt.length);
     for (const { el, txt } of rows) {
       if (new RegExp(MASK).test(txt)) return true;
       const btns = [...el.querySelectorAll('button,a,[role="button"]')].filter(vis)
         .map((b) => (b.innerText || b.getAttribute('aria-label') || '').trim().toLowerCase());
-      const hasManage = btns.some((b) => /更改|编辑|管理|更新|change|edit|manage|update/.test(b));
-      const hasAdd = btns.some((b) => /添加|设置|创建|^add$|^set|^create/.test(b));
+      const hasManage = btns.some((b) => manageRe.test(b));
+      const hasAdd = btns.some((b) => addRe.test(b));
       if (hasManage && !hasAdd) return true;
     }
     return false;
+  }, {
+    settingsPasswordMask: S.SETTINGS_PASSWORD_MASK_PATTERN,
+    settingsPasswordCurrent: S.SETTINGS_PASSWORD_CURRENT_PATTERN,
+    settingsPasswordRow: S.SETTINGS_PASSWORD_ROW_PATTERN,
+    settingsPasswordManageBtn: S.SETTINGS_PASSWORD_MANAGE_BTN_PATTERN,
+    settingsPasswordAddBtn: S.SETTINGS_PASSWORD_ADD_BTN_PATTERN,
   }).catch(() => false);
 }
 
@@ -2162,8 +2171,8 @@ async function step8_setupPasswordAnd2FA(page, { email, password, enable2fa = tr
       out.passwordSet = true;
     } else {
       log('安全设置 · 点击添加密码');
-      let pwEntry = await clickMarked(page, findRowButton, { kw: '密码|password', btns: ['添加', 'add', 'set', '设置', 'create', '创建'] });
-      if (!pwEntry) pwEntry = await humanClickByText(page, ['设置密码', '创建密码', 'set password', 'create password'], { timeout: 3000 }).catch(() => null);
+      let pwEntry = await clickMarked(page, findRowButton, { kw: S.SETTINGS_PASSWORD_ROW_PATTERN, btns: ['添加', 'add', 'set', '设置', 'create', '创建', '追加'] });
+      if (!pwEntry) pwEntry = await humanClickByText(page, ['设置密码', '创建密码', 'set password', 'create password', 'パスワードを設定', 'パスワードを作成'], { timeout: 3000 }).catch(() => null);
       log('安全设置 · 点击密码设置入口');
       await sleep(2500);
       await dumpUi(page, '03-password-entry', log);

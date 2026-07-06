@@ -74,31 +74,34 @@ export async function collectSignals(page) {
       let mfaEnabled = null;
       const hasSecurityTab = !!q1('[data-testid="security-tab"]');
       const inSettings = /#settings/i.test(location.hash)
-        || /account security|账户安全与登录|帐户安全与登录/i.test(text);
+        || new RegExp(sel.settingsInSecurity, 'i').test(text);
       const hasAuthRow = [...document.querySelectorAll('div,li,section')].some(
         (el) => vis(el) && /authenticator|验证器应用|身份验证器/i.test(el.innerText || '') && (el.innerText || '').length < 200,
       );
-      const onSecurity = (hasSecurityTab || inSettings) && (hasAuthRow || /设置密码|create password|多重验证|multi-factor|two-factor/i.test(text));
+      const onSecurity = (hasSecurityTab || inSettings) && (hasAuthRow || new RegExp(sel.settingsOnSecurityHint, 'i').test(text));
       if (onSecurity) {
         // 密码是否已设
-        if (new RegExp('(密码|password)\\s*' + MASK, 'i').test(text)
-            || /当前密码|现有密码|current password|enter your (current|existing) password/i.test(text)) {
+        if (new RegExp(sel.settingsPasswordMask, 'i').test(text)
+            || new RegExp(sel.settingsPasswordCurrent, 'i').test(text)) {
           passwordSet = true;
         } else {
+          const rowRe = new RegExp(sel.settingsPasswordRow, 'i');
+          const manageRe = new RegExp(sel.settingsPasswordManageBtn, 'i');
+          const addRe = new RegExp(sel.settingsPasswordAddBtn, 'i');
           const rows = [...document.querySelectorAll('div,li,section,tr')].filter(vis)
             .map((el) => ({ el, txt: (el.innerText || '').replace(/\s+/g, ' ').trim() }))
-            .filter((x) => x.txt && x.txt.length < 140 && /密码|password/i.test(x.txt.slice(0, 24)))
+            .filter((x) => x.txt && x.txt.length < 140 && rowRe.test(x.txt.slice(0, 24)))
             .sort((a, b) => a.txt.length - b.txt.length);
           for (const { el, txt } of rows) {
             if (new RegExp(MASK).test(txt)) { passwordSet = true; break; }
             const btns = [...el.querySelectorAll('button,a,[role="button"]')].filter(vis)
               .map((b) => (b.innerText || b.getAttribute('aria-label') || '').trim().toLowerCase());
-            const hasManage = btns.some((b) => /更改|编辑|管理|更新|change|edit|manage|update/.test(b));
-            const hasAdd = btns.some((b) => /添加|设置|创建|^add$|^set|^create/.test(b));
+            const hasManage = btns.some((b) => manageRe.test(b));
+            const hasAdd = btns.some((b) => addRe.test(b));
             if (hasManage && !hasAdd) { passwordSet = true; break; }
             if (hasAdd && !hasManage) { passwordSet = false; }
           }
-          if (passwordSet === null && /设置密码|创建密码|create password|set password/i.test(text)) passwordSet = false;
+          if (passwordSet === null && new RegExp(sel.settingsPasswordUnset, 'i').test(text)) passwordSet = false;
         }
         // 2FA 是否已启用（authenticator 行开关）
         if (/验证器应用已启用|authenticator app enabled/i.test(text)) {
@@ -150,6 +153,14 @@ export async function collectSignals(page) {
       profile: `${S.NAME_INPUT}, ${S.FIRST_NAME_INPUT}, ${S.LAST_NAME_INPUT}, ${S.BIRTHDAY_INPUT}`,
       successTexts: S.SUCCESS_TEXTS,
       invalidCodePattern: INVALID_CODE_PATTERN.source,
+      settingsPasswordMask: S.SETTINGS_PASSWORD_MASK_PATTERN,
+      settingsPasswordCurrent: S.SETTINGS_PASSWORD_CURRENT_PATTERN,
+      settingsPasswordRow: S.SETTINGS_PASSWORD_ROW_PATTERN,
+      settingsPasswordManageBtn: S.SETTINGS_PASSWORD_MANAGE_BTN_PATTERN,
+      settingsPasswordAddBtn: S.SETTINGS_PASSWORD_ADD_BTN_PATTERN,
+      settingsPasswordUnset: S.SETTINGS_PASSWORD_UNSET_PATTERN,
+      settingsInSecurity: S.SETTINGS_IN_SECURITY_PATTERN,
+      settingsOnSecurityHint: S.SETTINGS_ON_SECURITY_HINT_PATTERN,
     });
   } catch (e) {
     dom = { evalError: String(e && e.message || e) };

@@ -7,7 +7,7 @@
 //   { type:"result", data:{...} }
 //   { type:"error",  message, partial:{...} }
 // Python → Node（stdin，每行一个 JSON）：
-//   { type:"code", code:"123456"|null }
+//   { type:"code", code:"123456"|null, received_at:"2026-07-06 13:05:50"|null }
 //   { type:"stop" }
 //
 // 流程严格串行：任一时刻最多一个 requestCode 在等待。Python 收到 need_code 后
@@ -67,8 +67,14 @@ function handleCommand(cmd) {
       const p = _pendingCode;
       _pendingCode = null;
       const code = cmd.code == null ? null : String(cmd.code);
-      if (code) p.resolve(code);
-      else p.reject(new Error('取码超时（Python 侧未拿到验证码）'));
+      if (code) {
+        p.resolve({
+          code,
+          receivedAt: cmd.received_at == null ? null : String(cmd.received_at),
+        });
+      } else {
+        p.reject(new Error('取码超时（Python 侧未拿到验证码）'));
+      }
     }
     return;
   }

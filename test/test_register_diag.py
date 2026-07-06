@@ -15,6 +15,7 @@ from services.register import openai_register  # noqa: E402
 from services.register_diag_service import (  # noqa: E402
     _extract_goto_retries,
     _extract_manifest_capture,
+    _extract_manifest_code_capture,
     _extract_visible_ui,
     _load_manifest,
     _proxy_from_abnormal,
@@ -97,6 +98,31 @@ class RegisterDiagServiceTest(unittest.TestCase):
         self.assertEqual(capture["after_continue"]["continueHit"], "dialog-submit")
         self.assertEqual(capture["post_email"]["landing"], "unknown")
         self.assertEqual(capture["pre_continue"]["authUi"]["buttons"][0]["text"], "続行")
+
+    def test_extract_manifest_code_capture_prefers_invalid_step(self):
+        manifest = [
+            {
+                "stepId": "register-04-code-filled",
+                "note": "注册验证码已填 code=111111",
+                "code": "111111",
+                "codeReceivedAt": "2026-07-01 22:45:38",
+                "codeInputMode": "single",
+                "codeReadbackMatches": True,
+            },
+            {
+                "stepId": "register-04-code-invalid",
+                "note": "验证码无效 hint=不正確なコード",
+                "code": "111111",
+                "codeReceivedAt": "2026-07-01 22:45:38",
+                "invalidHintText": "不正確なコード",
+            },
+            {"stepId": "final-error-scene", "note": "验证码无效"},
+        ]
+        capture = _extract_manifest_code_capture(manifest)
+        self.assertEqual(capture["stepId"], "register-04-code-invalid")
+        self.assertEqual(capture["code"], "111111")
+        self.assertEqual(capture["codeReceivedAt"], "2026-07-01 22:45:38")
+        self.assertEqual(capture["invalidHintText"], "不正確なコード")
 
     def test_extract_goto_retries(self):
         manifest = [

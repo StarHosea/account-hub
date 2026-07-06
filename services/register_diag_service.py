@@ -278,6 +278,42 @@ def _extract_visible_ui(html: str) -> dict:
     }
 
 
+def _extract_manifest_code_capture(manifest: list[dict]) -> dict:
+    """从 manifest 提取验证码填码审计（register-04*）。"""
+    row = None
+    for step_pref in ("register-04-code-invalid", "register-04-code-filled"):
+        for candidate in reversed(manifest):
+            if str(candidate.get("stepId") or "") == step_pref:
+                row = candidate
+                break
+        if row:
+            break
+    if not row:
+        for candidate in reversed(manifest):
+            step_id = str(candidate.get("stepId") or "")
+            if step_id.startswith("register-04"):
+                row = candidate
+                break
+    if not row:
+        return {}
+    capture = {
+        "stepId": str(row.get("stepId") or ""),
+        "note": str(row.get("note") or ""),
+        "codePurpose": row.get("codePurpose"),
+        "code": row.get("code"),
+        "codeReceivedAt": row.get("codeReceivedAt"),
+        "resendRounds": row.get("resendRounds"),
+        "codeInputMode": row.get("codeInputMode"),
+        "codeInputCount": row.get("codeInputCount"),
+        "codeReadback": row.get("codeReadback"),
+        "codeReadbackMatches": row.get("codeReadbackMatches"),
+        "submitMethod": row.get("submitMethod"),
+        "chromeErrorRecovered": row.get("chromeErrorRecovered"),
+        "invalidHintText": row.get("invalidHintText"),
+    }
+    return {k: v for k, v in capture.items() if v not in (None, "")}
+
+
 def _extract_manifest_capture(manifest: list[dict]) -> dict:
     """从 manifest 结构化字段提取诊断采集（authUi / continueHit 等）。"""
     capture: dict = {}
@@ -392,6 +428,7 @@ def build_brief(email: str, request: Request | None = None) -> dict:
     last_html = _read_html(record_dir, str(last.get("html") or "")) if record_dir else ""
     visible_ui = _extract_visible_ui(last_html)
     manifest_capture = _extract_manifest_capture(manifest)
+    code_capture = _extract_manifest_code_capture(manifest)
     goto_retries = _extract_goto_retries(manifest)
     proxy = _proxy_from_abnormal(abnormal)
     if isinstance(manifest_capture.get("auth_ui"), dict):
@@ -454,6 +491,7 @@ def build_brief(email: str, request: Request | None = None) -> dict:
         "state_reason": str(last.get("reason") or ""),
         "manifest_tail": tail,
         "manifest_capture": manifest_capture,
+        "code_capture": code_capture,
         "goto_retries": goto_retries,
         "proxy": proxy,
         "visible_ui": visible_ui,
@@ -502,6 +540,7 @@ def build_brief_markdown(email: str = "", request: Request | None = None) -> str
 
     ui = brief.get("visible_ui") if isinstance(brief.get("visible_ui"), dict) else {}
     capture = brief.get("manifest_capture") if isinstance(brief.get("manifest_capture"), dict) else {}
+    code_capture = brief.get("code_capture") if isinstance(brief.get("code_capture"), dict) else {}
     goto_retries = brief.get("goto_retries") if isinstance(brief.get("goto_retries"), list) else []
     proxy = brief.get("proxy") if isinstance(brief.get("proxy"), dict) else {}
     logs = brief.get("logs_tail") if isinstance(brief.get("logs_tail"), list) else []
@@ -570,6 +609,35 @@ def build_brief_markdown(email: str = "", request: Request | None = None) -> str
         post_btns = [b.get("text") for b in post_ui.get("buttons", []) if isinstance(b, dict) and b.get("text")]
         if post_btns:
             lines.append(f"- 等待后按钮: {', '.join(f'`{b}`' for b in post_btns[:12])}")
+
+    if code_capture:
+        lines.extend(["", "## 邮箱验证码采集（manifest）", ""])
+        if code_capture.get("code"):
+            lines.append(f"- 验证码: `{code_capture.get('code')}`")
+        if code_capture.get("codeReceivedAt"):
+            lines.append(f"- 收件时间: `{code_capture.get('codeReceivedAt')}`")
+        if code_capture.get("codePurpose"):
+            lines.append(f"- 用途: `{code_capture.get('codePurpose')}`")
+        if code_capture.get("resendRounds") is not None:
+            lines.append(f"- 重发轮次: `{code_capture.get('resendRounds')}`")
+        if code_capture.get("codeInputMode"):
+            lines.append(
+                f"- 输入结构: `{code_capture.get('codeInputMode')}`"
+                f"（{code_capture.get('codeInputCount') or '—'} 格）"
+            )
+        if code_capture.get("codeReadback") is not None:
+            lines.append(
+                f"- 填回值: `{code_capture.get('codeReadback')}`"
+                f"（匹配: `{code_capture.get('codeReadbackMatches')}`）"
+            )
+        if code_capture.get("submitMethod"):
+            lines.append(f"- 提交方式: `{code_capture.get('submitMethod')}`")
+        if code_capture.get("chromeErrorRecovered") is not None:
+            lines.append(f"- chrome-error 恢复: `{code_capture.get('chromeErrorRecovered')}`")
+        if code_capture.get("invalidHintText"):
+            lines.append(f"- 页面错误提示: `{code_capture.get('invalidHintText')}`")
+        if code_capture.get("note"):
+            lines.append(f"- note: {code_capture.get('note')}")
 
     if goto_retries:
         lines.extend(["", "## 打开页面重试（manifest）", ""])

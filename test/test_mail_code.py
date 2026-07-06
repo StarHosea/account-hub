@@ -30,9 +30,13 @@ class MailCodeRoundTimeoutTests(unittest.TestCase):
         class _FakeProvider:
             conf = {}
 
-            def wait_for_code(self, mailbox, after_received_at=None):
+            def wait_for_code_detail(self, mailbox, after_received_at=None):
                 captured["wait_timeout"] = self.conf["wait_timeout"]
-                return "654321"
+                return {"code": "654321", "received_at": datetime(2026, 7, 1, 22, 45, 38)}
+
+            def wait_for_code(self, mailbox, after_received_at=None):
+                detail = self.wait_for_code_detail(mailbox, after_received_at=after_received_at)
+                return detail.get("code") if detail else None
 
             def close(self):
                 pass
@@ -50,11 +54,11 @@ class MailCodeRoundTimeoutTests(unittest.TestCase):
 
         try:
             mp._create_provider = _fake_create
-            code = mc.fulfill_need_code({"wait_timeout": 300}, {"address": "a@b.com"}, ts="2026-07-01T14:30:00Z")
+            code_result = mc.fulfill_need_code({"wait_timeout": 300}, {"address": "a@b.com"}, ts="2026-07-01T14:30:00Z")
         finally:
             mp._create_provider = original
 
-        self.assertEqual(code, "654321")
+        self.assertEqual(code_result, {"code": "654321", "received_at": "2026-07-01 22:45:38"})
         self.assertEqual(captured.get("wait_timeout"), 90.0)
 
 

@@ -270,15 +270,17 @@ class BaseMailProvider:
         message = self.fetch_latest_message(mailbox)
         return message.get("received_at") if message else None
 
-    def wait_for_code(self, mailbox: dict[str, Any], after_received_at: datetime | None = None) -> str | None:
-        """轮询取验证码，最长等待由 conf['wait_timeout'] 限定。
+    def wait_for_code_detail(
+        self, mailbox: dict[str, Any], after_received_at: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        """轮询取验证码及邮件到达时间，最长等待由 conf['wait_timeout'] 限定。
 
         after_received_at 给定时，只接受「到达时间严格晚于它」的邮件的验证码（即发码之后新到的邮件），
         避免抓到发码前残留在信箱里的旧码。按到达时间判断而非码值——OpenAI 有时会重发相同的码，
         码值相同不代表是旧码。到达时间无法解析时不接受，继续轮询直至超时或出现可判定的新邮件。
         """
 
-        def pick_fresh_code(message: dict[str, Any]) -> str | None:
+        def pick_fresh_message(message: dict[str, Any]) -> dict[str, Any] | None:
             code = _extract_code(message)
             if not code:
                 return None
@@ -286,9 +288,13 @@ class BaseMailProvider:
                 received = message.get("received_at")
                 if not _received_is_fresh(received, after_received_at):
                     return None
-            return code
+            return {"code": code, "received_at": message.get("received_at")}
 
-        return self.wait_for(mailbox, pick_fresh_code)
+        return self.wait_for(mailbox, pick_fresh_message)
+
+    def wait_for_code(self, mailbox: dict[str, Any], after_received_at: datetime | None = None) -> str | None:
+        detail = self.wait_for_code_detail(mailbox, after_received_at=after_received_at)
+        return str(detail.get("code") or "") if detail else None
 
 
 
@@ -525,6 +531,16 @@ def wait_for_code(mail_config: dict, mailbox: dict, after_received_at: datetime 
     provider = _create_provider(mail_config, str(mailbox.get("provider") or ""), str(mailbox.get("provider_ref") or ""))
     try:
         return provider.wait_for_code(mailbox, after_received_at=after_received_at)
+    finally:
+        provider.close()
+
+
+def wait_for_code_detail(
+    mail_config: dict, mailbox: dict, after_received_at: datetime | None = None,
+) -> dict[str, Any] | None:
+    provider = _create_provider(mail_config, str(mailbox.get("provider") or ""), str(mailbox.get("provider_ref") or ""))
+    try:
+        return provider.wait_for_code_detail(mailbox, after_received_at=after_received_at)
     finally:
         provider.close()
 

@@ -90,3 +90,38 @@ export async function hasInvalidCodeError(page) {
 export function textIndicatesInvalidCode(text) {
   return INVALID_CODE_PATTERN.test(String(text || ''));
 }
+
+/** 提取页面上可见的验证码错误提示文案（用于诊断审计）。 */
+export async function extractInvalidCodeHint(page) {
+  const patternSrc = INVALID_CODE_PATTERN.source;
+  return page.evaluate(({ patternSrc, codeSel }) => {
+    const re = new RegExp(patternSrc, 'i');
+    const vis = (el) => {
+      if (!el) return false;
+      const r = el.getBoundingClientRect();
+      const s = getComputedStyle(el);
+      return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+    };
+    const pick = (text) => {
+      const t = String(text || '').trim();
+      if (!t || !re.test(t)) return '';
+      const m = t.match(re);
+      return m ? m[0] : t;
+    };
+    for (const el of document.querySelectorAll('[role="alert"], [aria-live="assertive"], [aria-live="polite"]')) {
+      if (!vis(el)) continue;
+      const hint = pick(el.innerText || el.textContent || '');
+      if (hint) return hint;
+    }
+    const body = document.body?.innerText || '';
+    const lines = body.split('\n').map((ln) => ln.trim()).filter(Boolean);
+    for (const ln of lines) {
+      const hint = pick(ln);
+      if (hint) return hint;
+    }
+    for (const el of document.querySelectorAll(codeSel)) {
+      if (vis(el) && el.getAttribute('aria-invalid') === 'true') return 'aria-invalid';
+    }
+    return '';
+  }, { patternSrc, codeSel: CODE_FIELD_SELECTOR }).catch(() => '');
+}

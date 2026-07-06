@@ -76,7 +76,7 @@ export const BIRTHDAY_INPUT = [
 export const CONTINUE_TEXTS = [
   'continue', 'next', 'sign up', 'create account', 'agree', 'submit',
   '继续', '下一步', '注册', '创建账号', '同意', '提交',
-  '続ける', '次へ', '登録', '同意',
+  '続ける', '続行', '次へ', '登録', '同意',
 ];
 
 // 出现这些文案代表注册基本成功（进入 chatgpt 主界面）

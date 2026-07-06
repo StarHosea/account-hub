@@ -118,6 +118,11 @@ def _read_html(record_dir: Path, filename: str) -> str:
         return ""
 
 
+def _strip_html_text(raw: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", raw or "")
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def _extract_visible_ui(html: str) -> dict:
     if not html:
         return {"buttons": [], "inputs": [], "hints": [], "title": ""}
@@ -127,12 +132,12 @@ def _extract_visible_ui(html: str) -> dict:
 
     buttons: list[str] = []
     for pattern in (
-        r"<button[^>]*>([^<]{1,120})</button>",
-        r'<(?:a|div|span)[^>]*role=["\']button["\'][^>]*>([^<]{1,120})</(?:a|div|span)>',
+        r"<button[^>]*>([\s\S]{0,500}?)</button>",
+        r'<(?:a|div|span)[^>]*role=["\']button["\'][^>]*>([\s\S]{0,500}?)</(?:a|div|span)>',
         r'<input[^>]*type=["\'](?:submit|button)["\'][^>]*value=["\']([^"\']{1,120})',
     ):
         for m in re.finditer(pattern, html, re.I):
-            text = re.sub(r"\s+", " ", m.group(1)).strip()
+            text = _strip_html_text(m.group(1))
             if text and text not in buttons:
                 buttons.append(text)
             if len(buttons) >= 30:
@@ -178,6 +183,79 @@ def _extract_visible_ui(html: str) -> dict:
     }
 
 
+def _extract_manifest_capture(manifest: list[dict]) -> dict:
+    """从 manifest 结构化字段提取诊断采集（authUi / continueHit 等）。"""
+    capture: dict = {}
+    if not manifest:
+        return capture
+
+    by_step = {str(row.get("stepId") or ""): row for row in manifest}
+    for step_id, key in (
+        ("register-02-pre-continue", "pre_continue"),
+        ("register-02-after-continue", "after_continue"),
+        ("register-02-post-email", "post_email"),
+    ):
+        row = by_step.get(step_id)
+        if not isinstance(row, dict):
+            continue
+        capture[key] = {
+            "stepId": step_id,
+            "note": str(row.get("note") or ""),
+            "authSurface": row.get("authSurface"),
+            "continueHit": row.get("continueHit"),
+            "landing": row.get("landing"),
+            "authUi": row.get("authUi") if isinstance(row.get("authUi"), dict) else None,
+        }
+
+    # 兼容旧 manifest：从 note 字符串里补 continue/landing
+    for row in reversed(manifest):
+        note = str(row.get("note") or "")
+        if "continue=" in note and "continue_hit" not in capture:
+            m = re.search(r"continue=([^\s]+)", note)
+            if m:
+                capture["continue_hit"] = m.group(1)
+        if "landing=" in note and "landing" not in capture:
+            m = re.search(r"landing=([^\s]+)", note)
+            if m:
+                capture["landing"] = m.group(1)
+        if row.get("authUi") and "auth_ui" not in capture:
+            capture["auth_ui"] = row.get("authUi")
+        if row.get("authSurface") and "auth_surface" not in capture:
+            capture["auth_surface"] = row.get("authSurface")
+
+    return capture
+
+
+def _extract_goto_retries(manifest: list[dict]) -> list[dict]:
+    rows: list[dict] = []
+    for row in manifest:
+        step_id = str(row.get("stepId") or "")
+        if not step_id.startswith("register-00-goto-"):
+            continue
+        rows.append({
+            "stepId": step_id,
+            "note": str(row.get("note") or ""),
+            "url": str(row.get("url") or ""),
+            "attempt": row.get("attempt"),
+            "attempts": row.get("attempts"),
+        })
+    return rows
+
+
+def _proxy_from_abnormal(abnormal: dict | None) -> dict:
+    if not abnormal:
+        return {}
+    keys = (
+        "proxy_region",
+        "proxy_host",
+        "proxy_scheme",
+        "proxy_sid",
+        "exit_ip",
+        "proxy_mode",
+    )
+    return {key: abnormal.get(key) for key in keys if abnormal.get(key) not in (None, "")}
+
+
 def _register_logs_for_email(email: str, *, limit: int = 80) -> list[dict]:
     try:
         from services.register_service import register_service
@@ -218,6 +296,22 @@ def build_brief(email: str, request: Request | None = None) -> dict:
 
     last_html = _read_html(record_dir, str(last.get("html") or "")) if record_dir else ""
     visible_ui = _extract_visible_ui(last_html)
+    manifest_capture = _extract_manifest_capture(manifest)
+    goto_retries = _extract_goto_retries(manifest)
+    proxy = _proxy_from_abnormal(abnormal)
+    if isinstance(manifest_capture.get("auth_ui"), dict):
+        auth_ui = manifest_capture["auth_ui"]
+        if auth_ui.get("buttons") and not visible_ui.get("buttons"):
+            visible_ui["buttons"] = [
+                str(btn.get("text") or btn) if isinstance(btn, dict) else str(btn)
+                for btn in auth_ui.get("buttons", [])[:20]
+            ]
+        if auth_ui.get("inputs") and not visible_ui.get("inputs"):
+            visible_ui["inputs"] = [
+                f"{inp.get('type', 'text')}:{inp.get('label', '')}" if isinstance(inp, dict) else str(inp)
+                for inp in auth_ui.get("inputs", [])[:15]
+            ]
+        visible_ui["auth_surface"] = auth_ui.get("authSurface") or manifest_capture.get("auth_surface")
 
     screenshot_file = str(last.get("png") or "")
     screenshot_b64 = ""
@@ -249,6 +343,9 @@ def build_brief(email: str, request: Request | None = None) -> dict:
         "accountFacts": last.get("accountFacts"),
         "state_reason": str(last.get("reason") or ""),
         "manifest_tail": tail,
+        "manifest_capture": manifest_capture,
+        "goto_retries": goto_retries,
+        "proxy": proxy,
         "visible_ui": visible_ui,
         "logs_tail": _register_logs_for_email(email),
         "urls": _diag_urls(email, request),
@@ -294,6 +391,9 @@ def build_brief_markdown(email: str = "", request: Request | None = None) -> str
         return "\n".join(lines) + "\n"
 
     ui = brief.get("visible_ui") if isinstance(brief.get("visible_ui"), dict) else {}
+    capture = brief.get("manifest_capture") if isinstance(brief.get("manifest_capture"), dict) else {}
+    goto_retries = brief.get("goto_retries") if isinstance(brief.get("goto_retries"), list) else []
+    proxy = brief.get("proxy") if isinstance(brief.get("proxy"), dict) else {}
     logs = brief.get("logs_tail") if isinstance(brief.get("logs_tail"), list) else []
     tail = brief.get("manifest_tail") if isinstance(brief.get("manifest_tail"), list) else []
 
@@ -312,9 +412,22 @@ def build_brief_markdown(email: str = "", request: Request | None = None) -> str
         f"- 状态机说明: {brief.get('state_reason') or '—'}",
         f"- 账号事实: `{json.dumps(brief.get('accountFacts'), ensure_ascii=False) if brief.get('accountFacts') else '—'}`",
         "",
+    ]
+    if proxy:
+        lines.extend([
+            "## 代理 / 出口",
+            f"- 模式: `{proxy.get('proxy_mode') or '—'}`",
+            f"- 地区: `{proxy.get('proxy_region') or '—'}`",
+            f"- 主机: `{proxy.get('proxy_host') or '—'}`",
+            f"- 协议: `{proxy.get('proxy_scheme') or '—'}`",
+            f"- SID: `{proxy.get('proxy_sid') or '—'}`",
+            f"- 出口 IP: `{proxy.get('exit_ip') or '—'}`",
+            "",
+        ])
+    lines.extend([
         "## 可见 UI",
         f"- 标题: {ui.get('title') or '—'}",
-    ]
+    ])
     if ui.get("buttons"):
         lines.append(f"- 按钮: {', '.join(f'`{b}`' for b in ui['buttons'][:12])}")
     if ui.get("inputs"):
@@ -323,6 +436,38 @@ def build_brief_markdown(email: str = "", request: Request | None = None) -> str
         lines.append("- 错误/提示:")
         for hint in ui["hints"][:8]:
             lines.append(f"  - {hint}")
+
+    after = capture.get("after_continue") if isinstance(capture.get("after_continue"), dict) else {}
+    pre = capture.get("pre_continue") if isinstance(capture.get("pre_continue"), dict) else {}
+    post = capture.get("post_email") if isinstance(capture.get("post_email"), dict) else {}
+    if pre or after or post:
+        lines.extend(["", "## 邮箱提交采集（manifest）", ""])
+    if pre:
+        lines.append(f"- 点击前 authSurface: `{pre.get('authSurface') or '—'}`")
+        pre_ui = pre.get("authUi") if isinstance(pre.get("authUi"), dict) else {}
+        pre_btns = [b.get("text") for b in pre_ui.get("buttons", []) if isinstance(b, dict) and b.get("text")]
+        if pre_btns:
+            lines.append(f"- 点击前按钮: {', '.join(f'`{b}`' for b in pre_btns[:12])}")
+    if after:
+        lines.append(f"- continueHit: `{after.get('continueHit') or capture.get('continue_hit') or '—'}`")
+        after_ui = after.get("authUi") if isinstance(after.get("authUi"), dict) else {}
+        after_btns = [b.get("text") for b in after_ui.get("buttons", []) if isinstance(b, dict) and b.get("text")]
+        if after_btns:
+            lines.append(f"- 点击后按钮: {', '.join(f'`{b}`' for b in after_btns[:12])}")
+    if post:
+        lines.append(f"- landing: `{post.get('landing') or capture.get('landing') or '—'}`")
+        post_ui = post.get("authUi") if isinstance(post.get("authUi"), dict) else {}
+        post_btns = [b.get("text") for b in post_ui.get("buttons", []) if isinstance(b, dict) and b.get("text")]
+        if post_btns:
+            lines.append(f"- 等待后按钮: {', '.join(f'`{b}`' for b in post_btns[:12])}")
+
+    if goto_retries:
+        lines.extend(["", "## 打开页面重试（manifest）", ""])
+        for row in goto_retries:
+            lines.append(
+                f"- **{row.get('stepId')}** attempt={row.get('attempt')}/{row.get('attempts') or '—'} "
+                f"url={row.get('url') or '—'} note={row.get('note') or ''}"
+            )
 
     if tail:
         lines.extend(["", "## 最后几步（manifest）", ""])

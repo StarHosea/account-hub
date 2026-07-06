@@ -193,22 +193,110 @@ async function clickHomeSideAuthContinue(page, log) {
   if (await submit.isVisible({ timeout: 3000 }).catch(() => false)) {
     await submit.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
     await submit.click({ timeout: 5000 });
-    return '继续';
+    return 'side-panel-submit';
   }
   return humanClickByText(page, S.CONTINUE_TEXTS, { timeout: 8000, exclude: OAUTH_EXCLUDE, awaitPageLoad: true, log });
 }
 
-// 填邮箱并点继续；若在右侧面板内则限定在面板 scope 点击。
+async function isEmailInAuthDialog(emailInput) {
+  if (!emailInput) return false;
+  return emailInput.evaluate((el) => !!el.closest('[role="dialog"]')).catch(() => false);
+}
+
+// 采集当前可见的认证 UI（按钮含嵌套文案、输入框、所在容器），供诊断 brief 使用。
+async function collectAuthUiSnapshot(page) {
+  return page.evaluate((panelTestId) => {
+    const vis = (el) => {
+      if (!el) return false;
+      const r = el.getBoundingClientRect();
+      const s = getComputedStyle(el);
+      return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'
+        && el.getAttribute('aria-disabled') !== 'true' && !el.disabled;
+    };
+    const textOf = (el) => (el.innerText || el.value || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+    const scopeOf = (el) => {
+      if (el.closest('[role="dialog"]')) return 'dialog';
+      if (el.closest(`[data-testid="${panelTestId}"]`)) return 'side_panel';
+      return 'page';
+    };
+
+    const buttons = [];
+    for (const el of document.querySelectorAll('button, a, [role="button"], input[type="submit"], input[type="button"]')) {
+      if (!vis(el)) continue;
+      const text = textOf(el);
+      if (!text || text.length > 120) continue;
+      buttons.push({
+        text,
+        tag: el.tagName.toLowerCase(),
+        type: (el.getAttribute('type') || '').toLowerCase(),
+        scope: scopeOf(el),
+      });
+      if (buttons.length >= 30) break;
+    }
+
+    const inputs = [];
+    for (const el of document.querySelectorAll('input, textarea')) {
+      if (!vis(el)) continue;
+      inputs.push({
+        type: (el.getAttribute('type') || 'text').toLowerCase(),
+        label: el.getAttribute('placeholder') || el.getAttribute('aria-label') || el.name || '',
+        valueLen: String(el.value || '').length,
+        scope: scopeOf(el),
+      });
+      if (inputs.length >= 20) break;
+    }
+
+    let authSurface = 'unknown';
+    const dialog = document.querySelector('[role="dialog"]');
+    const panel = document.querySelector(`[data-testid="${panelTestId}"]`);
+    if (dialog && vis(dialog)) authSurface = 'dialog';
+    else if (panel && vis(panel)) authSurface = 'side_panel';
+    else if (inputs.some((i) => i.scope !== 'page') || buttons.some((b) => b.scope !== 'page')) authSurface = 'embedded';
+
+    return { authSurface, buttons, inputs };
+  }, S.NO_AUTH_RIGHT_LOGIN_PANEL_TESTID).catch(() => ({ authSurface: 'unknown', buttons: [], inputs: [], error: 'eval_failed' }));
+}
+
+async function clickAuthDialogContinue(page, log) {
+  await waitForPageFullyLoaded(page, { log });
+  const submit = page.locator('[role=dialog] button[type="submit"]').first();
+  if (await submit.isVisible({ timeout: 3000 }).catch(() => false)) {
+    await submit.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
+    await submit.click({ timeout: 5000 });
+    return 'dialog-submit';
+  }
+  return humanClickByText(page, S.CONTINUE_TEXTS, { timeout: 8000, exclude: OAUTH_EXCLUDE, awaitPageLoad: true, log });
+}
+
+// 填邮箱并点继续；右侧面板 / 中央弹窗分别限定 scope 点击。
+// 返回 { hit, authSurface, preUi, postUi } 供诊断采集。
 async function fillAuthEmailAndContinue(page, emailInput, email, log) {
   await humanType(emailInput, email);
   log(`正在填写邮箱：${email}`);
   const inSidePanel = await isEmailInHomeSideAuthPanel(emailInput);
+  const inDialog = await isEmailInAuthDialog(emailInput);
+  const authSurface = inSidePanel ? 'side_panel' : inDialog ? 'dialog' : 'auth_page';
+  const preUi = await collectAuthUiSnapshot(page);
+
+  let hit;
   if (inSidePanel) {
     log('右侧登录/注册面板：点击「继续」…');
-    await clickHomeSideAuthContinue(page, log);
+    hit = await clickHomeSideAuthContinue(page, log);
+  } else if (inDialog) {
+    log('登录/注册弹窗：点击「继续」…');
+    hit = await clickAuthDialogContinue(page, log);
   } else {
-    await humanClickByText(page, S.CONTINUE_TEXTS, { timeout: 12000, exclude: OAUTH_EXCLUDE, awaitPageLoad: true, log });
+    hit = await humanClickByText(page, S.CONTINUE_TEXTS, { timeout: 12000, exclude: OAUTH_EXCLUDE, awaitPageLoad: true, log });
   }
+  if (!hit) {
+    log('邮箱提交 · 「继续」未命中，尝试弹窗/面板 submit 兜底', 'warn');
+    hit = await clickAuthDialogContinue(page, log)
+      || await clickHomeSideAuthContinue(page, log);
+  }
+  const postUi = await collectAuthUiSnapshot(page);
+  if (!hit) log('邮箱提交 · 「继续」点击失败', 'warn');
+  else log(`邮箱提交 · 已点击「${hit}」`);
+  return { hit, authSurface, preUi, postUi };
 }
 
 // 优先取弹窗内的邮箱框（新版首页注册弹窗把 input 放在 role=dialog 里）。
@@ -426,7 +514,8 @@ async function snapshot(page, tag, log) {
 }
 
 // 打开页面（住宅代理慢/抖动时重试）。先等 commit（首字节），再等 body 出现。
-async function openWithRetry(page, url, log, { attempts = 3 } = {}) {
+async function openWithRetry(page, url, log, { attempts = 3, recorder = NOOP_RECORDER } = {}) {
+  const mark = (id, meta) => recorder.record(id, typeof meta === 'string' ? { note: meta } : meta).catch(() => {});
   let lastErr;
   for (let i = 1; i <= attempts; i += 1) {
     try {
@@ -441,10 +530,19 @@ async function openWithRetry(page, url, log, { attempts = 3 } = {}) {
         log(`已打开页面（第 ${i} 次），标题：${await page.title().catch(() => '')}`);
         return true;
       }
+      const thinUrl = await page.url().catch(() => url);
       log(`页面内容过少，第 ${i} 次重新打开`);
+      await mark(`register-00-goto-thin-${i}`, { note: '页面内容过少', url: thinUrl, attempt: i, attempts });
     } catch (err) {
       lastErr = err;
+      const failUrl = await page.url().catch(() => url);
       log(`打开页面失败（第 ${i}/${attempts} 次）：${err?.message || err}`);
+      await mark(`register-00-goto-fail-${i}`, {
+        note: String(err?.message || err),
+        url: failUrl,
+        attempt: i,
+        attempts,
+      });
       await sleep(2500);
     }
   }
@@ -633,7 +731,7 @@ async function clickButtonRobust(page, textRe, { timeout = 10000, tries = 3, rel
 async function forgotPasswordFlow({ page, email, requestCode, log, recorder = NOOP_RECORDER }) {
   const newPassword = generatePassword();
   log(`重设密码 · 已生成新密码：${newPassword}`);
-  const mark = (id, note) => recorder.record(id, { note }).catch(() => {});
+  const mark = (id, meta) => recorder.record(id, typeof meta === 'string' ? { note: meta } : meta).catch(() => {});
   // 1) 点"忘记了密码？"
   const moved1 = await clickButtonRobust(page, /忘记了密码|忘记密码|forgot/i, { timeout: 8000, log });
   log(`重设密码 · 点击忘记密码，${moved1 ? '页面已跳转' : '页面未变化'}`);
@@ -797,7 +895,7 @@ async function waitForLoginPasswordOutcome(page, beforeUrl, { timeoutMs = 8000, 
 // 老账号登录（OTP 收码登录）。验证码通过 requestCode('login') 向 Python 请求。
 // totpSecret：若账号已开 2FA，登录后会要求验证器码，传入 secret 则自动生成 TOTP 填入。
 export async function loginChatGPT({ page, email, chatgptUrl = 'https://chatgpt.com/', password = '', totpSecret = '', requestCode, log, recorder = NOOP_RECORDER }) {
-  const mark = (id, note) => recorder.record(id, { note }).catch(() => {});
+  const mark = (id, meta) => recorder.record(id, typeof meta === 'string' ? { note: meta } : meta).catch(() => {});
   let landing = null;
 
   // 快路径：若调用前页面已停在 auth 登录密码页（注册流程检测到"邮箱已注册"后直接转来），
@@ -813,7 +911,7 @@ export async function loginChatGPT({ page, email, chatgptUrl = 'https://chatgpt.
 
   if (landing === null) {
     log('登录 · 打开 ChatGPT 官网');
-    await openWithRetry(page, chatgptUrl, log);
+    await openWithRetry(page, chatgptUrl, log, { recorder });
     await sleep(2500);
 
     if (isLoggedInUrl(page.url())) {
@@ -1216,10 +1314,10 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
   log(`已生成注册密码：${password}`);
   const { firstName, lastName } = generateRandomName();
   const birthday = generateRandomBirthday();
-  const mark = (id, note) => recorder.record(id, { note }).catch(() => {});
+  const mark = (id, meta) => recorder.record(id, typeof meta === 'string' ? { note: meta } : meta).catch(() => {});
 
   log('注册 · 打开 ChatGPT 官网');
-  await openWithRetry(page, chatgptUrl, log);
+  await openWithRetry(page, chatgptUrl, log, { recorder });
   await waitForHomeReady(page);
   await mark('register-01-home', '已打开官网');
 
@@ -1279,11 +1377,29 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
     throw new Error('未找到邮箱输入框');
   }
 
-  await fillAuthEmailAndContinue(page, emailInput, email, log);
+  const emailSubmit = await fillAuthEmailAndContinue(page, emailInput, email, log);
+  await mark('register-02-pre-continue', {
+    note: `authSurface=${emailSubmit.authSurface}`,
+    authSurface: emailSubmit.authSurface,
+    authUi: emailSubmit.preUi,
+  });
+  await mark('register-02-after-continue', {
+    note: `continue=${emailSubmit.hit || 'miss'} authSurface=${emailSubmit.authSurface}`,
+    continueHit: emailSubmit.hit || null,
+    authSurface: emailSubmit.authSurface,
+    authUi: emailSubmit.postUi,
+  });
   log('注册 · 已提交邮箱，等待页面跳转');
 
   const landing = await waitForPostEmailLanding(page, log, { timeoutMs: 120000 });
-  await mark('register-02-post-email', `邮箱提交后 landing=${landing}`);
+  const postEmailUi = await collectAuthUiSnapshot(page);
+  await mark('register-02-post-email', {
+    note: `landing=${landing} continue=${emailSubmit.hit || 'miss'}`,
+    landing,
+    continueHit: emailSubmit.hit || null,
+    authSurface: emailSubmit.authSurface,
+    authUi: postEmailUi,
+  });
 
   // 邮箱已存在检测：不再抛错，返回标记让 worker 走"老账号"分流
   const afterEmailText = await pageText(page);
@@ -1997,7 +2113,7 @@ async function hasExistingPassword(page) {
 }
 
 async function step8_setupPasswordAnd2FA(page, { email, password, enable2fa = true, forceReset2fa = false, existingTotpSecret = '', requestCode, log, recorder = NOOP_RECORDER }) {
-  const mark = (id, note) => recorder.record(id, { note }).catch(() => {});
+  const mark = (id, meta) => recorder.record(id, typeof meta === 'string' ? { note: meta } : meta).catch(() => {});
   // passwordChanged=true 仅当本次「确实设置/更改了密码」；检测到已存在而跳过时保持 false，
   // 供 secureExistingChatGPT 判断该存"新密码"还是"沿用登录用的原密码"。
   const out = { passwordSet: false, passwordChanged: false, password, twoFactorSecret: '', twoFactorUri: '', recoveryCodes: [], twoFactorSet: false, observed: {} };

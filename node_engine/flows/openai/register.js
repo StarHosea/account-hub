@@ -42,9 +42,64 @@ async function waitForDomReady(page, { timeoutMs = 20000 } = {}) {
 
 /** 表单提交前等待 DOM 就绪；超时 60s 则刷新后重试。 */
 const FORM_SUBMIT_PAGE_LOAD_MS = 60000;
+const CLOUDFLARE_CLEAR_MS = 90000;
+
+/** 判定当前是否为 Cloudflare Turnstile 挑战页（URL 可能已是 auth.openai.com 真实路径）。 */
+async function isCloudflareChallengePage(page) {
+  return page.evaluate(() => {
+    const text = document.body?.innerText || '';
+    const title = document.title || '';
+    const hasCfWidget = !!document.querySelector(
+      'input[name="cf-turnstile-response"], [id^="cf-chl-widget"], script[src*="challenges.cloudflare.com"], script[src*="cdn-cgi/challenge-platform"]',
+    );
+    const hasCfOpt = typeof window._cf_chl_opt === 'object';
+    const cfTitle = /しばらくお待ち|just a moment|checking your browser|please wait/i.test(title);
+    const cfBody = /セキュリティ検証|security verification|cloudflare|challenge-platform|enable javascript and cookies/i.test(text);
+    const hasRealAuth = !!document.querySelector(
+      'link[href*="auth-cdn.oaistatic.com"], form[data-discover="true"], form[action*="/reset-password"], form[action*="/log-in"]',
+    );
+    if ((hasCfWidget || hasCfOpt) && (!hasRealAuth || cfTitle || cfBody)) return true;
+    if (cfTitle && !hasRealAuth) return true;
+    return false;
+  }).catch(() => false);
+}
+
+/** 等待 Cloudflare 挑战结束；卡住时 reload 一次。返回是否已离开挑战页。 */
+async function waitForCloudflareClear(page, { timeoutMs = CLOUDFLARE_CLEAR_MS, log, onWait } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  let logged = false;
+  let reloaded = false;
+  while (Date.now() < deadline) {
+    if (!(await isCloudflareChallengePage(page))) return true;
+    if (!logged) {
+      log?.('Cloudflare 验证页，等待通过…', 'warn');
+      onWait?.('cloudflare-wait');
+      logged = true;
+    }
+    const stuck = await page.evaluate(() => {
+      const t = document.body?.innerText || '';
+      return /応答を待っています|waiting for.*response/i.test(t);
+    }).catch(() => false);
+    if (stuck && !reloaded && Date.now() > deadline - timeoutMs + 45000) {
+      log?.('Cloudflare 验证后无跳转，刷新页面', 'warn');
+      onWait?.('cloudflare-reload');
+      await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+      await sleep(2000);
+      reloaded = true;
+      continue;
+    }
+    await sleep(1500);
+  }
+  log?.('Cloudflare 验证等待超时', 'warn');
+  onWait?.('cloudflare-timeout');
+  return !(await isCloudflareChallengePage(page));
+}
 
 async function waitForPageFullyLoaded(page, { timeoutMs = FORM_SUBMIT_PAGE_LOAD_MS, log } = {}) {
-  if (await waitForDomReady(page, { timeoutMs })) return;
+  if (await waitForDomReady(page, { timeoutMs })) {
+    await waitForCloudflareClear(page, { timeoutMs: Math.min(CLOUDFLARE_CLEAR_MS, timeoutMs), log });
+    return;
+  }
 
   log?.(`页面 DOM 加载超过 ${Math.round(timeoutMs / 1000)}s，刷新浏览器`, 'warn');
   await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
@@ -52,6 +107,7 @@ async function waitForPageFullyLoaded(page, { timeoutMs = FORM_SUBMIT_PAGE_LOAD_
   if (!(await waitForDomReady(page, { timeoutMs: Math.min(timeoutMs, 20000) }))) {
     log?.('刷新后页面仍未完全加载，继续尝试提交', 'warn');
   }
+  await waitForCloudflareClear(page, { timeoutMs: Math.min(CLOUDFLARE_CLEAR_MS, timeoutMs), log });
 }
 
 // 在按钮/链接里按文案找可点击元素，然后用 Playwright 真实（humanize）点击。
@@ -801,6 +857,10 @@ async function forgotPasswordFlow({ page, email, requestCode, log, recorder = NO
   log(`重设密码 · 点击忘记密码，${moved1 ? '页面已跳转' : '页面未变化'}`);
   await mark('forgot-01-click', { note: moved1 ? 'forgot-link-moved' : 'forgot-link-no-move', url: page.url() });
   await sleep(2000);
+  await waitForCloudflareClear(page, {
+    log,
+    onWait: (note) => mark('forgot-01-cf', { note, url: page.url() }),
+  });
   if (await clickRetryIfError(page, log)) {
     await mark('forgot-01-retry', { note: 'reset-password 错误页已点重试', url: page.url() });
     await sleep(2000);
@@ -826,9 +886,14 @@ async function forgotPasswordFlow({ page, email, requestCode, log, recorder = NO
       await throwIfRateLimited(page, log);
       await sleep(2500);
     }
+    await waitForCloudflareClear(page, {
+      log,
+      onWait: (note) => mark('forgot-02-cf', { note, url: page.url() }),
+    });
     const codeVisible = await firstVisible(page, `${S.CODE_INPUT}, ${S.CODE_INPUT_SEGMENTED}`, { timeout: 3000 }).catch(() => null);
+    const stillCf = await isCloudflareChallengePage(page);
     await mark('forgot-02-continue', {
-      note: codeVisible ? 'continue-code-visible' : (moved2 ? 'continue-moved' : 'continue-no-move'),
+      note: stillCf ? 'continue-cloudflare' : (codeVisible ? 'continue-code-visible' : (moved2 ? 'continue-moved' : 'continue-no-move')),
       url: page.url(),
     });
     await snapshot(page, 'forgot-02-after-continue', log);
@@ -837,6 +902,10 @@ async function forgotPasswordFlow({ page, email, requestCode, log, recorder = NO
   }
 
   // 3) 收码页 → 向 Python 请求重置码填码
+  await waitForCloudflareClear(page, {
+    log,
+    onWait: (note) => mark('forgot-03-cf', { note, url: page.url() }),
+  });
   const codeReady = await firstVisible(page, `${S.CODE_INPUT}, ${S.CODE_INPUT_SEGMENTED}`, { timeout: 40000 });
   if (codeReady) {
     await mark('forgot-03-pre-code', { note: '收码框已出现', url: page.url() });
@@ -2091,6 +2160,8 @@ export const __test = {
   fillCode,
   isChromeErrorUrl,
   recoverFromChromeError,
+  isCloudflareChallengePage,
+  waitForCloudflareClear,
   submitCodeForm,
   requestCodeWithResend,
   clickResendVerificationCode,

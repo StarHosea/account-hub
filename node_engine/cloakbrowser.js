@@ -125,6 +125,9 @@ export async function launchSession(proxyUrl, { headless = false, fingerprintSee
       if (proxyUrl) opts.proxy = proxyUrl;
       const context = await launchContext(opts);
       if (resolvedLocale) await applyNavigatorLocale(context, resolvedLocale);
+      if (resolvedAcceptLanguage) {
+        await context.setExtraHTTPHeaders({ 'Accept-Language': resolvedAcceptLanguage });
+      }
       const browser = context.browser();
       const localeNote = resolvedLocale || (proxyUrl ? 'geoip 自动' : 'en-US');
       const tzNote = resolvedTimezone ? `，tz=${resolvedTimezone}` : '';

@@ -16,11 +16,16 @@ from services.register_diag_service import (  # noqa: E402
     _extract_goto_retries,
     _extract_manifest_capture,
     _extract_manifest_code_capture,
+    _extract_manifest_second_code_capture,
     _extract_visible_ui,
     _load_manifest,
     _proxy_from_abnormal,
+    _safe_recording_filename,
     build_brief,
     find_recording_dir,
+    read_recording_html,
+    recording_asset_path,
+    rewrite_recording_html,
 )
 from services.register_service import _normalize  # noqa: E402
 
@@ -105,6 +110,7 @@ class RegisterDiagServiceTest(unittest.TestCase):
                 "stepId": "register-04-code-filled",
                 "note": "注册验证码已填 code=111111",
                 "code": "111111",
+                "codeNeedAt": "2026-07-01T14:30:00.000Z",
                 "codeReceivedAt": "2026-07-01 22:45:38",
                 "codeInputMode": "single",
                 "codeReadbackMatches": True,
@@ -113,6 +119,7 @@ class RegisterDiagServiceTest(unittest.TestCase):
                 "stepId": "register-04-code-invalid",
                 "note": "验证码无效 hint=不正確なコード",
                 "code": "111111",
+                "codeNeedAt": "2026-07-01T14:30:00.000Z",
                 "codeReceivedAt": "2026-07-01 22:45:38",
                 "invalidHintText": "不正確なコード",
             },
@@ -121,8 +128,35 @@ class RegisterDiagServiceTest(unittest.TestCase):
         capture = _extract_manifest_code_capture(manifest)
         self.assertEqual(capture["stepId"], "register-04-code-invalid")
         self.assertEqual(capture["code"], "111111")
+        self.assertEqual(capture["codeNeedAt"], "2026-07-01T14:30:00.000Z")
         self.assertEqual(capture["codeReceivedAt"], "2026-07-01 22:45:38")
         self.assertEqual(capture["invalidHintText"], "不正確なコード")
+
+    def test_extract_manifest_second_code_capture_prefers_invalid_step(self):
+        manifest = [
+            {
+                "stepId": "register-05b-second-code-1",
+                "code": "222222",
+                "codeNeedAt": "2026-07-01T15:00:00.000Z",
+                "codeReceivedAt": "2026-07-01 23:00:01",
+                "round": 1,
+                "codeReadbackMatches": True,
+            },
+            {
+                "stepId": "register-05b-second-code-invalid-1",
+                "code": "222222",
+                "codeNeedAt": "2026-07-01T15:00:00.000Z",
+                "codeReceivedAt": "2026-07-01 23:00:01",
+                "round": 1,
+                "invalidHintText": "不正確なコード",
+            },
+            {"stepId": "final-error-scene", "note": "二次验证码无效"},
+        ]
+        capture = _extract_manifest_second_code_capture(manifest)
+        self.assertEqual(capture["stepId"], "register-05b-second-code-invalid-1")
+        self.assertEqual(capture["code"], "222222")
+        self.assertEqual(capture["round"], 1)
+        self.assertEqual(capture["codeNeedAt"], "2026-07-01T15:00:00.000Z")
 
     def test_extract_goto_retries(self):
         manifest = [
@@ -294,6 +328,42 @@ class RegisterDiagServiceTest(unittest.TestCase):
             )
             rows = _load_manifest(record_dir)
             self.assertEqual([row["stepId"] for row in rows], ["s1", "s2"])
+
+    def test_safe_recording_filename_rejects_traversal(self):
+        self.assertEqual(_safe_recording_filename("004-register-02-after-continue.html"), "004-register-02-after-continue.html")
+        self.assertIsNone(_safe_recording_filename("../secret.html"))
+        self.assertIsNone(_safe_recording_filename("004-evil.exe"))
+
+    def test_rewrite_recording_html_rewrites_assets(self):
+        body = (
+            '<script>const M=[{"html":"004-register-02-after-continue.html",'
+            '"png":"004-register-02-after-continue.png"}];</script>'
+        )
+        out = rewrite_recording_html(body, "a@b.com")
+        self.assertIn("/api/register/diag/asset?email=a%40b.com&file=004-register-02-after-continue.html", out)
+        self.assertIn("/api/register/diag/asset?email=a%40b.com&file=004-register-02-after-continue.png", out)
+
+    def test_read_recording_html_and_asset_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            record_dir = Path(tmp)
+            (record_dir / "recording.html").write_text(
+                '<script>const M=[{"html":"001-register-start.html","png":"001-register-start.png"}];</script>',
+                encoding="utf-8",
+            )
+            (record_dir / "001-register-start.html").write_text("<html><body>ok</body></html>", encoding="utf-8")
+            (record_dir / "001-register-start.png").write_bytes(b"png")
+
+            abnormal = mock.Mock()
+            abnormal.list_items.return_value = [{
+                "email": "a@b.com",
+                "recording_path": str(record_dir),
+            }]
+            with mock.patch("services.register_diag_service.register_abnormal_service", abnormal):
+                html = read_recording_html("a@b.com")
+                asset = recording_asset_path("a@b.com", "001-register-start.html")
+
+            self.assertIn("/api/register/diag/asset?email=a%40b.com&file=001-register-start.html", html or "")
+            self.assertEqual(asset, record_dir / "001-register-start.html")
 
 
 if __name__ == "__main__":

@@ -451,8 +451,8 @@ const CODE_POLL_MAX_ROUNDS = 4;
 
 const RESEND_CODE_TEXTS = [
   '重新发送电子邮件', '重新发送', '重新发送邮件', '重新发送验证码',
-  'resend email', 'resend', '再送信', 'メールを再送信',
-  'resend email', 'resend', 'send again', "didn't get", '未收到',
+  'resend email', 'resend', '再送信', 'メールを再送信する', 'メールを再送信',
+  'send again', "didn't get", '未收到',
 ];
 
 /** 在收码页点击「重新发送」类按钮。 */
@@ -467,8 +467,9 @@ async function clickResendVerificationCode(page, log) {
  * 向 Python 请求验证码；单轮超时（约 90s）未收到则在页面上点「重新发送」再开下一轮。
  * 最多 CODE_POLL_MAX_ROUNDS 轮，覆盖注册/登录/2FA/设密码等所有收码步骤。
  */
-async function requestCodeWithResend(page, requestCode, log, { purpose = 'register', maxRounds = CODE_POLL_MAX_ROUNDS } = {}) {
+async function requestCodeWithResend(page, requestCode, log, { purpose = 'register', maxRounds = CODE_POLL_MAX_ROUNDS, needCodeOptions = {} } = {}) {
   if (typeof requestCode !== 'function') throw new Error('requestCode 未注入');
+  const codeOptions = needCodeOptions && typeof needCodeOptions === 'object' ? needCodeOptions : {};
   let lastErr = null;
   for (let round = 1; round <= maxRounds; round += 1) {
     if (round > 1) {
@@ -477,10 +478,17 @@ async function requestCodeWithResend(page, requestCode, log, { purpose = 'regist
       await sleep(2500);
     }
     try {
-      const raw = await requestCode(purpose);
+      const raw = await requestCode(purpose, codeOptions);
       const code = typeof raw === 'string' ? raw : String(raw?.code || '');
       const receivedAt = typeof raw === 'object' && raw ? (raw.receivedAt || raw.received_at || '') : '';
-      return { code, receivedAt: receivedAt || null, purpose, resendRounds: round - 1 };
+      const needCodeAt = typeof raw === 'object' && raw ? (raw.needCodeAt || raw.need_code_at || '') : '';
+      return {
+        code,
+        receivedAt: receivedAt || null,
+        needCodeAt: needCodeAt || null,
+        purpose,
+        resendRounds: round - 1,
+      };
     } catch (e) {
       lastErr = e;
       if (round >= maxRounds) break;
@@ -489,9 +497,22 @@ async function requestCodeWithResend(page, requestCode, log, { purpose = 'regist
   throw lastErr || new Error(`已重新发送 ${maxRounds - 1} 次，仍未收到验证码`);
 }
 
-function buildCodeAuditNote(meta = {}) {
-  const parts = ['注册验证码已填'];
+function buildCodeAuditFromResult(codeResult, fillAudit, extra = {}) {
+  return {
+    codePurpose: codeResult.purpose,
+    code: codeResult.code,
+    codeNeedAt: codeResult.needCodeAt || '',
+    codeReceivedAt: codeResult.receivedAt || '',
+    resendRounds: codeResult.resendRounds,
+    ...fillAudit,
+    ...extra,
+  };
+}
+
+function buildCodeAuditNote(meta = {}, { label = '注册验证码已填' } = {}) {
+  const parts = [label];
   if (meta.code) parts.push(`code=${meta.code}`);
+  if (meta.codeNeedAt) parts.push(`needAt=${meta.codeNeedAt}`);
   if (meta.codeReceivedAt) parts.push(`receivedAt=${meta.codeReceivedAt}`);
   if (meta.codeInputMode) parts.push(`input=${meta.codeInputMode}`);
   if (meta.codeReadbackMatches === false) parts.push('readbackMismatch');
@@ -1511,7 +1532,14 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
     throw new Error('点击继续后未跳转到验证码输入页（可能仍在 loading 或出现异常）');
   }
   log('注册 · 开始填写邮箱验证码');
-  const codeResult = await requestCodeWithResend(page, requestCode, log, { purpose: 'register' });
+  // 经密码页时，邮箱提交后可能已发过一封验证码；密码提交后 OpenAI 会换码，须重发并忽略信箱里旧邮件。
+  const needCodeOptions = landing === 'password' ? { use_mailbox_baseline: true } : {};
+  if (landing === 'password') {
+    log('注册 · 路径经密码页，先重新发送验证码以免误用密码页之前的旧码');
+    await clickResendVerificationCode(page, log);
+    await sleep(3000);
+  }
+  const codeResult = await requestCodeWithResend(page, requestCode, log, { purpose: 'register', needCodeOptions });
   const fillAudit = await fillCode(page, codeResult.code, log);
   const submitHit = await humanClickByText(page, S.CONTINUE_TEXTS, { timeout: 10000, exclude: OAUTH_EXCLUDE, awaitPageLoad: true, log });
   await sleep(3000);
@@ -1524,15 +1552,10 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
     await submitCodeForm(page, log, { code: codeResult.code });
     await sleep(3000);
   }
-  const codeAudit = {
-    codePurpose: codeResult.purpose,
-    code: codeResult.code,
-    codeReceivedAt: codeResult.receivedAt || '',
-    resendRounds: codeResult.resendRounds,
-    ...fillAudit,
+  const codeAudit = buildCodeAuditFromResult(codeResult, fillAudit, {
     submitMethod: submitHit ? `continue:${submitHit}` : 'continue-miss',
     chromeErrorRecovered,
-  };
+  });
   await mark('register-04-code-filled', { note: buildCodeAuditNote(codeAudit), ...codeAudit });
 
   if (!isChromeErrorUrl(page.url()) && await detectInvalidCode(page)) {
@@ -1583,14 +1606,26 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
     const onCodePage = await isOnCodePage(page);
     if (!onCodePage) break;
     log(`注册 · 需要再次验证邮箱，第 ${round} 次`);
-    await mark(`register-05b-second-code-${round}`, `round=${round} url=${page.url()}`);
     await humanClickByText(page, RESEND_CODE_TEXTS, { timeout: 6000, exclude: OAUTH_EXCLUDE }).catch(() => {});
     const code2Result = await requestCodeWithResend(page, requestCode, log, { purpose: 'register' });
-    const code2 = code2Result.code;
-    await fillCode(page, code2, log);
-    await submitCodeForm(page, log, { code: code2 });
+    const fillAudit2 = await fillCode(page, code2Result.code, log);
+    await submitCodeForm(page, log, { code: code2Result.code });
+    const code2Audit = buildCodeAuditFromResult(code2Result, fillAudit2, {
+      submitMethod: 'form-submit',
+      round,
+    });
+    await mark(`register-05b-second-code-${round}`, {
+      note: buildCodeAuditNote(code2Audit, { label: `二次邮箱验证码已填 round=${round}` }),
+      ...code2Audit,
+    });
     await sleep(4000);
     if (!isChromeErrorUrl(page.url()) && await isOnCodePage(page) && await detectInvalidCode(page)) {
+      const invalidHintText = await extractInvalidCodeHint(page);
+      await mark(`register-05b-second-code-invalid-${round}`, {
+        note: `二次验证码无效 round=${round} hint=${invalidHintText || '-'}`,
+        ...code2Audit,
+        invalidHintText: invalidHintText || '',
+      });
       throw new Error('二次验证码无效');
     }
   }

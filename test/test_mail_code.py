@@ -24,6 +24,50 @@ class MailCodeRoundTimeoutTests(unittest.TestCase):
     def test_round_timeout_default(self) -> None:
         self.assertEqual(mc.ROUND_WAIT_TIMEOUT, 90.0)
 
+    def test_merge_after_received_at_uses_later_baseline(self) -> None:
+        cutoff = datetime(2026, 7, 6, 21, 6, 0)
+        baseline = datetime(2026, 7, 6, 21, 5, 52)
+        merged = mc._merge_after_received_at(
+            cutoff,
+            use_mailbox_baseline=True,
+            mail_config={},
+            mailbox={"address": "a@b.com"},
+        )
+        self.assertEqual(merged, cutoff)
+
+        import services.register.mail_provider as mp
+
+        original = mp.peek_received_at
+
+        def _fake_peek(_conf, _mailbox):
+            return baseline
+
+        try:
+            mp.peek_received_at = _fake_peek
+            merged = mc._merge_after_received_at(
+                cutoff,
+                use_mailbox_baseline=True,
+                mail_config={},
+                mailbox={"address": "a@b.com"},
+            )
+        finally:
+            mp.peek_received_at = original
+
+        self.assertEqual(merged, cutoff)
+
+        try:
+            mp.peek_received_at = lambda _conf, _mailbox: datetime(2026, 7, 6, 21, 6, 5)
+            merged = mc._merge_after_received_at(
+                cutoff,
+                use_mailbox_baseline=True,
+                mail_config={},
+                mailbox={"address": "a@b.com"},
+            )
+        finally:
+            mp.peek_received_at = original
+
+        self.assertEqual(merged, datetime(2026, 7, 6, 21, 6, 5))
+
     def test_fulfill_uses_round_timeout(self) -> None:
         captured: dict = {}
 

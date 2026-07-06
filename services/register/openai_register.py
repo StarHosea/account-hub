@@ -793,6 +793,7 @@ def _run_browser_job(
                 code_result = mail_code.fulfill_need_code(
                     _mail_config(), mailbox, ts=evt.get("ts"), purpose=purpose,
                     round_timeout=round_timeout,
+                    use_mailbox_baseline=bool(evt.get("use_mailbox_baseline")),
                 )
                 code = (code_result or {}).get("code") if code_result else None
                 received_at = (code_result or {}).get("received_at") if code_result else None

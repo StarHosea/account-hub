@@ -17,7 +17,8 @@ from services.register_diag_service import (
     delete_recordings_for_emails,
     diag_meta,
     list_diag_entries,
-    recording_html_path,
+    read_recording_html,
+    recording_asset_path,
     screenshot_path,
     trace_zip_path,
 )
@@ -231,11 +232,19 @@ def create_router() -> APIRouter:
         )
 
     @router.get("/api/register/diag/recording")
-    async def register_diag_recording(email: str = Query(...)):
-        path = recording_html_path(email)
-        if not path:
+    async def register_diag_recording(request: Request, email: str = Query(...)):
+        body = read_recording_html(email, request)
+        if not body:
             return Response("recording.html 不存在", status_code=404, media_type="text/plain; charset=utf-8")
-        return FileResponse(path, media_type="text/html; charset=utf-8")
+        return Response(body, media_type="text/html; charset=utf-8")
+
+    @router.get("/api/register/diag/asset")
+    async def register_diag_asset(email: str = Query(...), file: str = Query(...)):
+        path = recording_asset_path(email, file)
+        if not path:
+            return Response("资源不存在", status_code=404, media_type="text/plain; charset=utf-8")
+        media_type = "image/png" if path.suffix.lower() == ".png" else "text/html; charset=utf-8"
+        return FileResponse(path, media_type=media_type)
 
     @router.get("/api/register/diag/screenshot")
     async def register_diag_screenshot(email: str = Query(...)):

@@ -5,20 +5,10 @@ import { __test } from '../flows/openai/register.js';
 
 const { shouldForceReset2faWhenAlreadyEnabled, detectAuthenticator2faEnabledFromText } = __test;
 
-test('本地无 secret 且 2FA 已开启 → 需要强制重设', () => {
-  assert.equal(shouldForceReset2faWhenAlreadyEnabled({ forceReset2fa: false, existingTotpSecret: '' }), true);
-});
-
-test('本地有 secret 且未显式 force → 不重设', () => {
+test('安全页 2FA 已开启 → 一律强制重设（与本地 secret 无关）', () => {
+  assert.equal(shouldForceReset2faWhenAlreadyEnabled(), true);
   assert.equal(
     shouldForceReset2faWhenAlreadyEnabled({ forceReset2fa: false, existingTotpSecret: 'JBSWY3DPEHPK3PXP' }),
-    false,
-  );
-});
-
-test('显式 forceReset2fa → 即使本地有 secret 也重设', () => {
-  assert.equal(
-    shouldForceReset2faWhenAlreadyEnabled({ forceReset2fa: true, existingTotpSecret: 'JBSWY3DPEHPK3PXP' }),
     true,
   );
 });

@@ -711,8 +711,8 @@ def _run_browser_job(
         job["loginPassword"] = stored_pwd
     if stored_totp:
         job["existingTotpSecret"] = stored_totp
-    # 本地无 2FA 密钥时让 worker 在安全页检测到已开启则自动关后重开（避免静默跳过导致落库空 secret）。
-    if bool(config.get("enable_2fa")) and not stored_totp:
+    # 开启 2FA 时一律强制重设（安全页已开则先关后开），不因本地已有 totp_secret 而跳过。
+    if bool(config.get("enable_2fa")):
         job["forceReset2fa"] = True
     if stored_pwd or stored_totp:
         parts = []

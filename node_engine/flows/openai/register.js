@@ -1420,10 +1420,9 @@ function resolveStep8Tolerance(partial, passwordOk, { require2fa = false, existi
   };
 }
 
-// 安全页检测到 2FA 已开启时：本地无 secret 必须关后重开才能落库；显式 forceReset2fa 同理。
-function shouldForceReset2faWhenAlreadyEnabled({ forceReset2fa = false, existingTotpSecret = '' } = {}) {
-  if (forceReset2fa) return true;
-  return !String(existingTotpSecret || '').trim();
+// 安全页检测到 2FA 已开启时：一律关后重开，落库新 secret（不因本地已有密钥而跳过）。
+function shouldForceReset2faWhenAlreadyEnabled() {
+  return true;
 }
 
 // 老账号：登录已注册账号 → 设密码 + 开 2FA → 取 token。复用 loginChatGPT + step8。
@@ -1435,7 +1434,7 @@ export async function secureExistingChatGPT({ page, email, loginPassword = '', e
   log('已有账号 · 开始登录');
   const login = await loginChatGPT({ page, email, password: loginPassword, totpSecret: existingTotpSecret, chatgptUrl, requestCode, log, recorder });
 
-  log(`已有账号 · ${enable2fa ? (forceReset2fa ? '重设双重验证' : (existingTotpSecret ? '开启双重验证' : '本地无2FA密钥，将尝试关闭后重开')) : '跳过双重验证'}，并设置密码`);
+  log(`已有账号 · ${enable2fa ? '设置/重设双重验证，并设置密码' : '跳过双重验证，仅设置密码'}`);
   let secure;
   try {
     secure = await step8_setupPasswordAnd2FA(page, {
@@ -1451,10 +1450,10 @@ export async function secureExistingChatGPT({ page, email, loginPassword = '', e
   } catch (e) {
     const partial = e._secure || {};
     const passwordOk = Boolean(login.resetPassword || partial.passwordSet);
-    const require2fa = enable2fa && shouldForceReset2faWhenAlreadyEnabled({ forceReset2fa, existingTotpSecret });
+    const require2fa = Boolean(enable2fa);
     const tolerated = resolveStep8Tolerance(partial, passwordOk, {
       require2fa,
-      existingTotpSecret: forceReset2fa ? '' : existingTotpSecret,
+      existingTotpSecret: '',
     });
     if (tolerated) {
       log(`已有账号 · 双重验证未完成，密码已设置，按普通账号保存：${e.message}`, 'yellow');
@@ -1465,8 +1464,8 @@ export async function secureExistingChatGPT({ page, email, loginPassword = '', e
         // 最终密码：忘记密码重设 > step8 真正新设 > 用于登录的原密码（passwordChanged 才是"确实改了"）
         password: login.resetPassword || (partial.passwordChanged ? newPassword : (loginPassword || '')),
         passwordSet: Boolean(login.resetPassword) || partial.passwordSet || false,
-        // 2FA：step8 新开用新 secret；未改则回传注入的 existingTotpSecret，避免存空覆盖库里已有密钥
-        twoFactorSecret: partial.twoFactorSecret || existingTotpSecret || '',
+        // 2FA：老账号加固只落库 step8 新开的 secret，不回退旧密钥
+        twoFactorSecret: partial.twoFactorSecret || '',
         twoFactorUri: partial.twoFactorUri || '',
         recoveryCodes: partial.recoveryCodes || [],
         twoFactorSet: partial.twoFactorSet || false,
@@ -1484,8 +1483,8 @@ export async function secureExistingChatGPT({ page, email, loginPassword = '', e
     // 最终密码：忘记密码重设 > step8 真正新设 > 用于登录的原密码（passwordChanged 才是"确实改了"）
     password: login.resetPassword || (secure.passwordChanged ? newPassword : (loginPassword || '')),
     passwordSet: Boolean(login.resetPassword) || secure.passwordSet,
-    // 2FA：step8 新开用新 secret；强制重设失败时不回退旧 secret（可能已失效）
-    twoFactorSecret: secure.twoFactorSecret || (forceReset2fa ? '' : existingTotpSecret),
+    // 2FA：老账号加固只落库 step8 新开的 secret
+    twoFactorSecret: secure.twoFactorSecret || '',
     twoFactorUri: secure.twoFactorUri,
     recoveryCodes: secure.recoveryCodes,
     twoFactorSet: secure.twoFactorSet,
@@ -2683,16 +2682,9 @@ async function step8_setupPasswordAnd2FA(page, { email, password, enable2fa = tr
     const twofaAlready = await isAuthenticator2faEnabled(page);
 
     if (twofaAlready) {
-      const mustReset = shouldForceReset2faWhenAlreadyEnabled({ forceReset2fa, existingTotpSecret });
-      if (!mustReset) {
-        log('安全设置 · 双重验证已开启，跳过');
-        out.twoFactorSet = true;
-        out.twoFactorSecret = String(existingTotpSecret || '').trim();
-        return out;
-      }
       if (!forceReset2fa) {
         log(existingTotpSecret
-          ? '安全设置 · 先关闭已有的双重验证（强制重设）'
+          ? '安全设置 · 双重验证已开启，先关闭后重新开启'
           : '安全设置 · 双重验证已开启但本地无密钥，尝试关闭后重新开启');
         const disabled = await disable2fa(page, existingTotpSecret, log, { requestCode });
         if (!disabled) {

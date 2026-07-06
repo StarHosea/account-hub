@@ -12,6 +12,7 @@
 - manifest 末 2～3 步：（stepId + note）
 - logs_tail：（关键行原文）
 - pageState / reason：（若有）
+- 取件页（验证码相关时）：`fetch_url`（含 `limit` 值）、各封邮件 subject/到达时间/是否含 6 位码
 
 ## 证据审计
 - [ ] 能确定卡在哪步？

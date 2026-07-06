@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from services.register import mail_provider
+from services.register.mail_provider import MAILBOX_DISPLAY_TZ
 
 # 请求取码时刻往前这么久的邮件一律视为旧码（发码动作与 requestCode 之间可能有数秒延迟）。
 FRESHNESS_BUFFER_SECONDS = 10
@@ -48,14 +49,14 @@ def parse_request_ts(ts: str | None) -> datetime | None:
 def cutoff_from_request(ts: str | None, *, buffer_seconds: int = FRESHNESS_BUFFER_SECONDS) -> datetime | None:
     """由 need_code 请求时刻推算「可接受邮件」的最早到达时间。
 
-    API 收件页解析出的时间为服务器本地朴素 datetime；将请求时刻转成本地朴素再减 buffer，
-    以便与 provider 返回的 received_at 直接比较。
+    API 收件页解析出的时间为取件页展示时区（Asia/Shanghai）下的朴素 datetime；
+    将请求时刻转到同一时区再减 buffer，避免生产机 UTC 与取件页 UTC+8 混比导致误收旧码。
     """
     requested = parse_request_ts(ts)
     if requested is None:
         return None
-    local = requested.astimezone().replace(tzinfo=None)
-    return local - timedelta(seconds=buffer_seconds)
+    mailbox_local = requested.astimezone(MAILBOX_DISPLAY_TZ).replace(tzinfo=None)
+    return mailbox_local - timedelta(seconds=buffer_seconds)
 
 
 def mail_config_with_defaults(mail_config: dict | None) -> dict:

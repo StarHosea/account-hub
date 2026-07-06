@@ -1,6 +1,7 @@
 import unittest
 from datetime import datetime
 
+from services.register import mail_code as mc
 from services.register import mail_provider as mp
 
 T0 = datetime(2026, 7, 1, 22, 0, 0)
@@ -90,6 +91,19 @@ class WaitForFreshCodeTests(unittest.TestCase):
 
     def test_no_baseline_keeps_old_behavior(self) -> None:
         self.assertEqual(_FakeProvider([("111111", T0)]).wait_for_code({}), "111111")
+
+    def test_rejects_stale_assurivo_email_when_request_is_utc(self) -> None:
+        # peeling-withers.12@icloud.com 现场：needAt 13:34:55Z，取件页显示 21:07:04（UTC+8）。
+        cutoff = mc.cutoff_from_request("2026-07-06T13:34:55.481Z")
+        self.assertIsNotNone(cutoff)
+        received = datetime(2026, 7, 6, 21, 7, 4)
+        self.assertFalse(mp._received_is_fresh(received, cutoff))
+
+    def test_accepts_new_assurivo_email_after_request(self) -> None:
+        cutoff = mc.cutoff_from_request("2026-07-06T13:34:55.481Z")
+        self.assertIsNotNone(cutoff)
+        received = datetime(2026, 7, 6, 21, 35, 1)
+        self.assertTrue(mp._received_is_fresh(received, cutoff))
 
 
 if __name__ == "__main__":

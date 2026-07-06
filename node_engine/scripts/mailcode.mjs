@@ -8,6 +8,7 @@
 // 正确：先抽 srcdoc → 实体解码 → 去标签 → 语境正则取码。见 skill: register-cdp-debug。
 //
 // 用法：node scripts/mailcode.mjs '<取件URL>' [--exclude 旧码1,旧码2] [--wait 秒]
+//   取件 URL 多为 assurivo open.php；排查时把 ?limit=1 改大（如 limit=10）可看历史邮件。
 //   --exclude  跳过这些已知旧码（联调触发新码后，排除上一次的码，确保取到新的）
 //   --wait     轮询等待秒数（默认 0=只取一次；触发码后邮件有延迟时设 20~40）
 // 成功打印 6 位码到 stdout；失败 exit 2。

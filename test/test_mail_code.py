@@ -2,15 +2,16 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from services.register import mail_code as mc
+from services.register.mail_provider import MAILBOX_DISPLAY_TZ
 
 
 class MailCodeCutoffTests(unittest.TestCase):
-    def test_cutoff_subtracts_buffer_from_local_time(self) -> None:
+    def test_cutoff_subtracts_buffer_from_mailbox_display_time(self) -> None:
         ts = "2026-07-01T14:30:00+00:00"
         cutoff = mc.cutoff_from_request(ts, buffer_seconds=10)
         self.assertIsNotNone(cutoff)
-        requested_local = datetime.fromisoformat(ts).astimezone().replace(tzinfo=None)
-        self.assertEqual(cutoff, requested_local - timedelta(seconds=10))
+        requested_mailbox_local = datetime.fromisoformat(ts).astimezone(MAILBOX_DISPLAY_TZ).replace(tzinfo=None)
+        self.assertEqual(cutoff, requested_mailbox_local - timedelta(seconds=10))
 
     def test_cutoff_none_without_ts(self) -> None:
         self.assertIsNone(mc.cutoff_from_request(None))

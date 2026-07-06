@@ -13,6 +13,7 @@ from pathlib import Path
 from services.account_service import account_service
 from services.config import DATA_DIR, config
 from services.register import mail_provider, openai_register, fingerprint
+from services.register_diag_service import delete_all_recordings
 
 
 def _now() -> str:
@@ -417,6 +418,11 @@ class RegisterService:
             self._logs = []
             self._save()
             return self.get()
+
+    def clear_recordings(self) -> dict[str, int]:
+        """删除全部诊断存证目录（供设置页「清空存证」使用）。"""
+        with self._lock:
+            return delete_all_recordings()
 
     def clear_logs_for_emails(self, emails: list[str]) -> int:
         """删除与指定邮箱相关的注册日志（含同任务号的 [任务N] 步骤日志）。"""

@@ -72,6 +72,27 @@ class RegisterRecordingCleanupTest(unittest.TestCase):
             self.assertEqual(result["dirs_removed"], 0)
             self.assertTrue(outside.exists())
 
+    def test_delete_all_recordings_removes_every_scene(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "a-b.com-111"
+            second = root / "c-d.com-999"
+            first.mkdir()
+            second.mkdir()
+            payload = "x" * 2048
+            (first / "trace.zip").write_text(payload, encoding="utf-8")
+            (second / "trace.zip").write_text(payload, encoding="utf-8")
+
+            with mock.patch.dict(openai_register.config, {"record_enabled": True, "record_dir": str(root)}, clear=False):
+                from services.register_diag_service import delete_all_recordings
+
+                result = delete_all_recordings()
+
+            self.assertEqual(result["dirs_removed"], 2)
+            self.assertGreaterEqual(result["bytes_freed"], 4096)
+            self.assertFalse(first.exists())
+            self.assertFalse(second.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

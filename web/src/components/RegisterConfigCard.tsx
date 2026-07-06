@@ -1,8 +1,9 @@
-import { Card, Button, Input, InputNumber, Select, Switch, TextArea, Typography, Space, Toast, Radio, RadioGroup } from "@douyinfe/semi-ui-19";
-import { IconSave, IconRefresh, IconLink } from "@douyinfe/semi-icons";
+import { Card, Button, Input, InputNumber, Select, Switch, TextArea, Typography, Space, Toast, Radio, RadioGroup, Popconfirm } from "@douyinfe/semi-ui-19";
+import { IconSave, IconRefresh, IconLink, IconDelete } from "@douyinfe/semi-icons";
 
 import { useSettingsStore } from "@/store/settings";
 import { copyToClipboard } from "@/lib/clipboard";
+import { clearRegisterRecordings } from "@/lib/api";
 import ActivationConfigCard from "@/components/ActivationConfigCard";
 import {
   DEFAULT_HTTP_PROXY,
@@ -60,6 +61,7 @@ export default function RegisterConfigCard() {
   const activationConfig = useSettingsStore((s) => s.activationConfig);
   const setActivationAutoActivate = useSettingsStore((s) => s.setActivationAutoActivate);
   const loadRegister = useSettingsStore((s) => s.loadRegister);
+  const setRegisterConfig = useSettingsStore((s) => s.setRegisterConfig);
   const isLoadingRegister = useSettingsStore((s) => s.isLoadingRegister);
 
   if (!config) return null;
@@ -76,6 +78,23 @@ export default function RegisterConfigCard() {
       Toast.success("注册配置已保存");
     } catch (e) {
       Toast.error(e instanceof Error ? e.message : "保存失败");
+    }
+  };
+
+  const handleClearRecordings = async () => {
+    try {
+      const result = await clearRegisterRecordings();
+      setRegisterConfig(result.register);
+      const freedMb = result.bytes_freed ? (result.bytes_freed / (1024 * 1024)).toFixed(1) : "";
+      const detail =
+        result.dirs_removed && freedMb
+          ? `，释放约 ${freedMb} MB 磁盘空间`
+          : result.dirs_removed
+            ? ""
+            : "（无存证可删）";
+      Toast.success(`已清空 ${result.dirs_removed} 份诊断存证${detail}`);
+    } catch (e) {
+      Toast.error(e instanceof Error ? e.message : "清空存证失败");
     }
   };
 
@@ -344,6 +363,22 @@ export default function RegisterConfigCard() {
               <Button icon={<IconRefresh />} size="small" theme="borderless" loading={isLoadingRegister} onClick={() => void loadRegister()}>
                 刷新
               </Button>
+              <Popconfirm
+                title="确认清空全部诊断存证？"
+                content="将删除存证目录下所有失败现场（DOM / 截图 / Trace），不可恢复。"
+                okType="danger"
+                onConfirm={() => void handleClearRecordings()}
+              >
+                <Button
+                  icon={<IconDelete />}
+                  size="small"
+                  type="danger"
+                  theme="borderless"
+                  disabled={!config.record_dir_count}
+                >
+                  清空存证
+                </Button>
+              </Popconfirm>
             </Space>
             {config.record_resolved_dir ? (
               <Text type="tertiary" size="small" style={{ display: "block", marginTop: 6 }}>

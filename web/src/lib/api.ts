@@ -1101,6 +1101,14 @@ export async function clearRegisterLogs() {
   return httpRequest<{ register: RegisterConfig }>("/api/register/clear-logs", { method: "POST" });
 }
 
+export async function clearRegisterRecordings() {
+  return httpRequest<{
+    register: RegisterConfig;
+    dirs_removed: number;
+    bytes_freed: number;
+  }>("/api/register/clear-recordings", { method: "POST" });
+}
+
 // ── Register abnormal accounts（注册机异常账号清单）──────────────────
 
 export type RegisterAbnormal = {

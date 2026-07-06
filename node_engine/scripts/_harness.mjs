@@ -107,6 +107,16 @@ export function makeCodeProvider({ mailUrl = '', pollMs = 5000, timeoutMs = 1800
       const res = await fetch(mailUrl, { headers: { 'User-Agent': 'Mozilla/5.0 node_engine-recon' } });
       const html = await res.text();
       let text = html;
+      // assurivo 等取件页把正文放在 iframe srcdoc 里，需先解出再匹配
+      text = text.replace(/srcdoc="([^"]*)"/gi, (_, inner) => {
+        let decoded = inner;
+        for (let i = 0; i < 3; i += 1) {
+          decoded = decoded
+            .replace(/&nbsp;/gi, ' ').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>')
+            .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n))).replace(/&amp;/gi, '&');
+        }
+        return ` ${decoded} `;
+      });
       for (let i = 0; i < 2; i += 1) {
         text = text
           .replace(/&nbsp;/gi, ' ').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>')
@@ -115,7 +125,8 @@ export function makeCodeProvider({ mailUrl = '', pollMs = 5000, timeoutMs = 1800
       text = text.replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<style[\s\S]*?<\/style>/gi, ' ').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
       const patterns = [
         /输入此临时验证码以继续[：:]\s*(\d{6})/,
-        /(?:验证码|临时验证码|代码为|code is|verification code|enter this code|your chatgpt code is)[^0-9#]{0,24}(\d{6})/i,
+        /verify your identity[:\s]*(\d{6})/i,
+        /(?:验证码|临时验证码|代码为|code is|verification code|enter this code|your chatgpt code is|authentication code)[^0-9#]{0,40}(\d{6})/i,
       ];
       for (const re of patterns) {
         const m = text.match(re);
@@ -136,7 +147,9 @@ export function makeCodeProvider({ mailUrl = '', pollMs = 5000, timeoutMs = 1800
         if (code) { priorCodes.add(code); log(`已自动取到验证码 ${code}`); return code; }
         await new Promise((r) => setTimeout(r, pollMs));
       }
-      log('自动取码超时，改为手动输入', 'warn');
+      log('自动取码超时', 'warn');
+      if (!process.stdin.isTTY) throw new Error('自动取码超时且当前非交互终端，无法手动输入验证码');
+      log('改为手动输入', 'warn');
     }
     const code = await prompt(`🔑 需要验证码[${purpose}]，请输入 6 位码后回车: `);
     if (code) priorCodes.add(code);
@@ -144,6 +157,55 @@ export function makeCodeProvider({ mailUrl = '', pollMs = 5000, timeoutMs = 1800
   }
 
   return { requestCode, close: () => rl.close() };
+}
+
+// 连接本机已开的 Chrome（--remote-debugging-port），脚本只挂接驱动，退出时不关浏览器。
+// port：端口号；endpoint：完整 URL，如 http://127.0.0.1:9222
+export function resolveCdpEndpoint(portOrUrl = '') {
+  const raw = String(portOrUrl || process.env.CLOAK_CONNECT_CDP || process.env.CLOAK_CDP_PORT || '').trim();
+  if (!raw) return '';
+  if (/^https?:\/\//i.test(raw)) return raw.replace(/\/$/, '');
+  const port = Number(raw);
+  if (!Number.isFinite(port) || port <= 0) throw new Error(`无效的 CDP 端口：${raw}`);
+  return `http://127.0.0.1:${port}`;
+}
+
+export async function connectCdp({ port = 9222, endpoint = '', log = console.log } = {}) {
+  const { chromium } = await import('playwright-core');
+  const cdpEndpoint = resolveCdpEndpoint(endpoint || port) || `http://127.0.0.1:${Number(port) || 9222}`;
+  let browser;
+  try {
+    browser = await chromium.connectOverCDP(cdpEndpoint);
+  } catch (e) {
+    throw new Error(
+      `连不上本机 Chrome CDP（${cdpEndpoint}）：${e?.message || e}\n`
+      + '请先完全退出 Chrome，再用调试端口启动：\n'
+      + '  /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome --remote-debugging-port=9222\n'
+      + '手动打开 chatgpt.com 并确认无 Cloudflare 后，再运行本脚本。',
+    );
+  }
+  const context = browser.contexts()[0];
+  if (!context) throw new Error(`CDP 已连接但无 context：${cdpEndpoint}`);
+  const pages = context.pages();
+  const page = pages.find((p) => /chatgpt\.com|auth\.openai\.com/i.test(p.url()))
+    || pages.find((p) => !/^devtools:/i.test(p.url()))
+    || pages[pages.length - 1]
+    || await context.newPage();
+  page.setDefaultTimeout(45000);
+  log(`已连接本机 Chrome CDP（${cdpEndpoint}，当前页：${page.url()})`);
+  return {
+    session: {
+      mode: 'cdp-chrome',
+      seed: null,
+      browser,
+      context,
+      async close() { /* detachOnly：不关浏览器 */ },
+    },
+    page,
+    staticCache: null,
+    detachOnly: true,
+    cdpEndpoint,
+  };
 }
 
 // 启动 CloakBrowser 并开一个新页面。

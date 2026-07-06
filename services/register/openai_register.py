@@ -711,6 +711,9 @@ def _run_browser_job(
         job["loginPassword"] = stored_pwd
     if stored_totp:
         job["existingTotpSecret"] = stored_totp
+    # 本地无 2FA 密钥时让 worker 在安全页检测到已开启则自动关后重开（避免静默跳过导致落库空 secret）。
+    if bool(config.get("enable_2fa")) and not stored_totp:
+        job["forceReset2fa"] = True
     if stored_pwd or stored_totp:
         parts = []
         if stored_pwd:
@@ -958,7 +961,8 @@ def worker(index: int) -> dict:
             stored_pwd, stored_totp = _lookup_stored_credentials(email)
             if not str(acct.get("password") or "").strip() and stored_pwd:
                 acct["password"] = stored_pwd
-            if not str(acct.get("totp_secret") or "").strip() and stored_totp:
+            incoming_totp = str(acct.get("totp_secret") or "").strip()
+            if not incoming_totp and stored_totp:
                 acct["totp_secret"] = stored_totp
             # 同邮箱的旧账号条目（旧 access_token / email:: 占位）先删，避免重复与陈旧凭据。
             # 必须在 _lookup_stored_credentials 之后删（旧凭据就存在旧条目里）。

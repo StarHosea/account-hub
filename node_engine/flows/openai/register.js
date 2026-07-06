@@ -1710,6 +1710,11 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
   // submitCodeForm 内含 Enter/继续/form 提交、chrome-error 自愈、网络异常点「重试」
   await submitCodeForm(page, log, { code: codeResult.code });
   await sleep(3000);
+  if (await clickRetryIfError(page, log)) {
+    log('注册 · 验证码提交后出现网络异常（Route Error 等），已点重试', 'warn');
+    await sleep(3000);
+    await waitForPageFullyLoaded(page, { log });
+  }
   const codeAudit = buildCodeAuditFromResult(codeResult, fillAudit, {
     submitMethod: 'form-submit',
   });
@@ -1930,6 +1935,14 @@ async function fillCode(page, code, log) {
   return audit;
 }
 
+// OpenAI 可重试的网络/路由异常页（非 rate_limit_exceeded）。brief 实测：
+// 「Oops, an error occurred!」+ Route Error (400 Invalid content type…) + Try again。
+const RETRYABLE_NETWORK_ERROR_RE = /网络.*(异常|错误)|network error|出了点问题|something went wrong|请稍后.*重试|不明なエラー|unknown error|fail.*fetch|failed to fetch|"code":\s*"invalid_type"|oops.*error occurred|route error|invalid content type/i;
+
+function classifyRetryableNetworkError(text) {
+  return RETRYABLE_NETWORK_ERROR_RE.test(String(text || ''));
+}
+
 // 提交验证码表单：先在框内按 Enter，再点"继续"兜底，最后原生 form.requestSubmit()。
 // OpenAI 偶发异常页：提交（密码 / 邮箱验证码 / 2FA 一次性码）后出现「请求超出限制
 // rate_limit_exceeded」或「网络异常」，页面带一个「重试」按钮。用稳定属性
@@ -1941,10 +1954,10 @@ async function clickRetryIfError(page, log, { max = 3, cooldownMs = 4000 } = {})
 
   let did = false;
   for (let i = 0; i < max; i += 1) {
-    const found = await page.evaluate(() => {
+    const found = await page.evaluate((reSrc) => {
       const vis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
       const text = document.body?.innerText || '';
-      const isErr = /网络.*(异常|错误)|network error|出了点问题|something went wrong|请稍后.*重试|不明なエラー|unknown error|fail.*fetch|failed to fetch|"code":\s*"invalid_type"/i.test(text);
+      const isErr = new RegExp(reSrc, 'i').test(text);
       let btn = document.querySelector('[data-dd-action-name="Try again"]');
       if (!(btn && vis(btn))) {
         btn = [...document.querySelectorAll('button,[role="button"]')].filter(vis)
@@ -1952,7 +1965,7 @@ async function clickRetryIfError(page, log, { max = 3, cooldownMs = 4000 } = {})
       }
       if (btn && vis(btn) && isErr) { btn.setAttribute('data-reg-retry', '1'); return { isErr: true }; }
       return null;
-    }).catch(() => null);
+    }, RETRYABLE_NETWORK_ERROR_RE.source).catch(() => null);
     if (!found) break;
     await throwIfRateLimited(page, log);
     await page.click('[data-reg-retry="1"]', { timeout: 4000 }).catch(() => {});
@@ -2035,6 +2048,7 @@ async function submitCodeForm(page, log, { code = '', retries = 2 } = {}) {
   // 提交后偶发限流/网络异常页 → 点「重试」再确认是否离开收码页
   if (await clickRetryIfError(page, log)) {
     await sleep(1500);
+    await waitForPageFullyLoaded(page, { log });
   }
   log('验证码已提交');
 }
@@ -2074,6 +2088,14 @@ async function detectPostCodeBranch(page, log, { timeoutMs = 20000 } = {}) {
       };
     }, profileSel).catch(() => null);
     if (!st) { await sleep(1200); continue; }
+    if (classifyRetryableNetworkError(st.text)) {
+      if (await clickRetryIfError(page, log)) {
+        log('注册 · 验证码后等待资料页时检测到网络异常，已点重试', 'warn');
+        await sleep(2500);
+      }
+      await sleep(1200);
+      continue;
+    }
     // 出现注册专属步骤（资料 / 创建密码）→ 真新号，继续原注册流程
     if (st.hasProfile || st.hasPassword) return 'register';
     // 已落已登录主界面（URL 干净 + 主界面文案，或已能取 token）且无资料页 → 已验证无密码老号
@@ -2122,12 +2144,22 @@ async function readProfileFields(page) {
 }
 
 async function assertProfileReady(page, log) {
-  const f = await readProfileFields(page);
-  const hasName = Boolean(f.name);
-  const hasAge = Boolean(f.age);
-  const hasBirthday = Boolean(f.birthday);
+  let f = await readProfileFields(page);
+  let hasName = Boolean(f.name);
+  if (!hasName) {
+    const bodyText = await page.evaluate(() => document.body?.innerText || '').catch(() => '');
+    if (classifyRetryableNetworkError(bodyText)) {
+      if (await clickRetryIfError(page, log)) {
+        log('注册 · 资料页校验前检测到网络异常，已点重试', 'warn');
+        await sleep(3000);
+        await waitForPageFullyLoaded(page, { log });
+        f = await readProfileFields(page);
+        hasName = Boolean(f.name);
+      }
+    }
+  }
   if (!hasName) throw new Error('资料页姓名未填写');
-  if (!hasAge && !hasBirthday) throw new Error('资料页生日/年龄未填写');
+  if (!Boolean(f.age) && !Boolean(f.birthday)) throw new Error('资料页生日/年龄未填写');
   if (f.ageInvalid || f.birthdayInvalid || f.ageHint) {
     throw new Error(`资料页校验未通过：age=${f.age || '(空)'} birthday=${f.birthday || '(空)'}`);
   }
@@ -2172,6 +2204,8 @@ export const __test = {
   readProfileFields,
   assertProfileReady,
   fillBirthday,
+  classifyRetryableNetworkError,
+  clickRetryIfError,
 };
 
 async function checkConsentIfAny(page, log) {

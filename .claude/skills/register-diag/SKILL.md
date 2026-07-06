@@ -1,6 +1,6 @@
 ---
 name: register-diag
-description: account-hub 注册失败诊断：拉取诊断链接/brief、分析失败现场、定位代码、出修复建议。禁止靠猜；证据不足只补日志/加采集或 CDP 验证，不得给修复方案；需 CDP 验证时必须实机跑通。触发：诊断链接、brief.md、fetch-register-diag、异常清单、注册失败分析、优化成功率。
+description: account-hub 注册失败诊断：拉取诊断链接/brief、分析失败现场、定位代码、出修复建议。含 assurivo 等取件页 limit 参数查历史邮件技巧。禁止靠猜；证据不足只补日志/加采集或 CDP 验证，不得给修复方案；需 CDP 验证时必须实机跑通。触发：诊断链接、brief.md、fetch-register-diag、异常清单、注册失败分析、验证码/收码问题、优化成功率。
 ---
 
 # 注册诊断
@@ -64,6 +64,33 @@ curl -fsSL '{base}/api/register/diag/brief?email=...'    # JSON，结构更全
 
 - `recording_missing` → **不得**推断 DOM 根因；闭环里加存证 + 超时前 last_step。
 - 需网络时序 → `.../api/register/diag/trace?email=...`
+- 验证码/收码相关 → 见下方「取件页排查」；brief 字段 `fetch_url`
+
+### 2.5) 取件页排查（验证码/收码问题时必做）
+
+brief 的 `fetch_url`、注册页/邮箱管理的「收邮件」链接，多为 assurivo 等 HTML 取件页，形如：
+
+```
+https://assurivo.com/console/open.php?mail={email}&pwd={password}&limit={N}
+```
+
+**`limit` = 展示最近 N 封邮件**（常见默认 `limit=1` 只看最新一封）。排查时把数字改大即可翻看历史邮件，无需猜：
+
+| 改法 | 示例 |
+|------|------|
+| 已有 `limit=1` | 改成 `limit=10` 或 `limit=20` |
+| URL 无 `limit` | 末尾追加 `&limit=10` |
+
+**适用场景**（每条须对照邮件正文与时间，不得凭空推断）：
+
+| 现象 | 在取件页核对什么 |
+|------|------------------|
+| 验证码无效 / 填码失败 | 发码后是否有**新**邮件；是否误用了旧码 |
+| 收码超时 | OpenAI 是否根本没发到信；是否被更早的无关邮件挡住 |
+| `mailcode.mjs` 取不到码 | 正文是否在 `<iframe srcdoc>` 里、6 位码是否在历史邮件中 |
+| 基线时间过滤 | 最新邮件到达时间是否**晚于**发码前记录的基线（见 `mail_provider.wait_for_code_detail`） |
+
+浏览器直接打开改过的 URL 人工核对；CLI 取码时也可把 `limit` 调大后传给 `mailcode.mjs`。详见 **register-cdp-debug** §2.5。
 
 ### 3) 证据审计（必做，在分类之前）
 
@@ -76,6 +103,7 @@ curl -fsSL '{base}/api/register/diag/brief?email=...'    # JSON，结构更全
 | selector 命中否？ | manifest step 的 note/extraMeta | dom-recorder 加 selector 结果 |
 | 状态机为何如此？ | `pageState` + auth-state evidence | auth-state 补 reason/evidence |
 | 网络/代理？ | logs_tail 连接错误码 | NDJSON 泵落详细错误 |
+| 码对不对/邮件到没到？ | `fetch_url` + 取件页 `limit` 放大后邮件列表 | 报告写明各封 subject/时间/是否含 6 位码 |
 | 进程怎么死的？ | kill_reason / last_url / stderr | Python 超时杀进程前写入 |
 
 **任一项答不上且与根因相关 → 本轮禁止修复，只做采集增强。**

@@ -8,7 +8,8 @@
 |------|-----------------|------------------------|------------------|
 | `reason` 含 超时/timeout | logs_tail 末行、manifest 末步、代理耗时 | 代理慢、死等、register_timeout | kill_reason、last_url、last_step |
 | `reason` 含 rate/limit/unusual/captcha | visible_ui.hints、URL | 风控 | 风控页 snapshot、response 摘要 |
-| `visible_ui.hints` 验证码/无效 | failed_step、pageState | 收码慢、填码 selector、chrome-error | fillCode note、submit 后 URL |
+| `visible_ui.hints` 验证码/无效 | failed_step、pageState、`fetch_url` | 收码慢、旧码、填码 selector、chrome-error | **取件页 `limit` 放大**看历史邮件时间与正文；fillCode note、submit 后 URL |
+| `reason` 含验证码/收码/OTP/mail | `fetch_url`、logs_tail 收码相关行 | 邮件未到、旧码、基线时间过滤、取件页解析 | 浏览器打开 `fetch_url` 改 `limit=10`；对照 subject/到达时间 |
 | `failed_step` register-02* | visible_ui.buttons | 注册按钮/邮箱兜底文案 | record note：点击尝试列表与命中 |
 | `failed_step` register-04* | manifest register-04 note | fillCode、submitCodeForm | selector 命中、填回值校验 |
 | `failed_step` step8-* | visible_ui、pageState | 安全页 selector、密码/2FA | step8 各子步 record note |

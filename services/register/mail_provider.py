@@ -6,6 +6,7 @@ import re
 import string
 import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from email import message_from_string, policy
 from email.utils import parsedate_to_datetime
 from threading import Lock
@@ -111,6 +112,9 @@ def _extract_code(message: dict[str, Any]) -> str | None:
     return None
 
 
+# API 取件页（assurivo 等）「时间：YYYY-MM-DD HH:MM:SS」为固定展示时区，与 Python 进程 TZ 无关。
+MAILBOX_DISPLAY_TZ = ZoneInfo("Asia/Shanghai")
+
 _TS_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?")
 _RFC822_DT_RE = re.compile(
     r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\s+\d{1,2}\s+\w+\s+\d{4}\s+\d{2}:\d{2}:\d{2}(?:\s*(?:\([A-Z]+\)|[+-]\d{4}))?",
@@ -152,18 +156,18 @@ def _extract_received_at(content: str) -> datetime | None:
     return None
 
 
-def _to_comparable_naive_local(dt: datetime) -> datetime:
-    """把带时区的时间转成本地朴素 datetime，便于与 API 收件页解析结果比较。"""
+def _to_comparable_mailbox_display(dt: datetime) -> datetime:
+    """把任意 datetime 转成取件页展示时区下的朴素时间，便于与 HTML 解析结果比较。"""
     if dt.tzinfo is not None:
-        return dt.astimezone().replace(tzinfo=None)
+        return dt.astimezone(MAILBOX_DISPLAY_TZ).replace(tzinfo=None)
     return dt
 
 
 def _received_is_fresh(received: datetime | None, after: datetime) -> bool:
-    """邮件到达时间是否严格晚于截止线（双方都转成本地朴素时间再比）。"""
+    """邮件到达时间是否严格晚于截止线（统一在取件页展示时区下比较）。"""
     if not isinstance(received, datetime):
         return False
-    return _to_comparable_naive_local(received) > _to_comparable_naive_local(after)
+    return _to_comparable_mailbox_display(received) > _to_comparable_mailbox_display(after)
 
 
 def _message_tracking_ref(message: dict[str, Any]) -> str:

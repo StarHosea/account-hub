@@ -34,7 +34,14 @@ logwithemailverifycode_*/
 test_batch_output/
 # 工具索引/编辑器目录
 .codegraph/
-.cursor/
+# Cursor 本地状态（OpenSpec skills/commands 纳入版本控制）
+.cursor/*
+!.cursor/skills/
+!.cursor/commands/
+.cursor/skills/*
+!.cursor/skills/openspec-*/
+.cursor/commands/*
+!.cursor/commands/opsx-*
 
 # 本地运行日志
 run.local.log

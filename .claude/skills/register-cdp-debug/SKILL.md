@@ -1,6 +1,6 @@
 ---
 name: register-cdp-debug
-description: 注册机（node_engine 的 ChatGPT 注册/登录/加固流程）DOM/selector/文案/状态机问题排查。必须用 CDP 连 cloakbrowser stealth 浏览器实机验证，记录 snapshot/操作结果作为证据；验证通过后才可改 register.js/selectors.js。禁止未验证就猜修复。触发：注册卡住、selector 失配、register-diag 要求 CDP、页面结构变化、联调注册。
+description: 注册机（node_engine 的 ChatGPT 注册/登录/加固流程）DOM/selector/文案/状态机/收码问题排查。必须用 CDP 连 cloakbrowser stealth 浏览器实机验证，记录 snapshot/操作结果作为证据；验证通过后才可改 register.js/selectors.js。含 assurivo 取件页 limit 查历史邮件、mailcode.mjs 联调。禁止未验证就猜修复。触发：注册卡住、selector 失配、验证码/收码失败、register-diag 要求 CDP、页面结构变化、联调注册。
 ---
 
 # 注册机 CDP 交互式联调
@@ -64,11 +64,33 @@ cdp-drive shot /tmp/x.png
 
 ### 2.5) 取验证码（收码页）
 
-```bash
-node scripts/mailcode.mjs '<取件URL>' [--exclude 上次旧码] [--wait 30]
+#### 取件 URL 与 `limit` 参数（排查必备）
+
+assurivo 等 HTML 取件页常见格式：
+
+```
+https://assurivo.com/console/open.php?mail={email}&pwd={password}&limit={N}
 ```
 
+- **`limit`**：页面展示**最近 N 封**邮件；默认常为 `1`，只能看到最新一封。
+- **排查技巧**：把 `limit` 改大（如 `5`、`10`、`20`）即可翻看历史邮件——确认 OpenAI 是否发过码、是否误取旧码、邮件到达时间是否在发码之后。
+- 无 `limit` 参数时，在 URL 末尾追加 `&limit=10`。
+- 来源：brief 的 `fetch_url`、注册页/邮箱管理「收邮件」、run-one 的 `--mail-url`。
+
+浏览器先打开 `limit` 放大后的 URL 人工核对，再跑 `mailcode.mjs`。
+
+#### 自动取码
+
+```bash
+# 建议排查时用 limit 更大的 URL
+node scripts/mailcode.mjs 'https://assurivo.com/console/open.php?mail=...&pwd=...&limit=10' [--exclude 上次旧码] [--wait 30]
+```
+
+`mailcode.mjs` 从 `<iframe srcdoc>` 按**最新优先**抽 6 位码；`--exclude` 跳过已知旧码；`--wait` 在触发发码后轮询等待新邮件。
+
 取到后：`cdp-drive fill "input[name=code]" <码>` → `cdp-drive click "继续"`。
+
+**取不到码时**：先浏览器看 `limit=10` 的页面是否有验证码邮件 → 再 `cdp-drive html` 对照 DOM 结构是否与 `mailcode.mjs` 解析逻辑一致（见该文件头注释）。
 
 ### 3) 卡点修复循环（证据 → 改码 → 复测）
 

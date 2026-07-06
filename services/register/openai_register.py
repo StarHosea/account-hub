@@ -956,7 +956,7 @@ def worker(index: int) -> dict:
                 **abnormal_extra,
             )
             mailbox["access_token"] = token
-            mail_provider.mark_mailbox_result(mailbox, success=True)
+            mail_provider.mark_mailbox_result(mailbox, success=False, error=err_msg)
             log(f"{email} 注册部分完成，登录凭证已保存到异常清单：{err_msg}", "yellow")
         else:
             register_abnormal_service.add(

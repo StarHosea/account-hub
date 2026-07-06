@@ -126,6 +126,17 @@ class MarkMailboxResultTests(unittest.TestCase):
         self.assertFalse(item["in_use"])  # 已释放
         self.assertIsNotNone(item["cooldown_until"])  # 有冷却
 
+    def test_partial_failure_keeps_mailbox_unused(self) -> None:
+        """半完成态（已有 token 但未入号池）写入异常清单时，邮箱应回到待注册。"""
+        self.svc.acquire_unused()
+        mailbox = self._mailbox("bad@x.com")
+        mailbox["access_token"] = "eyJpartial.token"
+        mp.mark_mailbox_result(mailbox, success=False, error=RuntimeError("2FA 设置失败"))
+        item = self.svc._mailboxes["bad@x.com"]
+        self.assertFalse(item["used"])
+        self.assertFalse(item["in_use"])
+        self.assertIsNone(item.get("account_token"))
+
 
 if __name__ == "__main__":
     unittest.main()

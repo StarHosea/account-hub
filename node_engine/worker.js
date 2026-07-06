@@ -80,7 +80,8 @@ function readJobFromStdin(timeoutMs = 5000) {
 // dryRun：不启浏览器，回放 log → need_code → result，用于协议/集成测试。
 async function runDryRun(job) {
   log('dryRun：开始（不启动浏览器）');
-  const code = await requestCode('register');
+  const result = await requestCode('register');
+  const code = result?.code || result;
   log('dryRun：收到验证码');
   emit({
     type: 'result',

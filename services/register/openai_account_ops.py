@@ -131,12 +131,14 @@ def _drive_worker(job: dict, mail_config, mailbox, log) -> dict:
                 purpose = str(evt.get("purpose") or "login")
                 label = reg._code_purpose_label(purpose)
                 log(f"正在等待{label}验证码…")
-                code = None
+                code_result = None
                 if mailbox:
-                    code = mail_code.fulfill_need_code(
+                    code_result = mail_code.fulfill_need_code(
                         mail_config, mailbox, ts=evt.get("ts"), purpose=purpose,
                     )
-                reg._send_line(proc, {"type": "code", "code": code or ""})
+                code = (code_result or {}).get("code") if code_result else None
+                received_at = (code_result or {}).get("received_at") if code_result else None
+                reg._send_line(proc, {"type": "code", "code": code or "", "received_at": received_at})
                 if code:
                     log(f"收到{label}验证码：{code}")
                 else:

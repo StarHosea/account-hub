@@ -218,7 +218,8 @@ def create_mailbox(username: str | None = None) -> dict:
 
 
 def wait_for_code(mailbox: dict) -> str | None:
-    return mail_code.fulfill_need_code(_mail_config(), mailbox)
+    result = mail_code.fulfill_need_code(_mail_config(), mailbox)
+    return (result or {}).get("code") if result else None
 
 
 def _probe_exit_ip_once(proxy: str, timeout: float = 12.0) -> str | None:
@@ -789,11 +790,13 @@ def _run_browser_job(
                     mail_code.ROUND_WAIT_TIMEOUT,
                     _remaining_task_seconds(deadline_at),
                 )
-                code = mail_code.fulfill_need_code(
+                code_result = mail_code.fulfill_need_code(
                     _mail_config(), mailbox, ts=evt.get("ts"), purpose=purpose,
                     round_timeout=round_timeout,
                 )
-                _send_line(proc, {"type": "code", "code": code})
+                code = (code_result or {}).get("code") if code_result else None
+                received_at = (code_result or {}).get("received_at") if code_result else None
+                _send_line(proc, {"type": "code", "code": code, "received_at": received_at})
                 if code:
                     step(index, f"收到{label}验证码：{code}")
                 else:

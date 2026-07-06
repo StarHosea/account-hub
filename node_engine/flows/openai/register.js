@@ -1,6 +1,6 @@
 import { sleep, generateRandomName, generateRandomBirthday, generatePassword, generateTotpNow } from '../../utils.js';
 import * as S from './selectors.js';
-import { detectInvalidCode } from './code-errors.js';
+import { detectInvalidCode, extractInvalidCodeHint } from './code-errors.js';
 import { throwIfRateLimited } from './rate-limit.js';
 import { detectAuthState, PAGE_STATE } from './auth-state.js';
 
@@ -477,13 +477,26 @@ async function requestCodeWithResend(page, requestCode, log, { purpose = 'regist
       await sleep(2500);
     }
     try {
-      return await requestCode(purpose);
+      const raw = await requestCode(purpose);
+      const code = typeof raw === 'string' ? raw : String(raw?.code || '');
+      const receivedAt = typeof raw === 'object' && raw ? (raw.receivedAt || raw.received_at || '') : '';
+      return { code, receivedAt: receivedAt || null, purpose, resendRounds: round - 1 };
     } catch (e) {
       lastErr = e;
       if (round >= maxRounds) break;
     }
   }
   throw lastErr || new Error(`已重新发送 ${maxRounds - 1} 次，仍未收到验证码`);
+}
+
+function buildCodeAuditNote(meta = {}) {
+  const parts = ['注册验证码已填'];
+  if (meta.code) parts.push(`code=${meta.code}`);
+  if (meta.codeReceivedAt) parts.push(`receivedAt=${meta.codeReceivedAt}`);
+  if (meta.codeInputMode) parts.push(`input=${meta.codeInputMode}`);
+  if (meta.codeReadbackMatches === false) parts.push('readbackMismatch');
+  if (meta.invalidHintText) parts.push(`hint=${meta.invalidHintText}`);
+  return parts.join(' ');
 }
 
 // 注册成功的 URL 判定：https + host∈chatgpt.com 且 path 不在 auth/create-account/email-verification/log-in/add-phone。
@@ -798,7 +811,8 @@ async function forgotPasswordFlow({ page, email, requestCode, log, recorder = NO
   if (codeReady) {
     await mark('forgot-03-pre-code', { note: '收码框已出现', url: page.url() });
     log('重设密码 · 等待邮箱验证码');
-    const code = await requestCodeWithResend(page, requestCode, log, { purpose: 'login' });
+    const codeResult = await requestCodeWithResend(page, requestCode, log, { purpose: 'login' });
+    const code = codeResult.code;
     await fillCode(page, code, log);
     await submitCodeForm(page, log, { code });
     await sleep(3500);
@@ -1094,7 +1108,8 @@ export async function loginChatGPT({ page, email, chatgptUrl = 'https://chatgpt.
     : await firstVisible(page, `${S.CODE_INPUT}, ${S.CODE_INPUT_SEGMENTED}`, { timeout: 60000 });
   if (codeReady) {
     log('登录 · 等待邮箱验证码');
-    const code = await requestCodeWithResend(page, requestCode, log, { purpose: 'login' });
+    const codeResult = await requestCodeWithResend(page, requestCode, log, { purpose: 'login' });
+    const code = codeResult.code;
     await fillCode(page, code, log);
     await submitCodeForm(page, log, { code });
     await sleep(4000);
@@ -1102,7 +1117,8 @@ export async function loginChatGPT({ page, email, chatgptUrl = 'https://chatgpt.
       if (!(await isOnCodePage(page))) break;
       log(`登录 · 重新发送验证码，第 ${r} 次`);
       await humanClickByText(page, ['重新发送电子邮件', '重新发送', 'resend email', 'resend'], { timeout: 6000, exclude: OAUTH_EXCLUDE }).catch(() => {});
-      const c2 = await requestCodeWithResend(page, requestCode, log, { purpose: 'login' });
+      const c2Result = await requestCodeWithResend(page, requestCode, log, { purpose: 'login' });
+      const c2 = c2Result.code;
       await fillCode(page, c2, log);
       await submitCodeForm(page, log, { code: c2 });
       await sleep(4000);
@@ -1190,7 +1206,8 @@ async function tryLoginMfaEmailFallback(page, requestCode, log) {
 
   log('登录 · 等待邮箱验证码完成双重验证');
   for (let round = 1; round <= 3; round += 1) {
-    const code = await requestCodeWithResend(page, requestCode, log, { purpose: 'login' });
+    const codeResult = await requestCodeWithResend(page, requestCode, log, { purpose: 'login' });
+    const code = codeResult.code;
     await fillCode(page, code, log);
     await submitCodeForm(page, log, { code });
     await sleep(2500);
@@ -1494,20 +1511,37 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
     throw new Error('点击继续后未跳转到验证码输入页（可能仍在 loading 或出现异常）');
   }
   log('注册 · 开始填写邮箱验证码');
-  const code = await requestCodeWithResend(page, requestCode, log, { purpose: 'register' });
-  await fillCode(page, code, log);
-  await humanClickByText(page, S.CONTINUE_TEXTS, { timeout: 10000, exclude: OAUTH_EXCLUDE, awaitPageLoad: true, log });
+  const codeResult = await requestCodeWithResend(page, requestCode, log, { purpose: 'register' });
+  const fillAudit = await fillCode(page, codeResult.code, log);
+  const submitHit = await humanClickByText(page, S.CONTINUE_TEXTS, { timeout: 10000, exclude: OAUTH_EXCLUDE, awaitPageLoad: true, log });
   await sleep(3000);
+  let chromeErrorRecovered = false;
   // 提交后落到浏览器错误页 → 刷新重填同码再提交（否则会被误判为"验证码无效"）
   if (await recoverFromChromeError(page, log) && await hasVisibleCodeInput(page)) {
+    chromeErrorRecovered = true;
     log('注册 · 页面加载异常，刷新后重新填写验证码', 'warn');
-    await fillCode(page, code, log);
-    await submitCodeForm(page, log, { code });
+    await fillCode(page, codeResult.code, log);
+    await submitCodeForm(page, log, { code: codeResult.code });
     await sleep(3000);
   }
-  await mark('register-04-code-filled', '注册验证码已填');
+  const codeAudit = {
+    codePurpose: codeResult.purpose,
+    code: codeResult.code,
+    codeReceivedAt: codeResult.receivedAt || '',
+    resendRounds: codeResult.resendRounds,
+    ...fillAudit,
+    submitMethod: submitHit ? `continue:${submitHit}` : 'continue-miss',
+    chromeErrorRecovered,
+  };
+  await mark('register-04-code-filled', { note: buildCodeAuditNote(codeAudit), ...codeAudit });
 
   if (!isChromeErrorUrl(page.url()) && await detectInvalidCode(page)) {
+    const invalidHintText = await extractInvalidCodeHint(page);
+    await mark('register-04-code-invalid', {
+      note: `验证码无效 hint=${invalidHintText || '-'}`,
+      ...codeAudit,
+      invalidHintText: invalidHintText || '',
+    });
     throw new Error('验证码无效');
   }
 
@@ -1551,7 +1585,8 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
     log(`注册 · 需要再次验证邮箱，第 ${round} 次`);
     await mark(`register-05b-second-code-${round}`, `round=${round} url=${page.url()}`);
     await humanClickByText(page, RESEND_CODE_TEXTS, { timeout: 6000, exclude: OAUTH_EXCLUDE }).catch(() => {});
-    const code2 = await requestCodeWithResend(page, requestCode, log, { purpose: 'register' });
+    const code2Result = await requestCodeWithResend(page, requestCode, log, { purpose: 'register' });
+    const code2 = code2Result.code;
     await fillCode(page, code2, log);
     await submitCodeForm(page, log, { code: code2 });
     await sleep(4000);
@@ -1628,8 +1663,14 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
 }
 
 async function fillCode(page, code, log) {
+  const audit = {
+    codeInputMode: '',
+    codeInputCount: 0,
+    codeReadback: '',
+    codeReadbackMatches: false,
+  };
   code = String(code == null ? '' : code).replace(/\s+/g, '');
-  if (!code) { log('验证码为空，跳过填写', 'warn'); return; }
+  if (!code) { log('验证码为空，跳过填写', 'warn'); return audit; }
   log(`填写验证码：${code}`);
   const segmented = page.locator(S.CODE_INPUT_SEGMENTED);
   const segCount = await segmented.count().catch(() => 0);
@@ -1641,6 +1682,8 @@ async function fillCode(page, code, log) {
   }, S.CODE_INPUT_SEGMENTED).catch(() => '');
 
   if (segCount >= code.length) {
+    audit.codeInputMode = 'segmented';
+    audit.codeInputCount = segCount;
     // 分格 OTP：聚焦首格后逐字符键入，交给组件自身 auto-advance 前进焦点（不再逐格 nth(i) 定位，
     // 那样会与组件的自动跳格冲突而错位吞字符，如 901755→90755）；填完读回校验，不符则清空重填。
     for (let attempt = 1; attempt <= 3; attempt += 1) {
@@ -1654,29 +1697,40 @@ async function fillCode(page, code, log) {
         await sleep(60 + Math.floor(Math.random() * 90));
       }
       const got = await readSegments();
-      if (got === code) { log('验证码填写完成'); return; }
+      audit.codeReadback = got;
+      audit.codeReadbackMatches = got === code;
+      if (got === code) { log('验证码填写完成'); return audit; }
       log(`验证码填写不完整，期望 ${code}，实际 ${got}，第 ${attempt}/3 次重试`, 'warn');
     }
     log(`验证码多次填写仍不完整，期望 ${code}，继续提交`, 'warn');
-    return;
+    return audit;
   }
 
   const single = await firstVisible(page, S.CODE_INPUT, { timeout: 8000 });
   if (single) {
+    audit.codeInputMode = 'single';
+    audit.codeInputCount = 1;
     await humanType(single, code);
     let got = '';
     try { got = String((await single.inputValue()) || '').replace(/\s+/g, ''); } catch { /* 无 inputValue 能力时跳过校验 */ }
+    audit.codeReadback = got;
+    audit.codeReadbackMatches = !got || got === code;
     if (got && got !== code) {
       log(`验证码填写异常，期望 ${code}，实际 ${got}，重新填写`, 'warn');
       await single.fill('').catch(() => {});
       await single.fill(code).catch(() => {});
+      try { got = String((await single.inputValue()) || '').replace(/\s+/g, ''); } catch { /* ignore */ }
+      audit.codeReadback = got;
+      audit.codeReadbackMatches = !got || got === code;
     }
     log('验证码填写完成');
-    return;
+    return audit;
   }
 
+  audit.codeInputMode = 'keyboard-fallback';
   await page.keyboard.type(code, { delay: 80 });
   log('验证码填写完成');
+  return audit;
 }
 
 // 提交验证码表单：先在框内按 Enter，再点"继续"兜底，最后原生 form.requestSubmit()。
@@ -2275,7 +2329,8 @@ async function step8_setupPasswordAnd2FA(page, { email, password, enable2fa = tr
         if (!(await isOnCodePage(page))) break;
         log(`安全设置 · 设置密码前需验证邮箱，第 ${r} 次`);
         if (r > 1) await humanClickByText(page, ['重新发送电子邮件', '重新发送', 'resend'], { timeout: 5000, exclude: OAUTH_EXCLUDE }).catch(() => {});
-        const vcode = await requestCodeWithResend(page, requestCode, log, { purpose: 'password' });
+        const vcodeResult = await requestCodeWithResend(page, requestCode, log, { purpose: 'password' });
+        const vcode = vcodeResult.code;
         await fillCode(page, vcode, log);
         await submitCodeForm(page, log, { code: vcode });
         await sleep(3500);
@@ -2297,7 +2352,8 @@ async function step8_setupPasswordAnd2FA(page, { email, password, enable2fa = tr
         const codeBox = await firstVisible(page, `${S.CODE_INPUT}, ${S.CODE_INPUT_SEGMENTED}`, { timeout: 4000 });
         if (codeBox) {
           log('安全设置 · 设置密码后需验证邮箱');
-          const code = await requestCodeWithResend(page, requestCode, log, { purpose: 'password' });
+          const codeResult = await requestCodeWithResend(page, requestCode, log, { purpose: 'password' });
+          const code = codeResult.code;
           await fillCode(page, code, log);
           await submitCodeForm(page, log, { code });
           await sleep(2500);
@@ -2400,7 +2456,8 @@ async function step8_setupPasswordAnd2FA(page, { email, password, enable2fa = tr
       if (!(await isOnCodePage(page))) break;
       log(`安全设置 · 开启双重验证前需验证邮箱，第 ${r} 次`);
       if (r > 1) await humanClickByText(page, ['重新发送电子邮件', '重新发送', 'resend'], { timeout: 5000, exclude: OAUTH_EXCLUDE }).catch(() => {});
-      const vc = await requestCodeWithResend(page, requestCode, log, { purpose: '2fa' });
+      const vcResult = await requestCodeWithResend(page, requestCode, log, { purpose: '2fa' });
+      const vc = vcResult.code;
       await fillCode(page, vc, log);
       await submitCodeForm(page, log);
       await sleep(3000);

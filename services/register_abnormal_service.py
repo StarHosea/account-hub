@@ -59,6 +59,12 @@ class RegisterAbnormalService:
     def _save(self) -> None:
         self._storage.save_collection(COLLECTION, list(self._items.values()))
 
+    def _refresh_from_storage_locked(self) -> None:
+        latest = self._storage.load_collection(COLLECTION)
+        if latest is None:
+            return
+        self._items = self._items_to_map(latest)
+
     @staticmethod
     def _normalize(item: dict) -> dict | None:
         if not isinstance(item, dict):
@@ -82,6 +88,7 @@ class RegisterAbnormalService:
 
     def list_items(self) -> list[dict]:
         with self._lock:
+            self._refresh_from_storage_locked()
             # 最近的异常排前面，便于排查。
             return sorted(
                 (dict(v) for v in self._items.values()),
@@ -91,6 +98,7 @@ class RegisterAbnormalService:
 
     def stats(self) -> dict:
         with self._lock:
+            self._refresh_from_storage_locked()
             items = list(self._items.values())
             total = len(items)
             no_trial = sum(1 for a in items if a.get("eligible") is False)
@@ -99,6 +107,7 @@ class RegisterAbnormalService:
     def export_text(self) -> str:
         """导出为 `邮箱---取件地址---原因` 每行一条。"""
         with self._lock:
+            self._refresh_from_storage_locked()
             return "\n".join(
                 f"{a.get('email') or ''}---{a.get('fetch_url') or ''}---{a.get('reason') or ''}"
                 for a in self.list_items()
@@ -112,6 +121,7 @@ class RegisterAbnormalService:
         if not email:
             return None
         with self._lock:
+            self._refresh_from_storage_locked()
             key = _norm_email(email)
             existing = self._items.get(key) or {}
             merged = {
@@ -169,12 +179,14 @@ class RegisterAbnormalService:
 
     def peek(self, email: str) -> dict | None:
         with self._lock:
+            self._refresh_from_storage_locked()
             item = self._items.get(_norm_email(email))
             return dict(item) if item else None
 
     def delete(self, emails: list[str]) -> int:
         removed = 0
         with self._lock:
+            self._refresh_from_storage_locked()
             for email in emails or []:
                 if self._items.pop(_norm_email(email), None) is not None:
                     removed += 1

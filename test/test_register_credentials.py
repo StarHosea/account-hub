@@ -68,6 +68,46 @@ class RegisterCredentialsPersistenceTest(unittest.TestCase):
         self.assertEqual(account.get("password"), "FromMailbox1!")
         self.assertEqual(account.get("totp_secret"), "ABCDEFGH23456789")
 
+    def test_complete_registration_derives_totp_from_otpauth_url(self) -> None:
+        email_key = email_storage_key(self.EMAIL)
+        self.service._accounts[email_key] = self.service._normalize_account(
+            {"email": self.EMAIL, "stage": STAGE_REGISTERING, "_registering": True}
+        )
+
+        self.service.complete_registration(
+            self.EMAIL,
+            {
+                "access_token": self.TOKEN,
+                "otpauth_url": "otpauth://totp/ChatGPT:test?secret=jbswy3dpehpk3pxp&issuer=OpenAI",
+            },
+        )
+
+        account = self.service.get_account(self.TOKEN)
+        self.assertIsNotNone(account)
+        assert account is not None
+        self.assertEqual(account.get("totp_secret"), "JBSWY3DPEHPK3PXP")
+
+    def test_complete_registration_does_not_clear_existing_totp_with_empty_payload(self) -> None:
+        email_key = email_storage_key(self.EMAIL)
+        self.service._accounts[email_key] = self.service._normalize_account(
+            {
+                "email": self.EMAIL,
+                "stage": STAGE_REGISTERING,
+                "_registering": True,
+                "totp_secret": "JBSWY3DPEHPK3PXP",
+            }
+        )
+
+        self.service.complete_registration(
+            self.EMAIL,
+            {"access_token": self.TOKEN, "totp_secret": ""},
+        )
+
+        account = self.service.get_account(self.TOKEN)
+        self.assertIsNotNone(account)
+        assert account is not None
+        self.assertEqual(account.get("totp_secret"), "JBSWY3DPEHPK3PXP")
+
     def test_release_registration_removes_placeholder(self) -> None:
         email_key = email_storage_key(self.EMAIL)
         self.service._accounts[email_key] = self.service._normalize_account(

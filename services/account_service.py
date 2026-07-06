@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1015,6 +1016,7 @@ class AccountService:
         with self._lock:
             norm = str(email or "").strip().lower()
             email_key = email_storage_key(norm)
+            payload = dict(payload or {})
             new_token = str(payload.get("access_token") or "").strip()
 
             # 注册成功时 add_account_items 往往已先写入带 password/2FA 的真实 token 行；
@@ -1032,7 +1034,30 @@ class AccountService:
                     key = email_key
                 current = dict(self._accounts.get(key) or {"email": email})
 
+            # 防止二次合并时空值冲掉已写入的密码/2FA；仅回传 otpauth_url 时自动补全 totp_secret。
+            incoming_password = str(payload.get("password") or "").strip()
+            incoming_totp = str(payload.get("totp_secret") or "").strip()
+            incoming_otpauth = str(payload.get("otpauth_url") or "").strip()
+            if not incoming_totp and incoming_otpauth:
+                incoming_totp = self._totp_secret_from_otpauth(incoming_otpauth)
+            if incoming_password:
+                payload["password"] = incoming_password
+            else:
+                payload.pop("password", None)
+            if incoming_totp:
+                payload["totp_secret"] = incoming_totp
+            else:
+                payload.pop("totp_secret", None)
+            if incoming_otpauth:
+                payload["otpauth_url"] = incoming_otpauth
+            else:
+                payload.pop("otpauth_url", None)
+
             merged = {**current, **payload, "email": email, "_registering": False}
+            if not str(merged.get("totp_secret") or "").strip():
+                merged_totp = self._totp_secret_from_otpauth(merged.get("otpauth_url"))
+                if merged_totp:
+                    merged["totp_secret"] = merged_totp
             merged = apply_stage(
                 merged,
                 STAGE_REGISTERED,
@@ -1118,8 +1143,20 @@ class AccountService:
         raw = str(value or "").strip().replace(" ", "")
         if len(raw) < 16:
             return False
-        import re
         return bool(re.fullmatch(r"[A-Z2-7=]+", raw.upper()))
+
+    @staticmethod
+    def _totp_secret_from_otpauth(value: object) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        match = re.search(r"[?&]secret=([^&]+)", raw, flags=re.IGNORECASE)
+        if not match:
+            return ""
+        secret = match.group(1).strip().replace(" ", "")
+        # otpauth URI 里常见的 base32 padding URL 编码兜底。
+        secret = secret.replace("%3D", "=").replace("%3d", "=")
+        return secret.upper() if secret else ""
 
     @staticmethod
     def _extract_access_token(text: str) -> str:

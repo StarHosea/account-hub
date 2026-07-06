@@ -17,6 +17,10 @@ class FakeLocator {
     return this.page.isVisibleSelector(this.selector) ? 1 : 0;
   }
 
+  async isVisible() {
+    return this.page.isVisibleSelector(this.selector);
+  }
+
   async waitFor() {
     if (!this.page.isVisibleSelector(this.selector)) throw new Error(`not visible: ${this.selector}`);
   }
@@ -75,10 +79,17 @@ class FakeMfaPage {
 
   async evaluate(fn) {
     const source = String(fn);
-    if (source.includes('querySelectorAll') && source.includes('wanted') && source.includes('mark')) {
-      return this.mode === 'totp' ? 'email a code' : null;
+    if (source.includes('hasEmailHint') && source.includes('hasTotpInput')) {
+      return this.mode === 'email-code';
     }
-    if (source.includes('verification code') || source.includes('hasEmailHint') || source.includes('刚刚向')) {
+    if (source.includes('querySelectorAll') && source.includes('wanted') && source.includes('mark')) {
+      if (this.mode === 'totp') {
+        this.mode = 'email-code';
+        return 'email a code';
+      }
+      return null;
+    }
+    if (source.includes('verification code') || source.includes('刚刚向')) {
       return this.mode === 'email-code';
     }
     if (source.includes('mfa-challenge') || source.includes('totp_otp')) {

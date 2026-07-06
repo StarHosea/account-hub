@@ -115,6 +115,8 @@ async function runReal(job) {
       headless: Boolean(job.headless),
       fingerprintSeed: Number.isInteger(job.fingerprintSeed) ? job.fingerprintSeed : null,
       locale: job.locale || null,
+      timezone: job.timezone || null,
+      acceptLanguage: job.acceptLanguage || null,
       log: (m) => log(m),
     });
     const seed = session.seed;

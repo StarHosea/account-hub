@@ -4,10 +4,11 @@ import assert from 'node:assert/strict';
 import * as S from '../flows/openai/selectors.js';
 import { __test } from '../flows/openai/register.js';
 
-test('WRONG_LOGIN_PASSWORD_PATTERN matches OpenAI login error copy', () => {
+test('WRONG_LOGIN_PASSWORD_PATTERN matches ja/zh/en login error copy', () => {
   assert.match('Incorrect email address or password', S.WRONG_LOGIN_PASSWORD_PATTERN);
   assert.match('密码不正确', S.WRONG_LOGIN_PASSWORD_PATTERN);
   assert.match('邮箱或密码错误', S.WRONG_LOGIN_PASSWORD_PATTERN);
+  assert.match('メールアドレスまたはパスワードが正しくありません', S.WRONG_LOGIN_PASSWORD_PATTERN);
   assert.doesNotMatch('How can I help you today', S.WRONG_LOGIN_PASSWORD_PATTERN);
 });
 

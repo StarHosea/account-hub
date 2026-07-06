@@ -12,6 +12,7 @@ export const EMAIL_INPUT = [
   'input[placeholder*="邮箱"]',
   'input[placeholder*="メール"]',
   'input[aria-label*="email" i]',
+  'input[aria-label*="メール"]',
 ].join(', ');
 
 export const PASSWORD_INPUT = [
@@ -22,6 +23,7 @@ export const PASSWORD_INPUT = [
   'input[id*="password" i]',
   'input[placeholder*="password" i]',
   'input[placeholder*="密码"]',
+  'input[placeholder*="パスワード"]',
 ].join(', ');
 
 export const CODE_INPUT = [
@@ -76,13 +78,14 @@ export const BIRTHDAY_INPUT = [
 export const CONTINUE_TEXTS = [
   'continue', 'next', 'sign up', 'create account', 'agree', 'submit',
   '继续', '下一步', '注册', '创建账号', '同意', '提交',
-  '続ける', '続行', '次へ', '登録', '同意',
+  '続ける', '続行', '次へ', '登録', '同意', 'サインアップ',
 ];
 
 // 出现这些文案代表注册基本成功（进入 chatgpt 主界面）
 export const SUCCESS_TEXTS = [
   'How can I help', 'What can I help', 'Message ChatGPT', 'New chat',
   '有什么可以帮', '给 ChatGPT', '新聊天',
+  'どこから始めますか', '新しいチャット',
 ];
 
 // 各类错误文案 → 见 code-errors.js（验证码错误文案来自 auth.openai.com 真实 i18n，含 en/zh/ja）
@@ -96,16 +99,16 @@ export const LOGIN_BUTTON_TESTID = 'login-button';
 export const NO_AUTH_RIGHT_LOGIN_PANEL_TESTID = 'no-auth-right-login-panel';
 
 // 登录密码页：邮箱或密码错误（出现即应转忘记密码，勿再重试提交）
-export const WRONG_LOGIN_PASSWORD_PATTERN = /incorrect\s+email\s+address\s+or\s+password|email.*or\s+password.*incorrect|密码.*(不正确|错误|无效)|邮箱.*密码.*(不正确|错误)|incorrect.*password|invalid password|wrong password/i;
+export const WRONG_LOGIN_PASSWORD_PATTERN = /incorrect\s+email\s+address\s+or\s+password|email.*or\s+password.*incorrect|密码.*(不正确|错误|无效)|邮箱.*密码.*(不正确|错误)|incorrect.*password|invalid password|wrong password|メールアドレス.*パスワード.*(正しくありません|間違)|パスワード.*(正しくありません|間違)/i;
 
 // 忘记密码 / 重置流程（en/zh/ja）
 export const FORGOT_PASSWORD_PATTERN = /忘记了密码|忘记密码|forgot|お忘れ|パスワードをお忘れ/i;
-export const RESET_CONTINUE_PATTERN = /继续|continue|发送|send|続行|続ける/i;
+export const RESET_CONTINUE_PATTERN = /继续|continue|发送|send|続行|続ける|送信/i;
 export const RESET_SAVE_PATTERN = /继续|保存|重置|确认|continue|save|reset|confirm|続行|保存|リセット|確認/i;
 export const RESET_SUCCESS_PATTERN = /重置.*成功|密码.*(已|修改|重置).*成功|password.*(reset|changed|updated)|パスワード.*(変更|更新|リセット).*成功/i;
 export const NEW_PASSWORD_PAGE_PATTERN = /新密码|设置密码|重新输入.*密码|create.*password|new password|新しいパスワード|パスワードを(設定|再入力)/i;
 export const LOGIN_LINK_PATTERN = /^登录$|登 ?录|log ?in|sign ?in|ログイン/i;
 export const LOGIN_OTP_TEXTS = [
   '改用验证码', '使用验证码', '通过电子邮件', 'email a code', 'send code', '发送验证码', 'use a code', 'verification code',
-  'メールで確認', 'メールで続行', 'コードを使用', 'メールにコードを送信',
+  'メールで確認', 'メールで続行', 'コードを使用', 'メールにコードを送信', 'メール', 'Eメール',
 ];

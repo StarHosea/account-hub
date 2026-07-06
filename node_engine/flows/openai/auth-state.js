@@ -134,11 +134,11 @@ export async function collectSignals(page) {
           if (codeInput?.getAttribute('aria-invalid') === 'true') return true;
           return false;
         })(),
-        forgotOrWelcomeBack: /忘记了密码|忘记密码|forgot password|お忘れ|パスワードをお忘れ|欢迎回来|welcome back/i.test(text),
-        checkInbox: /检查你的收件箱|输入.*验证码|check your inbox|enter the code|verification code/i.test(text),
-        mfaAuthenticator: /验证器应用|输入验证器|authenticator|two-factor|双重验证|验证你的身份|一次性验证码|一次性密码/i.test(text),
-        mfaEmailHint: /检查你的收件箱|查看你的邮箱|邮件已发送|邮箱验证码|电子邮件.*验证码|check your inbox|sent.*email|email.*code|verification code/i.test(text),
-        welcomeOverlay: /你已准备就绪|准备就绪|欢迎使用|请勿分享敏感信息|may (make mistakes|be reviewed)/i.test(text),
+        forgotOrWelcomeBack: /忘记了密码|忘记密码|forgot password|お忘れ|パスワードをお忘れ|欢迎回来|welcome back|ようこそ/i.test(text),
+        checkInbox: /检查你的收件箱|输入.*验证码|check your inbox|enter the code|verification code|受信トレイ|確認コード|ワンタイム/i.test(text),
+        mfaAuthenticator: /验证器应用|输入验证器|authenticator|two-factor|双重验证|验证你的身份|一次性验证码|一次性密码|認証アプリ|二要素/i.test(text),
+        mfaEmailHint: /检查你的收件箱|查看你的邮箱|邮件已发送|邮箱验证码|电子邮件.*验证码|check your inbox|sent.*email|email.*code|verification code|受信トレイ|メール.*送信|確認コード|届きません|再送信/i.test(text),
+        welcomeOverlay: /你已准备就绪|准备就绪|欢迎使用|请勿分享敏感信息|may (make mistakes|be reviewed)|準備完了|ようこそ/i.test(text),
         success: (sel.successTexts || []).some((t) => text.includes(t)),
         textLen: text.length,
       };

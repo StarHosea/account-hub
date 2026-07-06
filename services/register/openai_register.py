@@ -678,6 +678,8 @@ def _run_browser_job(
         "chatgptUrl": chatgpt_url,
         "timeoutMs": timeout_s * 1000,
         "locale": identity.browser_locale,
+        "timezone": identity.browser_timezone,
+        "acceptLanguage": identity.accept_language,
         "staticCache": static_cache_job_options(),
     }
     job.update(record_job_options())

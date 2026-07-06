@@ -531,12 +531,14 @@ async function openWithRetry(page, url, log, { attempts = 3, recorder = NOOP_REC
         log(`已打开页面（第 ${i} 次），标题：${await page.title().catch(() => '')}`);
         return true;
       }
-      const thinUrl = await page.url().catch(() => url);
+      let thinUrl = url;
+      try { thinUrl = page.url(); } catch { /* ignore */ }
       log(`页面内容过少，第 ${i} 次重新打开`);
       await mark(`register-00-goto-thin-${i}`, { note: '页面内容过少', url: thinUrl, attempt: i, attempts });
     } catch (err) {
       lastErr = err;
-      const failUrl = await page.url().catch(() => url);
+      let failUrl = url;
+      try { failUrl = page.url(); } catch { /* ignore */ }
       log(`打开页面失败（第 ${i}/${attempts} 次）：${err?.message || err}`);
       await mark(`register-00-goto-fail-${i}`, {
         note: String(err?.message || err),

@@ -269,6 +269,37 @@ def _proxy_sid(acct_proxy: str) -> str:
     return parts[-1] if parts else "?"
 
 
+def _proxy_diag_fields(acct_proxy: str, identity, exit_ip: str = "") -> dict:
+    """脱敏代理摘要，写入异常清单与诊断 brief。"""
+    region = str(getattr(getattr(identity, "region", None), "code", "") or "").strip()
+    if not acct_proxy:
+        fields = {
+            "proxy_region": region or None,
+            "proxy_host": None,
+            "proxy_scheme": None,
+            "proxy_sid": None,
+            "exit_ip": str(exit_ip or "").strip() or None,
+            "proxy_mode": "direct",
+        }
+        return {k: v for k, v in fields.items() if v is not None}
+
+    parsed = parse_proxy(acct_proxy)
+    host = str(parsed.host if parsed else "").strip()
+    scheme = str(parsed.scheme if parsed else "").strip()
+    sid = _proxy_sid(acct_proxy)
+    sid_masked = f"…{sid[-4:]}" if sid not in ("", "?") and len(sid) > 4 else sid
+    mode = "ipweb" if host.endswith("ipweb.cc") else "proxy"
+    fields = {
+        "proxy_region": region or None,
+        "proxy_host": host or None,
+        "proxy_scheme": scheme or None,
+        "proxy_sid": sid_masked,
+        "exit_ip": str(exit_ip or "").strip() or None,
+        "proxy_mode": mode,
+    }
+    return {k: v for k, v in fields.items() if v is not None}
+
+
 def _code_purpose_label(purpose: str) -> str:
     return mail_code.purpose_label(purpose)
 
@@ -768,6 +799,9 @@ def worker(index: int) -> dict:
     _progress_update(index, status="running", step="任务启动", email="")
     mailbox: dict | None = None
     mailbox_settled = False
+    acct_proxy = ""
+    exit_ip = ""
+    identity = None
 
     def _fail_timeout() -> dict:
         nonlocal mailbox_settled
@@ -781,7 +815,12 @@ def worker(index: int) -> dict:
         email = str((mailbox or {}).get("address") or "").strip()
         fetch_url = str((mailbox or {}).get("fetch_url") or "")
         if email:
-            register_abnormal_service.add(email, fetch_url=fetch_url, reason=err)
+            register_abnormal_service.add(
+                email,
+                fetch_url=fetch_url,
+                reason=err,
+                **_proxy_diag_fields(acct_proxy, identity, exit_ip),
+            )
             log(f"{email} 注册超时，已记入异常清单", "yellow")
         cost = time.time() - start
         with stats_lock:
@@ -904,7 +943,10 @@ def worker(index: int) -> dict:
         # —— 失败：可能带 partial token（step8 失败但已拿 token）—— #
         mailbox_settled = True
         token = str((partial or {}).get("accessToken") or "").strip()
-        abnormal_extra = {"recording_path": recording_dir} if recording_dir else {}
+        abnormal_extra = {
+            **_proxy_diag_fields(acct_proxy, identity, exit_ip),
+            **({"recording_path": recording_dir} if recording_dir else {}),
+        }
         if token:
             register_abnormal_service.add(
                 email, fetch_url=fetch_url, reason=str(err_msg or "register_error"),
@@ -938,7 +980,12 @@ def worker(index: int) -> dict:
         email = str((mailbox or {}).get("address") or "").strip()
         fetch_url = str((mailbox or {}).get("fetch_url") or "")
         if email:
-            register_abnormal_service.add(email, fetch_url=fetch_url, reason=str(e))
+            register_abnormal_service.add(
+                email,
+                fetch_url=fetch_url,
+                reason=str(e),
+                **_proxy_diag_fields(acct_proxy, identity, exit_ip),
+            )
             log(f"{email} 注册异常，已记入异常清单：{e}", "yellow")
         cost = time.time() - start
         with stats_lock:

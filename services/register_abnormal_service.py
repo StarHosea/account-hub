@@ -8,6 +8,15 @@ from services.config import config
 
 COLLECTION = "register_abnormal"
 
+PROXY_DIAG_KEYS = (
+    "proxy_region",
+    "proxy_host",
+    "proxy_scheme",
+    "proxy_sid",
+    "exit_ip",
+    "proxy_mode",
+)
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -66,6 +75,7 @@ class RegisterAbnormalService:
             "eligible": item.get("eligible") if isinstance(item.get("eligible"), bool) else None,
             "recording_path": str(item.get("recording_path") or "").strip() or None,
             "created_at": item.get("created_at") or _now(),
+            **{key: item.get(key) for key in PROXY_DIAG_KEYS if item.get(key) not in (None, "")},
         }
 
     # ----------------------------- 对外只读视图 ----------------------------- #
@@ -114,6 +124,11 @@ class RegisterAbnormalService:
                 "recording_path": extra.get("recording_path") or existing.get("recording_path"),
                 "created_at": existing.get("created_at") or _now(),
             }
+            for key in PROXY_DIAG_KEYS:
+                if key in extra and extra.get(key) not in (None, ""):
+                    merged[key] = extra[key]
+                elif existing.get(key) not in (None, ""):
+                    merged[key] = existing[key]
             normalized = self._normalize(merged)
             if normalized is None:
                 return None

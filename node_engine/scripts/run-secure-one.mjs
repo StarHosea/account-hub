@@ -33,7 +33,7 @@ try {
     enable2fa: !args['no-2fa'],
     loginPassword: args.password || '',
     existingTotpSecret: args['totp-secret'] || '',
-    forceReset2fa: Boolean(args['force-reset-2fa']),
+    forceReset2fa: !args['no-2fa'],
     requestCode,
     log,
   });

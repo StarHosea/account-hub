@@ -45,6 +45,20 @@ class ParseProxyTest(unittest.TestCase):
         self.assertEqual(fp.normalize_proxy(""), "")
 
 
+class BrowserProxyUrlTest(unittest.TestCase):
+    def test_socks5h_to_socks5(self):
+        self.assertEqual(
+            fp.browser_proxy_url("socks5h://user:pass@gate2.ipweb.cc:7778"),
+            "socks5://user:pass@gate2.ipweb.cc:7778",
+        )
+
+    def test_http_unchanged(self):
+        self.assertEqual(
+            fp.browser_proxy_url("http://user:pass@proxy.example:8080"),
+            "http://user:pass@proxy.example:8080",
+        )
+
+
 class RotateIpwebTest(unittest.TestCase):
     def test_changes_country_and_sid(self):
         url, sid = fp.rotate_ipweb_proxy(IPWEB_RAW, "US")

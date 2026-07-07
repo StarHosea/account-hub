@@ -24,6 +24,13 @@ function cdpArgs() {
   return port > 0 ? [`--remote-debugging-port=${port}`, '--remote-debugging-address=127.0.0.1'] : [];
 }
 
+/** CloakBrowser 0.4.8+ 风控相关 Chromium 参数 */
+function cloakFingerprintArgs(proxyUrl) {
+  const args = ['--fingerprint-allow-3p-cookies'];
+  if (proxyUrl && process.platform === 'linux') args.push('--license-through-proxy');
+  return args;
+}
+
 let _launchContext = null;
 let _loadError = null;
 
@@ -147,8 +154,7 @@ export async function launchSession(proxyUrl, { headless = false, fingerprintSee
         geoip: useGeoip,
         humanize: true,
         headless,
-        viewport: { width: 1280, height: 800 },
-        args: [`--fingerprint=${seed}`, ...HARDENING_ARGS, ...cdpArgs()],
+        args: [`--fingerprint=${seed}`, ...cloakFingerprintArgs(proxyUrl), ...HARDENING_ARGS, ...cdpArgs()],
       };
       if (resolvedLocale) opts.locale = resolvedLocale;
       if (browserTimezone) opts.timezone = browserTimezone;

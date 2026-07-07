@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 from pathlib import Path
 
 from fastapi import HTTPException
@@ -42,6 +43,28 @@ def require_admin(authorization: str | None) -> dict[str, object]:
     if identity.get("role") != "admin":
         raise HTTPException(status_code=403, detail={"error": "需要管理员权限才能执行这个操作"})
     return identity
+
+
+def extract_pool_client_token(
+    authorization: str | None = None,
+    x_api_token: str | None = None,
+) -> str:
+    """FlowPilot 插件池客户端 token：Bearer 或 X-Api-Token。"""
+    header_token = extract_bearer_token(authorization)
+    if header_token:
+        return header_token
+    return str(x_api_token or "").strip()
+
+
+def require_pool_client(
+    authorization: str | None = None,
+    x_api_token: str | None = None,
+) -> None:
+    """插件池 API 鉴权：仅接受管理员主密钥 ACCOUNT_HUB_AUTH_KEY。"""
+    token = extract_pool_client_token(authorization, x_api_token)
+    auth_key = str(config.auth_key or "").strip()
+    if not auth_key or not token or not hmac.compare_digest(token, auth_key):
+        raise HTTPException(status_code=401, detail="密钥无效或已失效，请重新登录")
 
 
 def resolve_web_asset(requested_path: str) -> Path | None:

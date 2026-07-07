@@ -9,12 +9,12 @@ import zipfile
 from datetime import datetime
 from typing import Any, Literal
 
-from fastapi import APIRouter, Header, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
-from api.support import require_admin
+from api.support import require_admin, require_pool_client
 from services.account_lifecycle import (
     STAGE_ACTIVATING,
     STAGE_PLUS_ACTIVATED,
@@ -29,6 +29,7 @@ from services.account_lifecycle import (
 )
 from services.account_service import account_service
 from services.mailbox_service import mailbox_service
+from services.pool_client_service import is_flowpilot_pool_upload, upload_flowpilot_account
 
 
 class AccountCreateRequest(BaseModel):
@@ -236,7 +237,19 @@ def create_router() -> APIRouter:
         }
 
     @router.post("/api/accounts")
-    async def create_accounts(body: AccountCreateRequest, authorization: str | None = Header(default=None)):
+    async def create_accounts(
+        request: Request,
+        authorization: str | None = Header(default=None),
+        x_api_token: str | None = Header(default=None, alias="X-Api-Token"),
+    ):
+        raw_body = await request.json()
+        if not isinstance(raw_body, dict):
+            raise HTTPException(status_code=400, detail={"error": "请求体必须是 JSON 对象"})
+        if is_flowpilot_pool_upload(raw_body):
+            require_pool_client(authorization, x_api_token)
+            return upload_flowpilot_account(raw_body)
+
+        body = AccountCreateRequest.model_validate(raw_body)
         require_admin(authorization)
         parsed_accounts, parsed_tokens = account_service.parse_import_blob(body.text)
         account_payloads = [item for item in body.accounts if isinstance(item, dict)] + parsed_accounts

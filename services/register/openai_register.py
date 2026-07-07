@@ -425,6 +425,18 @@ def _browser_proxy_url(raw: str, index: int) -> str:
     return f"{scheme}://{auth}{parsed.host}:{parsed.port}"
 
 
+def _browser_uses_geoip(proxy_url: str) -> bool:
+    """住宅代理场景：locale/时区/Accept-Language 交给 CloakBrowser geoip（与 node_engine 一致）。"""
+    raw = (proxy_url or "").strip()
+    if not raw:
+        return False
+    try:
+        host = (urlparse(raw).hostname or "").lower()
+        return host not in ("127.0.0.1", "localhost", "::1")
+    except Exception:
+        return True
+
+
 def static_cache_job_options() -> dict:
     """静态资源 route 缓存配置，随 job JSON 下发给 Node worker。"""
     raw_dir = str(config.get("static_cache_dir") or "").strip()
@@ -690,6 +702,7 @@ def _run_browser_job(
         return None, _timeout_error_message(), {}, ""
 
     timeout_s = max(1, int(remaining))
+    use_geoip = _browser_uses_geoip(browser_proxy)
     job = {
         "email": email,
         "proxyUrl": browser_proxy,
@@ -698,9 +711,9 @@ def _run_browser_job(
         "headless": bool(config.get("headless")),
         "chatgptUrl": chatgpt_url,
         "timeoutMs": timeout_s * 1000,
-        "locale": identity.browser_locale,
-        "timezone": identity.browser_timezone,
-        "acceptLanguage": identity.accept_language,
+        "locale": None if use_geoip else identity.browser_locale,
+        "timezone": None if use_geoip else identity.browser_timezone,
+        "acceptLanguage": None if use_geoip else identity.accept_language,
         "staticCache": static_cache_job_options(),
     }
     job.update(record_job_options())

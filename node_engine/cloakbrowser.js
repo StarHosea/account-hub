@@ -24,6 +24,15 @@ function cdpArgs() {
   return port > 0 ? [`--remote-debugging-port=${port}`, '--remote-debugging-address=127.0.0.1'] : [];
 }
 
+// 强制 HTTP/1.1（默认开）。CloakBrowser 官方 troubleshooting：CF 对「首访、无 cookie、走 HTTP/2」的
+// 新域名会下发「Just a moment」fresh-session 挑战（影响所有 Chromium）；socks5 只换 TCP 隧道、浏览器仍与
+// 源站协商 h2，解决不了。实测本项目正是在提交邮箱验证码后跳 auth.openai.com（对本会话为全新域名）时被此挑战
+// 拦住。--disable-http2 让 Chromium 走 h1.1 绕过该检查。若某域名反而因 h1.1 变慢/异常，设 CLOAK_DISABLE_HTTP2=false 关闭。
+function http2Args() {
+  const v = String(process.env.CLOAK_DISABLE_HTTP2 || 'true').toLowerCase();
+  return v !== 'false' ? ['--disable-http2'] : [];
+}
+
 /** CloakBrowser 0.4.8+ 风控相关 Chromium 参数（对齐官方 FPJS / Turnstile 推荐配置） */
 function cloakFingerprintArgs(proxyUrl) {
   const args = [
@@ -171,7 +180,7 @@ export async function launchSession(proxyUrl, { headless = false, fingerprintSee
         geoip: useGeoip,
         humanize: true,
         headless,
-        args: [`--fingerprint=${seed}`, ...cloakFingerprintArgs(proxyUrl), ...HARDENING_ARGS, ...cdpArgs()],
+        args: [`--fingerprint=${seed}`, '--start-maximized', ...http2Args(), ...cloakFingerprintArgs(proxyUrl), ...HARDENING_ARGS, ...cdpArgs()],
       };
       if (resolvedLocale) opts.locale = resolvedLocale;
       if (browserTimezone) opts.timezone = browserTimezone;
@@ -224,6 +233,7 @@ async function launchFallbackChromium(proxyUrl, headless, locale, timezone, acce
     proxy: pwProxy,
     args: [
       ...HARDENING_ARGS,
+      ...http2Args(),
       ...cdpArgs(),
       '--disable-blink-features=AutomationControlled',
       '--disable-features=IsolateOrigins,site-per-process',

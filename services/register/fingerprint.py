@@ -184,7 +184,7 @@ class Identity:
 
     @property
     def browser_timezone(self) -> str:
-        """CloakBrowser IANA 时区，与 browser_locale 成对传入以避免 geoip 按代理出口覆盖语言。"""
+        """本机联调代理用的 IANA 时区；生产住宅代理由 CloakBrowser geoip 按出口 IP 对齐。"""
         return browser_timezone_for_region(self.region.code)
 
     @property
@@ -237,7 +237,7 @@ def browser_locale_for_region(code: str | None) -> str:
 
 
 def browser_timezone_for_region(code: str | None) -> str:
-    """按地区码返回 IANA 时区，与 browser_locale 成对下发给 CloakBrowser。"""
+    """按地区码返回 IANA 时区；仅本机 7890 等本地代理时由 worker 使用，生产走 geoip。"""
     return {
         "US": "America/New_York",
         "JP": "Asia/Tokyo",

@@ -54,18 +54,35 @@ function toPlaywrightProxy(proxyUrl) {
   }
 }
 
-// 与 Python identity.region 对齐的 IANA 时区；显式 locale 时一并传入，避免 geoip 按代理出口（如本机 7890→CN）覆盖语言。
+// 本机联调代理（7890 等）出口常为 CN；此时关 geoip，用手动 IANA 时区 + 显式 locale。
 const LOCALE_IANA_TZ = {
   'en-US': 'America/New_York',
   'ja-JP': 'Asia/Tokyo',
   'en-IN': 'Asia/Kolkata',
 };
 
+/** 本机转发代理（127.0.0.1:7890 等），geoip 会误识别为 CN。 */
+function isLocalDevProxy(proxyUrl) {
+  const raw = String(proxyUrl || '').trim();
+  if (!raw) return false;
+  try {
+    const host = new URL(raw).hostname.toLowerCase();
+    return host === '127.0.0.1' || host === 'localhost' || host === '::1';
+  } catch {
+    return /(?:^|\/\/)(?:127\.0\.0\.1|localhost)(?::|\/|$)/i.test(raw);
+  }
+}
+
+/** 住宅代理：geoip 按出口 IP 对齐时区；语言仍由显式 locale / Accept-Language 锁定。 */
+function shouldUseGeoip(proxyUrl) {
+  return Boolean(String(proxyUrl || '').trim()) && !isLocalDevProxy(proxyUrl);
+}
+
 function resolveLocale(locale, proxyUrl) {
   const v = String(locale || '').trim();
   if (v) return v;
   // 有代理且开 geoip 时不设 locale，让 CloakBrowser 按出口 IP 自动匹配；无代理则回退 en-US
-  return proxyUrl ? null : 'en-US';
+  return shouldUseGeoip(proxyUrl) ? null : (proxyUrl ? null : 'en-US');
 }
 
 function resolveTimezone(timezone, locale) {
@@ -73,6 +90,12 @@ function resolveTimezone(timezone, locale) {
   if (tz) return tz;
   const loc = String(locale || '').trim();
   return LOCALE_IANA_TZ[loc] || null;
+}
+
+/** 仅本地代理或无 geoip 时下发手动 IANA；生产住宅代理交给 geoip。 */
+function effectiveBrowserTimezone(proxyUrl, resolvedTimezone) {
+  if (shouldUseGeoip(proxyUrl)) return null;
+  return resolvedTimezone || null;
 }
 
 /** 显式 locale 时同步 navigator.language，避免本机 zh-CN 泄漏到 auth 页。 */
@@ -109,25 +132,26 @@ export async function launchSession(proxyUrl, { headless = false, fingerprintSee
   const resolvedAcceptLanguage = String(acceptLanguage || '').trim()
     || (resolvedLocale ? `${resolvedLocale},${resolvedLocale.split('-')[0]};q=0.9,en-US;q=0.8,en;q=0.7` : '');
 
+  const useGeoip = shouldUseGeoip(proxyUrl);
+  const browserTimezone = effectiveBrowserTimezone(proxyUrl, resolvedTimezone);
+
   if (useSystemChrome()) {
-    const fb = await launchFallbackChromium(proxyUrl, headless, resolvedLocale || 'en-US', resolvedTimezone, resolvedAcceptLanguage, log);
+    const fb = await launchFallbackChromium(proxyUrl, headless, resolvedLocale || 'en-US', browserTimezone, resolvedAcceptLanguage, log);
     fb.seed = seed;
     return fb;
   }
 
   if (launchContext) {
     try {
-      // 显式 locale 时关闭 geoip：本机 7890 出口常为 CN，geoip/WebRTC IP 会把 navigator.language 拉回 zh-CN。
-      const useExplicitLocale = Boolean(resolvedLocale);
       const opts = {
-        geoip: !useExplicitLocale,
+        geoip: useGeoip,
         humanize: true,
         headless,
         viewport: { width: 1280, height: 800 },
         args: [`--fingerprint=${seed}`, ...HARDENING_ARGS, ...cdpArgs()],
       };
       if (resolvedLocale) opts.locale = resolvedLocale;
-      if (resolvedTimezone) opts.timezone = resolvedTimezone;
+      if (browserTimezone) opts.timezone = browserTimezone;
       if (resolvedAcceptLanguage) {
         opts.contextOptions = {
           extraHTTPHeaders: { 'Accept-Language': resolvedAcceptLanguage },
@@ -140,8 +164,8 @@ export async function launchSession(proxyUrl, { headless = false, fingerprintSee
         await context.setExtraHTTPHeaders({ 'Accept-Language': resolvedAcceptLanguage });
       }
       const browser = context.browser();
-      const localeNote = resolvedLocale || (proxyUrl ? 'geoip 自动' : 'en-US');
-      const tzNote = resolvedTimezone ? `，tz=${resolvedTimezone}` : '';
+      const localeNote = resolvedLocale || (useGeoip ? 'geoip 自动' : 'en-US');
+      const tzNote = useGeoip ? '，tz=geoip' : (browserTimezone ? `，tz=${browserTimezone}` : '');
       log(`浏览器已启动（seed=${seed}，locale=${localeNote}${tzNote}${proxyUrl ? '，出口走代理' : '，直连'}）`);
       return {
         mode: 'cloakbrowser',
@@ -163,7 +187,7 @@ export async function launchSession(proxyUrl, { headless = false, fingerprintSee
     log(`浏览器加载失败（${_loadError?.message || _loadError}），正在切换备用模式`);
   }
 
-  const fb = await launchFallbackChromium(proxyUrl, headless, resolvedLocale || 'en-US', resolvedTimezone, resolvedAcceptLanguage, log);
+  const fb = await launchFallbackChromium(proxyUrl, headless, resolvedLocale || 'en-US', browserTimezone, resolvedAcceptLanguage, log);
   fb.seed = seed; // 回退模式无真实指纹，仍记录 seed 保持数据结构一致
   return fb;
 }
@@ -218,5 +242,12 @@ async function launchFallbackChromium(proxyUrl, headless, locale, timezone, acce
     },
   };
 }
+
+export const __test = {
+  isLocalDevProxy,
+  shouldUseGeoip,
+  effectiveBrowserTimezone,
+  resolveTimezone,
+};
 
 export default { launchSession };

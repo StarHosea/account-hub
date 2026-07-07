@@ -8,8 +8,7 @@
 // Turnstile / FingerprintJS 等检测。每次 launch = 一个独立浏览器实例（独立指纹）。
 //
 // 与 browserregister 的差异：
-//   - proxy 由 Python 侧解析好，作为完整 http(s):// URL 字符串传入（Chromium 无法做
-//     带认证的 SOCKS5，故 Python 强制转 http）。
+//   - proxy 由 Python 侧解析好，作为完整 URL 字符串传入（ipweb 等走 socks5://，固定 HTTP 代理走 http://）。
 //   - Docker 内 Chromium 必须 --no-sandbox --disable-dev-shm-usage。
 //   - 回退到 playwright-core 由环境变量 CLOAK_FALLBACK_CHROMIUM 控制（本地默认 true；
 //     Docker 入口脚本设为 false，避免生产静默降级到无 stealth 的 Chromium）。

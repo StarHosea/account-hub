@@ -15,7 +15,7 @@ from __future__ import annotations
 import random
 import string
 from dataclasses import dataclass
-from urllib.parse import urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 # auth.openai.com 作为注册流程多数 JSON 请求的 origin（与旧 common_headers 保持一致）
 _AUTH_ORIGIN = "https://auth.openai.com"
@@ -373,6 +373,26 @@ def normalize_proxy(raw: str, default_scheme: str = "socks5h") -> str:
     """把任意支持的写法归一化为可直接交给 curl_cffi 的 URL；不可解析则原样返回。"""
     parsed = parse_proxy(raw, default_scheme)
     return parsed.to_url() if parsed else (raw or "").strip()
+
+
+def browser_proxy_url(raw: str, *, default_scheme: str = "socks5h") -> str | None:
+    """把代理 URL 转成 CloakBrowser/Chromium 可用格式。
+
+    CloakBrowser 0.4.8+ 原生支持带认证 SOCKS5（优于 HTTP CONNECT，利于过 Cloudflare）。
+    socks5/socks5h 归一为 ``socks5://``；http(s) 原样保留。无法解析返回 None。
+    """
+    parsed = parse_proxy(raw, default_scheme=default_scheme)
+    if parsed is None:
+        return None
+    scheme = (parsed.scheme or default_scheme).lower()
+    if scheme in ("socks", "socks5", "socks5h"):
+        scheme = "socks5"
+    elif scheme not in ("http", "https"):
+        scheme = "socks5"
+    user = quote(unquote(parsed.user), safe="") if parsed.user else ""
+    pwd = quote(unquote(parsed.password), safe="") if parsed.password else ""
+    auth = f"{user}:{pwd}@" if user else ""
+    return f"{scheme}://{auth}{parsed.host}:{parsed.port}"
 
 
 def rotate_ipweb_proxy(

@@ -84,14 +84,14 @@ class BrowserProxyUrlTest(unittest.TestCase):
         from services.register import openai_register
         self.o = openai_register
 
-    def test_socks5_with_auth_becomes_http(self):
+    def test_socks5_with_auth_stays_socks5(self):
         url = self.o._browser_proxy_url("socks5h://user:pass@gate2.ipweb.cc:7778", 1)
-        self.assertEqual(url, "http://user:pass@gate2.ipweb.cc:7778")
+        self.assertEqual(url, "socks5://user:pass@gate2.ipweb.cc:7778")
 
     def test_no_double_encoding(self):
         # 已编码的 %40 不应被二次编码成 %2540
         url = self.o._browser_proxy_url("socks5h://user:p%40ss@h.ipweb.cc:7778", 1)
-        self.assertEqual(url, "http://user:p%40ss@h.ipweb.cc:7778")
+        self.assertEqual(url, "socks5://user:p%40ss@h.ipweb.cc:7778")
 
     def test_raw_special_char_encoded_once(self):
         url = self.o._browser_proxy_url("http://user:p@ss@h:7778", 1)
@@ -104,7 +104,7 @@ class BrowserProxyUrlTest(unittest.TestCase):
 
     def test_ipweb_native_colon_form(self):
         url = self.o._browser_proxy_url("gate2.ipweb.cc:7778:B_1_US_x:pw", 1)
-        self.assertEqual(url, "http://B_1_US_x:pw@gate2.ipweb.cc:7778")
+        self.assertEqual(url, "socks5://B_1_US_x:pw@gate2.ipweb.cc:7778")
 
 
 class AcquireWorkingProxyTest(unittest.TestCase):

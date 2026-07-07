@@ -21,6 +21,7 @@ from services.register import mail_code
 from services.register import fingerprint
 from services.register.fingerprint import (
     ParsedProxy,
+    browser_proxy_url,
     build_identity,
     normalize_proxy,
     parse_proxy,
@@ -244,7 +245,7 @@ def _probe_exit_ip(account_proxy: str, timeout: float = 12.0) -> str | None:
 
     走 curl_cffi（与 mail_provider 一致，支持带认证 socks5h），不复用收件会话——
     收件永不走代理，这里必须走代理才能验证「这条出口线路是否真的活着」。
-    socks5h 探活失败时会再试 http（与浏览器侧 _browser_proxy_url 一致）。
+    socks5h 探活失败时会再试 http 兜底（curl 侧兼容）。
     """
     proxy = (account_proxy or "").strip()
     if not proxy:
@@ -400,29 +401,14 @@ def _acquire_working_proxy(identity, index: int) -> tuple[str, str]:
 
 
 def _browser_proxy_url(raw: str, index: int) -> str:
-    """把账号代理转成 Chromium 可用的 http(s):// URL。
-
-    Chromium/Playwright 无法做「带认证的 SOCKS5」，而 account-hub 代理默认归一化为 socks5h。
-    这里统一强制成 http，凭据做 URL 编码；无法解析则直连（返回空串）。
-    """
+    """把账号代理转成 CloakBrowser 可用的 URL（ipweb 等优先 socks5://，固定 HTTP 代理保持 http）。"""
     if not raw:
         return ""
-    parsed = parse_proxy(raw, default_scheme="http")
-    if parsed is None:
+    url = browser_proxy_url(raw)
+    if url is None:
         step(index, f"代理地址无法解析，使用本机网络：{raw}", "yellow")
         return ""
-    scheme = (parsed.scheme or "http").lower()
-    if scheme.startswith("socks"):
-        if parsed.user:
-            step(index, "检测到 SOCKS5 代理，已自动切换为 HTTP 方式连接", "yellow")
-        scheme = "http"
-    elif scheme not in ("http", "https"):
-        scheme = "http"
-    # 先 unquote 再 quote，避免对已编码的凭据二次编码（p%40ss → p@ss → p%40ss）
-    user = quote(unquote(parsed.user), safe="") if parsed.user else ""
-    pwd = quote(unquote(parsed.password), safe="") if parsed.password else ""
-    auth = f"{user}:{pwd}@" if user else ""
-    return f"{scheme}://{auth}{parsed.host}:{parsed.port}"
+    return url
 
 
 def _browser_uses_geoip(proxy_url: str) -> bool:

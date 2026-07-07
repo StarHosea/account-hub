@@ -5,7 +5,7 @@ oauth-token），而是复用注册用的 node_engine 浏览器引擎：spawn wo
 loginChatGPT 用账号存的 password + totp 在真实浏览器里登录取新 token。
 
 - 验证码从账号「自己绑定的邮箱」取（mailbox_service.get_fetch_url），不是注册用的邮箱池。
-- 代理复用账号专属出口（号一号一 IP），转成 Chromium 可用的 http(s):// 形式。
+- 代理复用账号专属出口（号一号一 IP），转成 CloakBrowser 可用的 socks5/http URL。
 - 复用 openai_register 的 config / _spawn_worker / NDJSON 泵原语，保持与注册同一套引擎与生命周期管理。
 """
 from __future__ import annotations
@@ -13,12 +13,10 @@ from __future__ import annotations
 import json
 import threading
 
-from urllib.parse import quote, unquote
-
 from services.register import mail_provider
 from services.register import mail_code
 from services.register import openai_register as reg
-from services.register.fingerprint import parse_proxy, browser_locale_for_region
+from services.register.fingerprint import browser_proxy_url, browser_locale_for_region
 
 # 浏览器登录很重（每次起一个浏览器几秒），批量刷新时限全局并发，避免同时起几十个浏览器打爆机器。
 # 与注册线程池相互独立；如需调整改这里即可。
@@ -27,22 +25,8 @@ _login_sem = threading.Semaphore(_LOGIN_CONCURRENCY)
 
 
 def _to_browser_proxy(raw: str) -> str:
-    """把账号专属代理转成 Chromium 可用的 http(s):// URL（带认证 SOCKS5 → 强制 http）。
-
-    与 openai_register._browser_proxy_url 同源逻辑，但不写注册进度表（无任务号）。
-    """
-    if not raw:
-        return ""
-    parsed = parse_proxy(raw, default_scheme="http")
-    if parsed is None:
-        return ""
-    scheme = (parsed.scheme or "http").lower()
-    if scheme.startswith("socks") or scheme not in ("http", "https"):
-        scheme = "http"
-    user = quote(unquote(parsed.user), safe="") if parsed.user else ""
-    pwd = quote(unquote(parsed.password), safe="") if parsed.password else ""
-    auth = f"{user}:{pwd}@" if user else ""
-    return f"{scheme}://{auth}{parsed.host}:{parsed.port}"
+    """把账号专属代理转成 CloakBrowser 可用 URL（与 openai_register._browser_proxy_url 同源）。"""
+    return browser_proxy_url(raw) or ""
 
 
 def _account_mail_ctx(email: str):

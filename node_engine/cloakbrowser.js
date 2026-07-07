@@ -11,7 +11,8 @@
 //   - proxy 由 Python 侧解析好，作为完整 http(s):// URL 字符串传入（Chromium 无法做
 //     带认证的 SOCKS5，故 Python 强制转 http）。
 //   - Docker 内 Chromium 必须 --no-sandbox --disable-dev-shm-usage。
-//   - 回退到 playwright-core 由环境变量 CLOAK_FALLBACK_CHROMIUM 控制（默认 true）。
+//   - 回退到 playwright-core 由环境变量 CLOAK_FALLBACK_CHROMIUM 控制（本地默认 true；
+//     Docker 入口脚本设为 false，避免生产静默降级到无 stealth 的 Chromium）。
 // ============================================================================
 
 const FALLBACK_ENABLED = String(process.env.CLOAK_FALLBACK_CHROMIUM || 'true').toLowerCase() !== 'false';
@@ -24,10 +25,15 @@ function cdpArgs() {
   return port > 0 ? [`--remote-debugging-port=${port}`, '--remote-debugging-address=127.0.0.1'] : [];
 }
 
-/** CloakBrowser 0.4.8+ 风控相关 Chromium 参数 */
+/** CloakBrowser 0.4.8+ 风控相关 Chromium 参数（对齐官方 FPJS / Turnstile 推荐配置） */
 function cloakFingerprintArgs(proxyUrl) {
-  const args = ['--fingerprint-allow-3p-cookies'];
+  const args = [
+    '--fingerprint-allow-3p-cookies',
+    '--fingerprint-noise=false',
+  ];
   if (proxyUrl && process.platform === 'linux') args.push('--license-through-proxy');
+  // 需 Windows 字体才有实际效果；无字体时为 no-op，不伤害。
+  if (process.platform === 'linux') args.push('--fingerprint-windows-font-metrics');
   return args;
 }
 
@@ -80,7 +86,7 @@ function isLocalDevProxy(proxyUrl) {
   }
 }
 
-/** 住宅代理：geoip 按出口 IP 对齐时区；语言仍由显式 locale / Accept-Language 锁定。 */
+/** 住宅代理：geoip 按出口 IP 对齐时区与 locale。 */
 function shouldUseGeoip(proxyUrl) {
   return Boolean(String(proxyUrl || '').trim()) && !isLocalDevProxy(proxyUrl);
 }
@@ -90,6 +96,20 @@ function resolveLocale(locale, proxyUrl) {
   if (v) return v;
   // 有代理且开 geoip 时不设 locale，让 CloakBrowser 按出口 IP 自动匹配；无代理则回退 en-US
   return shouldUseGeoip(proxyUrl) ? null : (proxyUrl ? null : 'en-US');
+}
+
+/** 生产住宅代理：locale/timezone/Accept-Language 全交给 geoip，忽略调用方传入值。 */
+function effectiveLocale(proxyUrl, locale) {
+  if (shouldUseGeoip(proxyUrl)) return null;
+  return resolveLocale(locale, proxyUrl);
+}
+
+function effectiveAcceptLanguage(proxyUrl, acceptLanguage, resolvedLocale) {
+  if (shouldUseGeoip(proxyUrl)) return '';
+  const v = String(acceptLanguage || '').trim();
+  if (v) return v;
+  if (!resolvedLocale) return '';
+  return `${resolvedLocale},${resolvedLocale.split('-')[0]};q=0.9,en-US;q=0.8,en;q=0.7`;
 }
 
 function resolveTimezone(timezone, locale) {
@@ -123,7 +143,7 @@ async function applyNavigatorLocale(context, locale) {
 // 返回统一句柄 { mode, seed, browser, context, close() }。
 // fingerprintSeed：固定指纹种子（10000-99999）。同一 seed = 同一指纹，跨会话可复现；
 // 不传则生成一个，并在返回值里带出实际 seed 供存储与后续复用。
-// locale：浏览器语言（如 en-US / ja-JP / en-IN），与 Python identity.region 对齐；显式传入时覆盖 geoip 自动检测。
+// locale：浏览器语言（如 en-US / ja-JP / en-IN）；住宅代理场景由 geoip 按出口 IP 自动检测。
 function useSystemChrome() {
   const v = String(process.env.CLOAK_USE_SYSTEM_CHROME || '').trim().toLowerCase();
   return v === '1' || v === 'true' || v === 'yes';
@@ -134,12 +154,10 @@ export async function launchSession(proxyUrl, { headless = false, fingerprintSee
   const seed = Number.isInteger(fingerprintSeed) && fingerprintSeed > 0
     ? fingerprintSeed
     : Math.floor(Math.random() * 90000) + 10000;
-  const resolvedLocale = resolveLocale(locale, proxyUrl);
-  const resolvedTimezone = resolveTimezone(timezone, resolvedLocale);
-  const resolvedAcceptLanguage = String(acceptLanguage || '').trim()
-    || (resolvedLocale ? `${resolvedLocale},${resolvedLocale.split('-')[0]};q=0.9,en-US;q=0.8,en;q=0.7` : '');
-
   const useGeoip = shouldUseGeoip(proxyUrl);
+  const resolvedLocale = effectiveLocale(proxyUrl, locale);
+  const resolvedTimezone = useGeoip ? null : resolveTimezone(timezone, resolvedLocale || locale);
+  const resolvedAcceptLanguage = effectiveAcceptLanguage(proxyUrl, acceptLanguage, resolvedLocale);
   const browserTimezone = effectiveBrowserTimezone(proxyUrl, resolvedTimezone);
 
   if (useSystemChrome()) {
@@ -253,6 +271,8 @@ export const __test = {
   isLocalDevProxy,
   shouldUseGeoip,
   effectiveBrowserTimezone,
+  effectiveLocale,
+  effectiveAcceptLanguage,
   resolveTimezone,
 };
 

@@ -4,7 +4,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 
-from api import accounts, activation, cdks, dispatch, mailboxes, phones, register, run, system
+from api import accounts, activation, cdks, dispatch, mailboxes, phones, pool_client, register, run, system
 from api.errors import install_exception_handlers
 from api.support import resolve_web_asset
 from services.config import config
@@ -45,6 +45,7 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
     app.include_router(accounts.create_router())
+    app.include_router(pool_client.create_router())
     app.include_router(register.create_router())
     app.include_router(mailboxes.create_router())
     app.include_router(cdks.create_router())

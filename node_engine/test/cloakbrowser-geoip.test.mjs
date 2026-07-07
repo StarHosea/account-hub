@@ -7,6 +7,8 @@ const {
   isLocalDevProxy,
   shouldUseGeoip,
   effectiveBrowserTimezone,
+  effectiveLocale,
+  effectiveAcceptLanguage,
   resolveTimezone,
 } = __test;
 
@@ -33,4 +35,15 @@ test('effectiveBrowserTimezone 生产代理不交手动时区', () => {
     'Asia/Tokyo',
   );
   assert.equal(resolveTimezone(null, 'ja-JP'), 'Asia/Tokyo');
+});
+
+test('effectiveLocale / effectiveAcceptLanguage 生产代理忽略调用方覆盖', () => {
+  const proxy = 'http://gate2.ipweb.cc:7778';
+  assert.equal(effectiveLocale(proxy, 'ja-JP'), null);
+  assert.equal(effectiveAcceptLanguage(proxy, 'ja-JP,ja;q=0.9', 'ja-JP'), '');
+  assert.equal(effectiveLocale('http://127.0.0.1:7890', 'ja-JP'), 'ja-JP');
+  assert.equal(
+    effectiveAcceptLanguage('http://127.0.0.1:7890', '', 'ja-JP'),
+    'ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7',
+  );
 });

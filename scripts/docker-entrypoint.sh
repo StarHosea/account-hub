@@ -7,6 +7,9 @@ set -e
 # 从而让 headless=false 的 Chromium 能在无物理显示的服务器上跑起来（反爬更稳）。
 # 若确实要无头运行，把注册配置里的 headless 设为 true 即可（Xvfb 存在但不影响）。
 #
+# 对齐 CloakBrowser 官方 Docker 入口：1920x1080 Xvfb + openbox（--start-maximized 生效）
+# + xdotool 轮询确认 X 就绪；生产默认禁止静默回退到无 stealth 的 Chromium。
+#
 # 【为何不再用 `xvfb-run … uv run uvicorn`】
 # 1) uv run 之坑：镜像构建期用 `uv sync --frozen --no-dev` 生成 .venv（不含 dev
 #    依赖如 httpx）。运行期若用 `uv run`，uv 会重新校验/同步环境，发现 dev 组的
@@ -19,29 +22,34 @@ set -e
 #    exec 让 uvicorn 成为 PID 1，彻底绕开 xvfb-run 的 PID 1 陷阱。
 # ============================================================================
 
-# 选一个空闲的 X display 号（避免与残留锁冲突）。
+export CLOAK_FALLBACK_CHROMIUM=false
+
+# 清理上次容器残留的 X lock（/tmp 非 tmpfs 时 restart 会留下死锁）。
 DISPLAY_NUM=99
-while [ -e "/tmp/.X${DISPLAY_NUM}-lock" ]; do
-  DISPLAY_NUM=$((DISPLAY_NUM + 1))
-done
+rm -f "/tmp/.X${DISPLAY_NUM}-lock" "/tmp/.X11-unix/X${DISPLAY_NUM}" 2>/dev/null || true
 export DISPLAY=":${DISPLAY_NUM}"
 
 # 后台拉起虚拟显示；uvicorn 及其派生 node 子进程通过继承的 DISPLAY 共享它。
-Xvfb "${DISPLAY}" -screen 0 1280x800x24 -ac -nolisten tcp &
+Xvfb "${DISPLAY}" -screen 0 1920x1080x24 -ac -nolisten tcp &
 XVFB_PID=$!
+OPENBOX_PID=""
 
-# 容器停止时一并清理 Xvfb。
-trap 'kill "${XVFB_PID}" 2>/dev/null || true' TERM INT
+# 容器停止时一并清理 Xvfb / openbox。
+trap 'kill "${OPENBOX_PID}" 2>/dev/null || true; kill "${XVFB_PID}" 2>/dev/null || true' TERM INT
 
-# 简单等待 Xvfb 就绪（最多 ~5s），失败也不致命：headless=true 场景不需要它。
+# 用 xdotool 确认 X 已接受连接（最多 ~10s），避免 openbox/Chromium 抢跑。
 i=0
 while [ "$i" -lt 50 ]; do
-  if [ -e "/tmp/.X${DISPLAY_NUM}-lock" ]; then
+  if DISPLAY="${DISPLAY}" xdotool getdisplaygeometry >/dev/null 2>&1; then
     break
   fi
   i=$((i + 1))
-  sleep 0.1
+  sleep 0.2
 done
+
+# 窗口管理器：无 WM 时 Chromium --start-maximized 是 silent no-op。
+DISPLAY="${DISPLAY}" openbox &
+OPENBOX_PID=$!
 
 # uvicorn 成为 PID 1，正确接收信号、被 docker restart/stop 正常管理。
 exec /app/.venv/bin/uvicorn main:app --host 0.0.0.0 --port 80 --access-log

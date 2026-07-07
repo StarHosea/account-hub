@@ -294,6 +294,22 @@ class MailboxService:
                     item["cooldown_until"] = None
                 self._save()
 
+    def append_note(self, email: str, fragment: str) -> None:
+        """在邮箱备注前追加一段文本（去重）。"""
+        key = _norm_email(email)
+        text = str(fragment or "").strip()
+        if not key or not text:
+            return
+        with self._lock:
+            item = self._mailboxes.get(key)
+            if item is None:
+                return
+            current = str(item.get("note") or "").strip()
+            if text in current:
+                return
+            item["note"] = f"{text}; {current}".strip("; ").strip()
+            self._save()
+
     def mark_used_bad(self, email: str, note: str = "") -> None:
         """把邮箱标记为不可再用（used=True）：用于「邮箱疑似已注册过账号」等永久性失败，
         避免注册机反复领用同一坏邮箱空转。不绑定账号 token。

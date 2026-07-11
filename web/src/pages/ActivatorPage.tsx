@@ -183,7 +183,7 @@ export default function ActivatorPage() {
         .then(setActivation)
         .catch(() => {});
     const pullAccounts = () =>
-      fetchAccounts({ page_size: 200 })
+      fetchAccounts({ activation: "activating", page_size: 200 })
         .then((r) => setAccounts(r.items))
         .catch(() => {});
     const pullResources = () => {

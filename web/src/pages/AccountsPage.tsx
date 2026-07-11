@@ -723,15 +723,33 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
                 </Button>
               </Popconfirm>
               {planType === "plus" ? (
-                <Button
-                  size="small"
-                  type="warning"
-                  theme="light"
-                  loading={busy}
-                  onClick={() => openRevokeActivationModal(selectedKeys)}
-                >
-                  撤销激活
-                </Button>
+                <>
+                  <Popconfirm
+                    title={`将选中的 ${selectedKeys.length} 个账号标记为已出库？`}
+                    onConfirm={() => void handleMarkUsed(selectedKeys, true)}
+                  >
+                    <Button size="small" type="primary" theme="light" loading={busy}>
+                      标记出库
+                    </Button>
+                  </Popconfirm>
+                  <Popconfirm
+                    title={`撤销选中的 ${selectedKeys.length} 个账号的出库标记？`}
+                    onConfirm={() => void handleMarkUsed(selectedKeys, false)}
+                  >
+                    <Button size="small" type="warning" theme="light" loading={busy}>
+                      撤销出库
+                    </Button>
+                  </Popconfirm>
+                  <Button
+                    size="small"
+                    type="warning"
+                    theme="light"
+                    loading={busy}
+                    onClick={() => openRevokeActivationModal(selectedKeys)}
+                  >
+                    撤销激活
+                  </Button>
+                </>
               ) : null}
               <span style={{ width: 1, height: 18, background: "var(--semi-color-border)", display: "inline-block" }} />
             </>

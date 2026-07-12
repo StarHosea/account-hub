@@ -24,9 +24,15 @@ class RegisterTimeoutTest(unittest.TestCase):
         cfg = _normalize({})
         self.assertEqual(cfg["register_timeout"], 600)
         self.assertEqual(cfg["ip_duration"], 10)
+        self.assertTrue(cfg["auto_set_password"])
 
         with mock.patch.dict(openai_register.config, {"register_timeout": 600}, clear=False):
             self.assertEqual(openai_register._register_timeout_s(), 600)
+
+    def test_auto_set_password_normalize(self):
+        from services.register_service import _normalize
+
+        self.assertFalse(_normalize({"auto_set_password": False})["auto_set_password"])
 
     def test_ip_duration_follows_register_timeout(self):
         from services.register_service import _normalize

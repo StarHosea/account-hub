@@ -25,6 +25,17 @@ test('连密码都没设成 → 不容忍', () => {
   assert.equal(resolveStep8Tolerance({ passwordSet: false }, false), null);
 });
 
+test('不要求密码时，未设密码也可容忍（无 2FA）', () => {
+  const r = resolveStep8Tolerance({ passwordSet: false }, false, { requirePassword: false });
+  assert.ok(r);
+  assert.equal(r.twoFactorSet, false);
+  assert.equal(r.passwordSet, false);
+});
+
+test('不要求密码但要求 2FA 且无 secret → 不容忍', () => {
+  assert.equal(resolveStep8Tolerance({ passwordSet: false }, false, { requirePassword: false, require2fa: true }), null);
+});
+
 test('2FA 失败但 partial 里已有 secret → 容忍并保留', () => {
   const partial = { passwordSet: false, twoFactorSecret: 'OLD', twoFactorUri: 'otpauth://x' };
   const r = resolveStep8Tolerance(partial, true, { require2fa: true });

@@ -183,9 +183,9 @@ class AccountService:
 
         changed = 0
         with self._lock:
-            for key, raw in list(self._accounts.items()):
-                stage = str(raw.get("stage") or "")
-                if stage != STAGE_PLUS_REVIEW:
+            # 读盘原始 stage：_accounts 在加载时已 enrich，内存里可能已是 plus_activated。
+            for raw in self.storage.load_accounts():
+                if str(raw.get("stage") or "") != STAGE_PLUS_REVIEW:
                     continue
                 item = apply_stage(
                     enrich_account(raw),
@@ -195,6 +195,9 @@ class AccountService:
                 )
                 account = self._normalize_account(item)
                 if account is None:
+                    continue
+                key = self._account_dict_key(account)
+                if not key:
                     continue
                 self._accounts[key] = account
                 changed += 1

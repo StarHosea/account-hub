@@ -102,7 +102,6 @@ def create_router() -> APIRouter:
         )
         if kind == "account":
             if act == "checkout":
-                # 出库含二次远端核验（刷新 token + 拉取信息），放线程池避免阻塞事件循环；核验通过后随出库落发号信息 meta。
                 result = await run_in_threadpool(dispatch_service.checkout_account, body.id, meta)
                 ok = bool(result.get("ok"))
                 message = str(result.get("reason") or "")

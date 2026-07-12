@@ -140,9 +140,8 @@ export default function DispatchPage() {
         pairCheckout,
       });
       setSummary(res.summary);
-      // 账号出库含二次核验：未通过时不消耗、保留当前卡片，提示原因，让管理员点「不可用，下一个」。
       if (!res.ok) {
-        Toast.error(res.message || "核验未通过，未出库");
+        Toast.error(res.message || "出库失败");
         setCheckoutOpen(false);
         return;
       }

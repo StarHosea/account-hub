@@ -4,23 +4,12 @@ import threading
 import uuid
 from datetime import datetime, timezone
 
-from services.account_lifecycle import (
-    STAGE_ACTIVATING,
-    STAGE_PLUS_ACTIVATED,
-    STAGE_PLUS_REVIEW,
-    STAGE_REGISTERED,
-    apply_stage,
-    enrich_account,
-    is_dispatchable,
-)
+from services.account_lifecycle import is_dispatchable
 from services.account_service import account_service
 from services.phone_service import phone_service
 
 # Plus 账号发号预占过期时间（秒）：超时自动释放，防止占用泄漏。
 ACCOUNT_RESERVE_STALE_SECONDS = 300
-
-# 视为「失效」的账号状态，不再发号。
-DEAD_STATUS = {"异常", "禁用"}
 
 
 def _parse_dt(value: object) -> datetime | None:
@@ -74,11 +63,6 @@ class DispatchService:
         fields = [f for f in fields if f["value"]]
         return {"kind": "account", "id": token, "title": email or token[:12], "fields": fields}
 
-    @staticmethod
-    def _is_plus(account: dict) -> bool:
-        item = enrich_account(account)
-        return str(item.get("plan") or "").strip().lower() == "plus"
-
     def list_dispatchable_accounts(self) -> list[dict]:
         now = datetime.now(timezone.utc)
         with self._lock:
@@ -120,34 +104,17 @@ class DispatchService:
             self._account_reserved.pop(str(token or ""), None)
 
     def checkout_account(self, token: str, meta: dict[str, str] | None = None) -> dict:
-        """出库：出库前二次实时核验账号仍是可用的 Plus，通过才标记已出库。
-
-        通过时把发号信息（客户/微信/闲鱼/套餐等 meta）随出库一并落库。
-        返回 {"ok": bool, "reason": str, "id": 最新token}。核验不通过或刷新失败时
-        不出库、不做任何标记，交由前端提示后让管理员「不可用，下一个」。
-        """
+        """出库：标记已出库并解除预占，发号信息（客户/微信/闲鱼/套餐等 meta）随出库落库。"""
         token = str(token or "")
         if not token:
             return {"ok": False, "reason": "缺少账号标识", "id": token}
 
-        # 实时刷新（刷新 access_token + 拉取远端 user info，回填 type/status）；token 可能轮换。
-        try:
-            account = account_service.fetch_remote_info(token, event="dispatch_checkout")
-        except Exception as exc:  # 网络/失效等：不出库，保留预占等待人工换号。
-            return {"ok": False, "reason": f"核验失败：{exc}".strip(), "id": token}
-
+        account = account_service.get_account(token)
         if not account:
-            return {"ok": False, "reason": "核验失败：账号已失效", "id": token}
+            return {"ok": False, "reason": "账号不存在", "id": token}
 
         latest_token = str(account.get("access_token") or token)
-        if not self._is_plus(account):
-            plan = str(account.get("type") or "").strip() or "未知"
-            return {"ok": False, "reason": f"核验未通过：账号非 Plus（当前套餐 {plan}）", "id": latest_token}
-        if str(account.get("status") or "") in DEAD_STATUS:
-            return {"ok": False, "reason": f"核验未通过：账号不可用（{account.get('status')}）", "id": latest_token}
-
         account_service.mark_used([latest_token], True, {latest_token: meta or {}})
-        # token 可能轮换，新旧都解除预占，避免占用泄漏。
         self.release_account(token)
         self.release_account(latest_token)
         return {"ok": True, "reason": "", "id": latest_token}

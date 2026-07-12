@@ -331,10 +331,13 @@ def account_in_view(account: dict[str, Any], view: str) -> bool:
 
 def is_dispatchable(account: dict[str, Any]) -> bool:
     item = enrich_account(account)
+    stage = str(item.get("stage"))
+    if stage not in (STAGE_PLUS_ACTIVATED, STAGE_PLUS_REVIEW):
+        return False
+    if stage == STAGE_PLUS_ACTIVATED and str(item.get("plan")) != PLAN_PLUS:
+        return False
     return (
-        str(item.get("stage")) == STAGE_PLUS_ACTIVATED
-        and str(item.get("plan")) == PLAN_PLUS
-        and str(item.get("token_status")) == TOKEN_OK
+        str(item.get("token_status")) == TOKEN_OK
         and not bool(item.get("dispatch", {}).get("dispatched"))
         and str(item.get("access_token") or "").startswith("eyJ")
     )

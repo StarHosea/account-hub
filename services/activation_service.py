@@ -437,61 +437,6 @@ class ActivationService:
         fields["plus_updated_at"] = _now()
         account_service.update_account(token, fields, quiet=True)
 
-    def _verify_plan(self, token: str, email: str, log_sink=None, audit: ActivationAuditRecorder | None = None) -> None:
-        """激活成功后向 OpenAI 核实真实套餐（读 plan_type 覆盖 type），确保档位是核实过的真值。
-
-        走 account_service.fetch_remote_info：内部会刷新 token、拉 get_user_info 并 update_account 合并，
-        真实 plan_type 覆盖 type。核实失败时 CDK 已消耗、激活仍计成功，账号保持「已激活」并进入
-        plus_review（需人工核查），下轮激活不再选中。
-        """
-        try:
-            if audit:
-                audit.record_plan_verify("start")
-            acct = account_service.fetch_remote_info(token, event="activation_verify")
-            tier = str((acct or {}).get("type") or "未知")
-            level = "green" if tier.lower() == "plus" else "yellow"
-            self._append_log(f"[{email}] 已核实套餐：{tier}", level, log_sink)
-            if audit:
-                audit.record_plan_verify("success", tier=tier)
-            if acct:
-                item = enrich_account(acct)
-                if tier.lower() == "plus":
-                    account_service.update_account(
-                        str(item.get("access_token") or token),
-                        apply_stage(item, STAGE_PLUS_ACTIVATED, plan="plus", activated_at=item.get("activated_at") or _now()),
-                        quiet=True,
-                    )
-                    if audit:
-                        self._end_audit(audit, OUTCOME_SUCCESS, f"激活成功，套餐已核实为 {tier}", token, cdk=audit.cdk, cdk_type=audit.cdk_type, cdk_consumed=audit.cdk_consumed)
-                else:
-                    review_msg = "激活成功但套餐核实非 Plus"
-                    account_service.update_account(
-                        str(item.get("access_token") or token),
-                        apply_stage(item, STAGE_PLUS_REVIEW, plus_last_message=review_msg),
-                        quiet=True,
-                    )
-                    if audit:
-                        self._end_audit(audit, OUTCOME_REVIEW, review_msg, token, cdk=audit.cdk, cdk_type=audit.cdk_type, cdk_consumed=audit.cdk_consumed)
-        except Exception as exc:  # noqa: BLE001
-            err = scrub(str(exc))
-            msg = f"套餐核实失败：{err}"
-            self._append_log(f"[{email}] {msg}，待人工核查", "yellow", log_sink)
-            if audit:
-                audit.record_plan_verify("error", error=err)
-            acct = account_service.get_account(token)
-            if acct:
-                account_service.update_account(
-                    token,
-                    apply_stage(
-                        enrich_account(acct),
-                        STAGE_PLUS_REVIEW,
-                        plus_last_message=msg,
-                    ),
-                    quiet=True,
-                )
-            if audit:
-                self._end_audit(audit, OUTCOME_REVIEW, msg, token, cdk=audit.cdk, cdk_type=audit.cdk_type, cdk_consumed=audit.cdk_consumed)
-
     def _activate_account(self, client: CdkRedeemClient, token: str, cfg: dict, log_sink=None, source: str = "batch") -> bool | None | str:
         claim_key = self._activation_claim_key(token)
         if not claim_key or not self._try_claim_account(claim_key):
@@ -684,7 +629,29 @@ class ActivationService:
                                       plus_last_message=message or "兑换成功",
                                       plus_activated_at=already_activated_at or _now())
                     self._append_log(f"[{email}] 激活成功（{cdk_type}）", "green", log_sink)
-                    self._verify_plan(token, email, log_sink, audit=audit)
+                    acct = account_service.get_account(token)
+                    if acct:
+                        item = enrich_account(acct)
+                        account_service.update_account(
+                            token,
+                            apply_stage(
+                                item,
+                                STAGE_PLUS_ACTIVATED,
+                                plan="plus",
+                                activated_at=item.get("activated_at") or item.get("plus_activated_at") or _now(),
+                            ),
+                            quiet=True,
+                        )
+                    if audit and not audit.finished_at:
+                        self._end_audit(
+                            audit,
+                            OUTCOME_SUCCESS,
+                            message or "兑换成功",
+                            token,
+                            cdk=audit.cdk,
+                            cdk_type=audit.cdk_type,
+                            cdk_consumed=audit.cdk_consumed,
+                        )
                     return "success"
 
                 if cls == "cdk_invalid":

@@ -205,12 +205,11 @@ class ActivationConcurrencyTest(unittest.TestCase):
                             with patch("services.activation_service.cdk_service.consume"):
                                 with patch("services.activation_service.cdk_service.release"):
                                     with patch.object(self.svc, "_attempt", side_effect=_blocking_attempt):
-                                        with patch.object(self.svc, "_verify_plan"):
-                                            t = threading.Thread(target=self.svc._run, args=(targets, cfg))
-                                            t.start()
-                                            self.assertTrue(gate.wait(timeout=5))
-                                            release.set()
-                                            t.join(timeout=5)
+                                        t = threading.Thread(target=self.svc._run, args=(targets, cfg))
+                                        t.start()
+                                        self.assertTrue(gate.wait(timeout=5))
+                                        release.set()
+                                        t.join(timeout=5)
 
         stats = self.svc.get()["stats"]
         self.assertEqual(stats["success"], 1)

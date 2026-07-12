@@ -36,6 +36,8 @@ import {
   fetchAccounts,
   refreshAccounts,
   fetchRefreshProgress,
+  refreshAccountTokens,
+  fetchRefreshTokenProgress,
   deleteAccounts,
   createAccounts,
   exportAccounts,
@@ -153,6 +155,7 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
   const [loading, setLoading] = useState(true);
   const [selectedKeys, setSelectedKeys] = useState<string[]>([]);
   const [refreshing, setRefreshing] = useState<Set<string>>(new Set());
+  const [rotatingTokens, setRotatingTokens] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
 
   // 搜索 / 筛选
@@ -236,6 +239,14 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
       return next;
     });
 
+  const setRotateFlag = (token: string, on: boolean) =>
+    setRotatingTokens((prev) => {
+      const next = new Set(prev);
+      if (on) next.add(token);
+      else next.delete(token);
+      return next;
+    });
+
   // ---- 操作 ----
   const handleRefresh = async (tokens: string[]) => {
     if (!tokens.length) return;
@@ -259,13 +270,51 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
       if (final.error) {
         Toast.error(final.error);
       } else {
-        Toast.success("刷新完成");
+        Toast.success("同步完成");
       }
       await load(true);
     } catch (e) {
-      Toast.error(e instanceof Error ? e.message : "刷新失败");
+      Toast.error(e instanceof Error ? e.message : "同步失败");
     } finally {
       tokens.forEach((t) => setRefreshFlag(t, false));
+    }
+  };
+
+  const handleRotateToken = async (tokens: string[]) => {
+    if (!tokens.length) return;
+    tokens.forEach((t) => setRotateFlag(t, true));
+    try {
+      const { progress_id } = await refreshAccountTokens(tokens);
+      const final = await new Promise<Awaited<ReturnType<typeof fetchRefreshTokenProgress>>>((resolve, reject) => {
+        const timer = setInterval(async () => {
+          try {
+            const p = await fetchRefreshTokenProgress(progress_id);
+            if (p.done) {
+              clearInterval(timer);
+              resolve(p);
+            }
+          } catch (err) {
+            clearInterval(timer);
+            reject(err);
+          }
+        }, 500);
+      });
+      if (final.error) {
+        Toast.error(final.error);
+      } else {
+        const ok = final.status_counts?.成功 ?? 0;
+        const fail = final.status_counts?.失败 ?? 0;
+        if (fail > 0) {
+          Toast.warning(`Token 刷新完成：成功 ${ok}，失败 ${fail}`);
+        } else {
+          Toast.success(`Token 已刷新（${ok} 个）`);
+        }
+      }
+      await load(true);
+    } catch (e) {
+      Toast.error(e instanceof Error ? e.message : "刷新 Token 失败");
+    } finally {
+      tokens.forEach((t) => setRotateFlag(t, false));
     }
   };
 
@@ -472,7 +521,7 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
     {
       title: "状态",
       width: 110,
-      render: (_: unknown, a: Account) => stageTag(a, refreshing.has(accountKey(a))),
+      render: (_: unknown, a: Account) => stageTag(a, refreshing.has(accountKey(a)) || rotatingTokens.has(accountKey(a))),
     },
     {
       title: "出口IP/国家",
@@ -544,9 +593,10 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
     },
     {
       title: "操作",
-      width: 170,
+      width: 210,
       fixed: "right",
       render: (_: unknown, a: Account) => {
+        const key = accountKey(a);
         return (
           <Space spacing={2}>
             <Button
@@ -561,8 +611,16 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
               size="small"
               theme="borderless"
               icon={<IconRefresh />}
-              title="校验/刷新"
-              loading={refreshing.has(accountKey(a))}
+              title="刷新 Token"
+              loading={rotatingTokens.has(key)}
+              onClick={() => void handleRotateToken([accountOpKey(a)])}
+            />
+            <Button
+              size="small"
+              theme="borderless"
+              icon={<IconSync />}
+              title="同步信息"
+              loading={refreshing.has(key)}
               onClick={() => void handleRefresh([accountOpKey(a)])}
             />
             <Popconfirm title="删除该账号？" onConfirm={() => void handleDelete([accountKey(a)])}>
@@ -690,6 +748,17 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
                   </Popconfirm>
                 </>
               ) : null}
+              <Button
+                size="small"
+                icon={<IconRefresh />}
+                loading={selectedKeys.some((k) => rotatingTokens.has(k))}
+                onClick={() => void handleRotateToken(selectedKeys.map((k) => {
+                  const acct = accounts.find((a) => accountKey(a) === k);
+                  return acct ? accountOpKey(acct) : k;
+                }))}
+              >
+                刷新 Token
+              </Button>
               <span style={{ width: 1, height: 18, background: "var(--semi-color-border)", display: "inline-block" }} />
             </>
           ) : null}
@@ -726,9 +795,11 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
           selected={selectedKeys}
           allSelected={allOnPageSelected}
           refreshing={refreshing}
+          rotatingTokens={rotatingTokens}
           onToggleAll={toggleSelectAll}
           onToggle={toggleOne}
           onRefresh={(t) => void handleRefresh([t])}
+          onRotateToken={(t) => void handleRotateToken([t])}
           onDelete={(t) => void handleDelete([t])}
           page={page}
           pageSize={PAGE_SIZE}
@@ -872,9 +943,11 @@ type AccountMobileListProps = {
   selected: string[];
   allSelected: boolean;
   refreshing: Set<string>;
+  rotatingTokens: Set<string>;
   onToggleAll: () => void;
   onToggle: (token: string) => void;
   onRefresh: (token: string) => void;
+  onRotateToken: (token: string) => void;
   onDelete: (token: string) => void;
   page: number;
   pageSize: number;
@@ -888,9 +961,11 @@ function AccountMobileList({
   selected,
   allSelected,
   refreshing,
+  rotatingTokens,
   onToggleAll,
   onToggle,
   onRefresh,
+  onRotateToken,
   onDelete,
   page,
   pageSize,
@@ -920,7 +995,7 @@ function AccountMobileList({
           const key = accountKey(a);
           const checked = selected.includes(key);
           const token = a.access_token || "";
-          const statusNode = stageTag(a, refreshing.has(key));
+          const statusNode = stageTag(a, refreshing.has(key) || rotatingTokens.has(key));
           return (
             <Card
               key={key}
@@ -978,7 +1053,15 @@ function AccountMobileList({
                   size="small"
                   theme="borderless"
                   icon={<IconRefresh />}
-                  title="校验/刷新"
+                  title="刷新 Token"
+                  loading={rotatingTokens.has(key)}
+                  onClick={() => onRotateToken(accountOpKey(a))}
+                />
+                <Button
+                  size="small"
+                  theme="borderless"
+                  icon={<IconSync />}
+                  title="同步信息"
                   loading={refreshing.has(key)}
                   onClick={() => onRefresh(accountOpKey(a))}
                 />

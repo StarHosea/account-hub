@@ -225,7 +225,7 @@ def _compose_last_error(item: dict[str, Any], raw_plus_status: str) -> str | Non
         stage=stage,
     ):
         parts.append(explicit)
-    for key in ("last_refresh_error", "last_token_refresh_error"):
+    for key in ("last_refresh_error", "last_token_refresh_error", "last_token_rotate_error"):
         value = str(item.get(key) or "").strip()
         if value and value not in parts:
             parts.append(value)

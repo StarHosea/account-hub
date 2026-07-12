@@ -80,6 +80,14 @@ def _normalize_checkout_meta(value: object) -> dict[str, str] | None:
     }
 
 
+def _parse_positive_int(value: object) -> int | None:
+    try:
+        num = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return num if num > 0 else None
+
+
 class AccountService:
     """账号池服务，使用 token -> account 的 dict 保存账号。"""
 
@@ -91,6 +99,9 @@ class AccountService:
     # 刷新进度追踪
     _refresh_progress: dict[str, dict] = {}
     _refresh_progress_lock = Lock()
+    # 刷新 Token（强制换 JWT）进度追踪
+    _token_rotate_progress: dict[str, dict] = {}
+    _token_rotate_progress_lock = Lock()
     # 重新登录进度追踪
     _relogin_progress: dict[str, dict] = {}
     _relogin_progress_lock = Lock()
@@ -424,6 +435,12 @@ class AccountService:
         normalized["plus_activated_at"] = normalized.get("plus_activated_at") or None
         # 指纹 Seed：注册内核迁移后会写入专用随机种子；存量/当前号先回退到注册时的 oai-device-id。
         normalized["fingerprint_seed"] = normalized.get("fingerprint_seed") or normalized.get("oai-device-id") or None
+        browser_session = normalized.get("browser_session")
+        normalized["browser_session"] = browser_session if isinstance(browser_session, dict) else None
+        normalized["browser_session_at"] = normalized.get("browser_session_at") or None
+        normalized["last_token_rotate_at"] = normalized.get("last_token_rotate_at") or None
+        normalized["last_token_rotate_error"] = normalized.get("last_token_rotate_error") or None
+        normalized["last_token_rotate_error_at"] = normalized.get("last_token_rotate_error_at") or None
         # 激活不可用标记：某邮箱账号两种类型 CDK 均连续激活失败后置位，下轮激活自动跳过，
         # 直到人工「标记可用」重置。与 plus_status 分离，保证重置后仍持久生效。
         normalized["plus_unavailable"] = bool(normalized.get("plus_unavailable"))
@@ -643,6 +660,7 @@ class AccountService:
         result = openai_account_ops.run_browser_login(
             email, password, totp_secret=totp_secret, account_proxy=account_proxy,
             country=str(account.get("country") or ""),
+            fingerprint_seed=_parse_positive_int(account.get("fingerprint_seed")),
         )
         if recorder is not None:
             recorder.record_http(
@@ -670,8 +688,100 @@ class AccountService:
         reset_pwd = str(result.get("reset_password") or "")
         if reset_pwd:
             updates["password"] = reset_pwd
+        storage = result.get("browser_session")
+        if isinstance(storage, dict):
+            updates["browser_session"] = storage
+            updates["browser_session_at"] = datetime.now(timezone.utc).isoformat()
+        seed = _parse_positive_int(result.get("fingerprint_seed"))
+        if seed is not None:
+            updates["fingerprint_seed"] = seed
         self.update_account(new_token, updates, quiet=True)
         return new_token
+
+    def rotate_access_token(self, access_token: str, *, event: str = "rotate_access_token") -> tuple[str, bool]:
+        """强制刷新 access_token（与 fetch_remote_info 解耦，无条件走浏览器换 JWT）。"""
+        if not access_token:
+            return "", False
+        with self._token_refresh_lock:
+            resolved_token, account = self._get_account_for_token(access_token)
+            if not account:
+                return access_token, False
+            active_token = str(account.get("access_token") or resolved_token or access_token)
+
+        from services.register import openai_account_ops
+
+        result = openai_account_ops.run_token_refresh(account)
+        if not result.get("ok"):
+            self._record_token_rotate_error(active_token, event, str(result.get("error") or ""))
+            return active_token, False
+
+        new_token = str(result.get("access_token") or "").strip()
+        if not new_token:
+            self._record_token_rotate_error(active_token, event, "浏览器未返回 access_token")
+            return active_token, False
+
+        token_data = {"access_token": new_token}
+        applied = self._apply_refreshed_tokens(active_token, token_data, event)
+        updates: dict[str, Any] = {
+            "source_type": "web",
+            "status": "正常",
+            "last_token_rotate_at": datetime.now(timezone.utc).isoformat(),
+            "last_token_rotate_error": None,
+            "last_token_rotate_error_at": None,
+        }
+        storage = result.get("browser_session")
+        if isinstance(storage, dict):
+            updates["browser_session"] = storage
+            updates["browser_session_at"] = datetime.now(timezone.utc).isoformat()
+        seed = _parse_positive_int(result.get("fingerprint_seed"))
+        if seed is not None:
+            updates["fingerprint_seed"] = seed
+        reset_pwd = str(result.get("reset_password") or "")
+        if reset_pwd:
+            updates["password"] = reset_pwd
+        self.update_account(applied, updates, quiet=True)
+
+        if applied == active_token:
+            log_service.add(
+                LOG_TYPE_ACCOUNT,
+                "刷新 Token 完成（JWT 未变化，已更新 browser_session）",
+                {
+                    "source": event,
+                    "token": anonymize_token(applied),
+                    "via_session": bool(result.get("via_session")),
+                },
+            )
+        else:
+            log_service.add(
+                LOG_TYPE_ACCOUNT,
+                "刷新 Token 成功",
+                {
+                    "source": event,
+                    "token": anonymize_token(applied),
+                    "via_session": bool(result.get("via_session")),
+                },
+            )
+        return applied, True
+
+    def _record_token_rotate_error(self, access_token: str, event: str, error: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            storage_key = self._resolve_storage_key_locked(access_token)
+            current = self._accounts.get(storage_key) if storage_key else None
+            if current is None:
+                return
+            next_item = dict(current)
+            next_item["last_token_rotate_error"] = str(error or "rotate token failed")
+            next_item["last_token_rotate_error_at"] = now
+            account = self._normalize_account(next_item)
+            if account is not None:
+                self._accounts[storage_key] = account
+                self._save_accounts()
+        log_service.add(
+            LOG_TYPE_ACCOUNT,
+            "刷新 Token 失败",
+            {"source": event, "token": anonymize_token(access_token), "error": str(error or "")},
+        )
 
     def _password_re_login_thread(self, access_token: str, email: str, password: str, event: str, progress_id: str | None = None) -> None:
         """密码重新登录线程入口"""
@@ -711,6 +821,13 @@ class AccountService:
                 reset_pwd = str(result.get("reset_password") or "")
                 if reset_pwd:
                     updates["password"] = reset_pwd
+                storage = result.get("browser_session")
+                if isinstance(storage, dict):
+                    updates["browser_session"] = storage
+                    updates["browser_session_at"] = datetime.now(timezone.utc).isoformat()
+                seed = _parse_positive_int(result.get("fingerprint_seed"))
+                if seed is not None:
+                    updates["fingerprint_seed"] = seed
                 self.update_account(new_token, updates, quiet=True)
 
                 log_service.add(
@@ -972,6 +1089,13 @@ class AccountService:
         _, account = self._get_account_for_token(access_token)
         return account
 
+    @staticmethod
+    def _strip_sensitive_for_list(account: dict) -> dict:
+        """列表/API 响应不返回 browser_session（等价完整登录态）。"""
+        item = dict(account)
+        item.pop("browser_session", None)
+        return item
+
     def list_accounts(self) -> list[dict]:
         """返回所有账号的副本，并为每个账号附加当前图片在途数 image_inflight。
 
@@ -984,7 +1108,7 @@ class AccountService:
                 account = enrich_account(dict(item))
                 token = account.get("access_token") or ""
                 account["image_inflight"] = int(self._image_inflight.get(token, 0))
-                result.append(account)
+                result.append(self._strip_sensitive_for_list(account))
             return result
 
     def find_by_email(self, email: str) -> dict | None:
@@ -1692,7 +1816,7 @@ class AccountService:
         if not access_token:
             raise ValueError("access_token is required")
 
-        active_token = self.refresh_access_token(access_token, event=f"{event}:preflight") or access_token
+        active_token = access_token
         try:
             from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
             result = OpenAIBackendAPI(active_token).get_user_info()
@@ -1822,6 +1946,119 @@ class AccountService:
         """清理过期进度记录。"""
         with self._relogin_progress_lock:
             self._relogin_progress.pop(progress_id, None)
+
+    # ---- 刷新 Token（强制换 JWT）进度追踪 ----
+
+    def init_token_rotate_progress(self, progress_id: str, total: int) -> None:
+        with self._token_rotate_progress_lock:
+            self._token_rotate_progress[progress_id] = {
+                "total": total,
+                "processed": 0,
+                "done": False,
+                "error": None,
+                "status_counts": {"成功": 0, "失败": 0, "跳过": 0},
+            }
+
+    def update_token_rotate_progress(self, progress_id: str, token: str, *, ok: bool, skipped: bool = False) -> None:
+        with self._token_rotate_progress_lock:
+            progress = self._token_rotate_progress.get(progress_id)
+            if progress is None:
+                return
+            progress["processed"] += 1
+            if skipped:
+                progress["status_counts"]["跳过"] = progress["status_counts"].get("跳过", 0) + 1
+            elif ok:
+                progress["status_counts"]["成功"] = progress["status_counts"].get("成功", 0) + 1
+            else:
+                progress["status_counts"]["失败"] = progress["status_counts"].get("失败", 0) + 1
+
+    def finish_token_rotate_progress(self, progress_id: str, result: dict | None = None, error: str | None = None) -> None:
+        with self._token_rotate_progress_lock:
+            progress = self._token_rotate_progress.get(progress_id)
+            if progress is None:
+                return
+            progress["done"] = True
+            progress["result"] = result
+            if error:
+                progress["error"] = error
+
+    def get_token_rotate_progress(self, progress_id: str) -> dict | None:
+        with self._token_rotate_progress_lock:
+            progress = self._token_rotate_progress.get(progress_id)
+            return dict(progress) if progress else None
+
+    def clean_token_rotate_progress(self, progress_id: str) -> None:
+        with self._token_rotate_progress_lock:
+            self._token_rotate_progress.pop(progress_id, None)
+
+    def refresh_account_tokens(
+        self,
+        access_tokens: list[str],
+        progress_id: str | None = None,
+    ) -> dict[str, Any]:
+        """强制刷新 access_token（不走 get_user_info，只换 JWT）。"""
+        access_tokens = list(dict.fromkeys(token for token in access_tokens if token))
+        if not access_tokens:
+            result = {"rotated": 0, "errors": [], "items": self.list_accounts()}
+            if progress_id:
+                self.finish_token_rotate_progress(progress_id, result)
+            return result
+
+        rotated = 0
+        errors: list[dict[str, str]] = []
+        max_workers = min(2, len(access_tokens))
+
+        if progress_id:
+            self.init_token_rotate_progress(progress_id, len(access_tokens))
+
+        def _rotate_one(token: str) -> tuple[bool, bool, str | None]:
+            account = self.get_account(token)
+            if not account:
+                return False, True, "账号不存在"
+            email = str(account.get("email") or "").strip()
+            password = str(account.get("password") or "").strip()
+            if not email or not password:
+                return False, True, "无邮箱密码"
+            _, ok = self.rotate_access_token(token, event="refresh_account_tokens")
+            if not ok:
+                acct = self.get_account(token) or {}
+                err = str(acct.get("last_token_rotate_error") or "刷新失败")
+                return False, False, err
+            return True, False, None
+
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        try:
+            futures = {executor.submit(_rotate_one, token): token for token in access_tokens}
+            for future in as_completed(futures):
+                token = futures[future]
+                try:
+                    ok, skipped, err = future.result()
+                except (KeyboardInterrupt, SystemExit):
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    raise
+                except Exception as exc:
+                    ok, skipped, err = False, False, str(exc)
+                if skipped:
+                    if err:
+                        errors.append({"token": anonymize_token(token), "error": err})
+                elif ok:
+                    rotated += 1
+                else:
+                    errors.append({"token": anonymize_token(token), "error": err or "刷新失败"})
+                if progress_id:
+                    self.update_token_rotate_progress(progress_id, token, ok=ok and not skipped, skipped=skipped)
+        except (KeyboardInterrupt, SystemExit):
+            if progress_id:
+                self.finish_token_rotate_progress(progress_id, error="cancelled")
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+        result = {"rotated": rotated, "errors": errors, "items": self.list_accounts()}
+        if progress_id:
+            self.finish_token_rotate_progress(progress_id, result)
+        return result
 
     def refresh_accounts(
         self,

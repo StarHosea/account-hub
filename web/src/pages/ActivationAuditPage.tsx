@@ -13,6 +13,7 @@ import {
   Popconfirm,
   Toast,
   Banner,
+  Tooltip,
 } from "@douyinfe/semi-ui-19";
 import { IconSearch, IconRefresh, IconDelete } from "@douyinfe/semi-icons";
 
@@ -51,6 +52,41 @@ function outcomeColor(outcome: string): string {
   if (outcome === "review") return "orange";
   if (outcome === "success") return "green";
   return "grey";
+}
+
+function EllipsisCell({
+  text,
+  maxWidth,
+  type,
+  style,
+}: {
+  text: string;
+  maxWidth: number;
+  type?: "primary" | "secondary" | "tertiary" | "quaternary" | "warning" | "danger" | "success";
+  style?: React.CSSProperties;
+}) {
+  const content = text || "—";
+  if (content === "—") {
+    return <Text type="tertiary" size="small">—</Text>;
+  }
+  return (
+    <Tooltip content={content}>
+      <Text
+        type={type}
+        size="small"
+        style={{
+          maxWidth,
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
+          display: "block",
+          ...style,
+        }}
+      >
+        {content}
+      </Text>
+    </Tooltip>
+  );
 }
 
 export default function ActivationAuditPage() {
@@ -145,7 +181,12 @@ export default function ActivationAuditPage() {
   const columns = useMemo(
     () => [
       { title: "时间", dataIndex: "started_at", width: 170, render: (v: string) => <Text type="tertiary" size="small">{v ? new Date(v).toLocaleString() : "—"}</Text> },
-      { title: "邮箱", dataIndex: "email", width: 220 },
+      {
+        title: "邮箱",
+        dataIndex: "email",
+        width: 200,
+        render: (v: string) => <EllipsisCell text={v} maxWidth={180} />,
+      },
       {
         title: "尝试",
         dataIndex: "attempt_count",
@@ -163,14 +204,24 @@ export default function ActivationAuditPage() {
       {
         title: "摘要",
         dataIndex: "summary",
-        render: (v: string) => <Text size="small" ellipsis={{ showTooltip: true }} style={{ maxWidth: 360 }}>{v || "—"}</Text>,
+        width: 220,
+        render: (v: string) => <EllipsisCell text={v} maxWidth={200} />,
       },
       {
         title: "CDK",
         dataIndex: "cdk",
-        width: 140,
+        width: 130,
         render: (v: string | null, row: ActivationAuditSummary) =>
-          v ? <Text type="tertiary" size="small" style={{ fontFamily: "monospace" }}>{maskSecret(v)} {row.cdk_type ? `(${row.cdk_type})` : ""}</Text> : <Text type="tertiary">—</Text>,
+          v ? (
+            <EllipsisCell
+              text={`${maskSecret(v)}${row.cdk_type ? ` (${row.cdk_type})` : ""}`}
+              maxWidth={110}
+              type="tertiary"
+              style={{ fontFamily: "monospace" }}
+            />
+          ) : (
+            <Text type="tertiary">—</Text>
+          ),
       },
       {
         title: "事件",
@@ -265,11 +316,13 @@ export default function ActivationAuditPage() {
         }
       >
         <Table
+          className="activation-audit-table"
           loading={loading}
           dataSource={items}
           columns={columns}
           rowKey="id"
           size="small"
+          tableLayout="fixed"
           pagination={false}
           rowSelection={{
             selectedRowKeys: selectedIds,
@@ -279,7 +332,7 @@ export default function ActivationAuditPage() {
             }),
           }}
           empty={<Empty description="暂无激活审计记录" />}
-          scroll={{ y: 560 }}
+          scroll={{ x: 1060, y: 560 }}
         />
       </Card>
       <ActivationAuditModal

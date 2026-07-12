@@ -84,33 +84,6 @@ class ActivationReviewTest(unittest.TestCase):
                 targets = svc._resolve_targets(None)
         self.assertEqual(targets, ["eyJfree"])
 
-    def test_verify_plan_failure_marks_plus_review(self):
-        svc = ActivationService()
-        token = "eyJbad"
-        acct = {
-            "email": "bad@x.com",
-            "access_token": token,
-            "plus_status": "已激活",
-            "plus_activated_at": "2026-01-01T00:00:00+00:00",
-            "stage": STAGE_PLUS_REVIEW,
-        }
-        updates: list[dict] = []
-
-        def _capture_update(access_token, fields, quiet=False):
-            updates.append(dict(fields))
-            return {**acct, **fields, "access_token": access_token}
-
-        with patch("services.activation_service.account_service.fetch_remote_info", side_effect=RuntimeError("token invalidated (/backend-api/me)")):
-            with patch("services.activation_service.account_service.get_account", return_value=acct):
-                with patch("services.activation_service.account_service.update_account", side_effect=_capture_update):
-                    svc._verify_plan(token, "bad@x.com")
-
-        self.assertEqual(len(updates), 1)
-        self.assertEqual(updates[0]["stage"], STAGE_PLUS_REVIEW)
-        self.assertEqual(updates[0]["plus_last_message"], "套餐核实失败：token invalidated (/backend-api/me)")
-        self.assertIsNone(updates[0].get("last_error"))
-        self.assertEqual(updates[0]["plus_status"], "已激活")
-
     def test_reconcile_stuck_activations_resets_stage(self):
         storage = MemoryStorage([
             {

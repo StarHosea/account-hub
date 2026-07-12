@@ -862,7 +862,7 @@ export async function acquireDispatch(kind: DispatchKind, releaseId?: string, to
   });
 }
 
-/** 对已预占的号执行动作：出库 / 冷却 / 无效 / 释放。account 出库会先做二次远端核验，未通过时 ok=false 且 message 说明原因。 */
+/** 对已预占的号执行动作：出库 / 冷却 / 无效 / 释放。 */
 export async function dispatchAction(kind: DispatchKind, id: string, action: DispatchAction) {
   return httpRequest<{ ok: boolean; message?: string; summary: DispatchSummary }>("/api/dispatch/action", {
     method: "POST",

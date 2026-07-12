@@ -259,8 +259,7 @@ class ActivateAccountCdkDispositionTest(unittest.TestCase):
                     with patch("services.activation_service.cdk_service.consume") as consume:
                         with patch("services.activation_service.cdk_service.release") as release:
                             with patch("services.activation_service.cdk_service.mark_invalid") as mark_invalid:
-                                with patch.object(self.svc, "_verify_plan"):
-                                    result = self.svc._activate_account(client, self.token, self.cfg)
+                                result = self.svc._activate_account(client, self.token, self.cfg)
         self.consume = consume
         self.release = release
         self.mark_invalid = mark_invalid
@@ -369,9 +368,8 @@ class ActivateAccountCdkDispositionTest(unittest.TestCase):
                     with patch("services.activation_service.cdk_service.consume") as consume:
                         with patch("services.activation_service.cdk_service.release") as release:
                             with patch("services.activation_service.cdk_service.mark_invalid"):
-                                with patch.object(self.svc, "_verify_plan"):
-                                    with patch.object(self.svc, "_attempt", side_effect=_attempt_side_effect):
-                                        result = self.svc._activate_account(MagicMock(), self.token, cfg)
+                                with patch.object(self.svc, "_attempt", side_effect=_attempt_side_effect):
+                                    result = self.svc._activate_account(MagicMock(), self.token, cfg)
         self.assertTrue(result)
         release.assert_called_once_with(cdk_fail)
         consume.assert_called_once_with(cdk_ok, self.token)
@@ -418,8 +416,7 @@ class ActivationOccupationLeakTest(unittest.TestCase):
         with patch("services.activation_service.cdk_service", self.cdk_svc):
             with patch("services.activation_service.account_service.get_account", return_value=self.acct):
                 with patch("services.activation_service.account_service.update_account", return_value=self.acct):
-                    with patch.object(self.svc, "_verify_plan"):
-                        return self.svc._activate_account(client, self.token, self.cfg)
+                    return self.svc._activate_account(client, self.token, self.cfg)
 
     def _assert_no_occupation(self) -> None:
         self.assertEqual(self.svc.get()["stats"]["claiming"], 0)
@@ -486,8 +483,7 @@ class ActivationOccupationLeakTest(unittest.TestCase):
                 with patch("services.activation_service.cdk_service", cdk_svc):
                     with patch("services.activation_service.account_service.get_account", return_value=self.acct):
                         with patch("services.activation_service.account_service.update_account", return_value=self.acct):
-                            with patch.object(self.svc, "_verify_plan"):
-                                self.assertFalse(self.svc._activate_account(client, self.token, self.cfg))
+                            self.assertFalse(self.svc._activate_account(client, self.token, self.cfg))
                 self.assertEqual(len(cdk_svc._reserved), 0)
                 self.assertEqual(cdk_svc._cdks["CDK-F"]["status"], STATUS_AVAILABLE)
                 self.assertEqual(self.svc.get()["stats"]["claiming"], 0)

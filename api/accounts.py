@@ -320,6 +320,33 @@ def create_router() -> APIRouter:
             raise HTTPException(status_code=404, detail={"error": "progress not found"})
         return progress
 
+    @router.post("/api/accounts/refresh-token")
+    async def refresh_account_tokens(body: AccountRefreshRequest, authorization: str | None = Header(default=None)):
+        """强制刷新 access_token（session 快路径 / 密码登录兜底），与同步远端信息解耦。"""
+        require_admin(authorization)
+        access_tokens = [str(token or "").strip() for token in body.access_tokens if str(token or "").strip()]
+        if not access_tokens:
+            raise HTTPException(status_code=400, detail={"error": "access_tokens is required"})
+
+        progress_id = str(uuid.uuid4())
+
+        async def _do_rotate():
+            try:
+                await run_in_threadpool(account_service.refresh_account_tokens, access_tokens, progress_id)
+            except Exception as e:
+                account_service.finish_token_rotate_progress(progress_id, error=str(e))
+
+        asyncio.create_task(_do_rotate())
+        return {"progress_id": progress_id}
+
+    @router.get("/api/accounts/refresh-token/progress/{progress_id}")
+    async def get_refresh_token_progress(progress_id: str, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        progress = account_service.get_token_rotate_progress(progress_id)
+        if progress is None:
+            raise HTTPException(status_code=404, detail={"error": "progress not found"})
+        return progress
+
     @router.post("/api/accounts/re-login")
     async def re_login_accounts(body: AccountRefreshRequest, authorization: str | None = Header(default=None)):
         """对选中账号执行密码重新登录流程（密码登录→验证码登录→刷新token）。"""

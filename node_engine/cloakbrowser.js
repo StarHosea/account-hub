@@ -157,7 +157,7 @@ function useSystemChrome() {
   return v === '1' || v === 'true' || v === 'yes';
 }
 
-export async function launchSession(proxyUrl, { headless = false, fingerprintSeed = null, locale = null, timezone = null, acceptLanguage = null, log = () => {} } = {}) {
+export async function launchSession(proxyUrl, { headless = false, fingerprintSeed = null, locale = null, timezone = null, acceptLanguage = null, storageState = null, log = () => {} } = {}) {
   const launchContext = await loadCloak();
   const seed = Number.isInteger(fingerprintSeed) && fingerprintSeed > 0
     ? fingerprintSeed
@@ -169,7 +169,7 @@ export async function launchSession(proxyUrl, { headless = false, fingerprintSee
   const browserTimezone = effectiveBrowserTimezone(proxyUrl, resolvedTimezone);
 
   if (useSystemChrome()) {
-    const fb = await launchFallbackChromium(proxyUrl, headless, resolvedLocale || 'en-US', browserTimezone, resolvedAcceptLanguage, log);
+    const fb = await launchFallbackChromium(proxyUrl, headless, resolvedLocale || 'en-US', browserTimezone, resolvedAcceptLanguage, storageState, log);
     fb.seed = seed;
     return fb;
   }
@@ -184,10 +184,12 @@ export async function launchSession(proxyUrl, { headless = false, fingerprintSee
       };
       if (resolvedLocale) opts.locale = resolvedLocale;
       if (browserTimezone) opts.timezone = browserTimezone;
+      opts.contextOptions = opts.contextOptions || {};
       if (resolvedAcceptLanguage) {
-        opts.contextOptions = {
-          extraHTTPHeaders: { 'Accept-Language': resolvedAcceptLanguage },
-        };
+        opts.contextOptions.extraHTTPHeaders = { 'Accept-Language': resolvedAcceptLanguage };
+      }
+      if (storageState && typeof storageState === 'object') {
+        opts.contextOptions.storageState = storageState;
       }
       if (proxyUrl) opts.proxy = proxyUrl;
       const context = await launchContext(opts);
@@ -219,13 +221,13 @@ export async function launchSession(proxyUrl, { headless = false, fingerprintSee
     log(`浏览器加载失败（${_loadError?.message || _loadError}），正在切换备用模式`);
   }
 
-  const fb = await launchFallbackChromium(proxyUrl, headless, resolvedLocale || 'en-US', browserTimezone, resolvedAcceptLanguage, log);
+  const fb = await launchFallbackChromium(proxyUrl, headless, resolvedLocale || 'en-US', browserTimezone, resolvedAcceptLanguage, storageState, log);
   fb.seed = seed; // 回退模式无真实指纹，仍记录 seed 保持数据结构一致
   return fb;
 }
 
 // 回退：playwright-core + 系统 Chrome / 自带 chromium（无 stealth 指纹，仅用于跑通链路）。
-async function launchFallbackChromium(proxyUrl, headless, locale, timezone, acceptLanguage, log) {
+async function launchFallbackChromium(proxyUrl, headless, locale, timezone, acceptLanguage, storageState, log) {
   const { chromium } = await import('playwright-core');
   const pwProxy = toPlaywrightProxy(proxyUrl);
   const launchOpts = {
@@ -257,6 +259,7 @@ async function launchFallbackChromium(proxyUrl, headless, locale, timezone, acce
     locale: locale || 'en-US',
     ...(timezone ? { timezoneId: timezone } : {}),
     ...(acceptLanguage ? { extraHTTPHeaders: { 'Accept-Language': acceptLanguage } } : {}),
+    ...(storageState && typeof storageState === 'object' ? { storageState } : {}),
     userAgent:
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
   });

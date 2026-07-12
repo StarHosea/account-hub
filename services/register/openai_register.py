@@ -549,6 +549,8 @@ def _build_account(data: dict, email: str, acct_proxy: str, identity, exit_ip: s
         "totp_secret": _totp_secret_from_data(data),
         "otpauth_url": str(data.get("twoFactorUri") or ""),
         "fingerprint_seed": data.get("fingerprintSeed"),
+        "browser_session": data.get("storageState") if isinstance(data.get("storageState"), dict) else None,
+        "browser_session_at": datetime.now(timezone.utc).isoformat() if isinstance(data.get("storageState"), dict) else None,
     }
 
 

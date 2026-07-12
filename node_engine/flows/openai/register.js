@@ -1084,6 +1084,52 @@ async function waitForLoginPasswordOutcome(page, beforeUrl, { timeoutMs = 8000, 
 
 // 老账号登录（OTP 收码登录）。验证码通过 requestCode('login') 向 Python 请求。
 // totpSecret：若账号已开 2FA，登录后会要求验证器码，传入 secret 则自动生成 TOTP 填入。
+// 用已保存的 browser session（cookies/localStorage）恢复登录态，失败时可 fallback 到 loginChatGPT。
+export async function sessionRefreshChatGPT({
+  page,
+  email,
+  chatgptUrl = 'https://chatgpt.com/',
+  password = '',
+  totpSecret = '',
+  fallbackLogin = true,
+  requestCode,
+  log,
+  recorder = NOOP_RECORDER,
+}) {
+  const mark = (id, meta) => recorder.record(id, typeof meta === 'string' ? { note: meta } : meta).catch(() => {});
+  log('刷新 · 尝试用已保存会话恢复登录态');
+  await openWithRetry(page, chatgptUrl, log, { recorder });
+  await sleep(2500);
+
+  let t = await readAccessToken(page);
+  for (let i = 0; i < 3 && !t.accessToken; i += 1) {
+    await sleep(1500);
+    t = await readAccessToken(page);
+  }
+  if (t.accessToken) {
+    log('刷新 · 会话恢复成功，已读取 accessToken');
+    await mark('session-refresh-ok', '会话恢复成功');
+    return { accessToken: t.accessToken, user: t.user, expires: t.expires, viaSession: true };
+  }
+
+  if (!fallbackLogin) {
+    throw new Error(`会话已失效：${t.error || '未取到 accessToken'}`);
+  }
+
+  log('刷新 · 会话失效，改用密码登录', 'yellow');
+  const login = await loginChatGPT({
+    page,
+    email,
+    chatgptUrl,
+    password,
+    totpSecret,
+    requestCode,
+    log,
+    recorder,
+  });
+  return { ...login, viaSession: false };
+}
+
 export async function loginChatGPT({ page, email, chatgptUrl = 'https://chatgpt.com/', password = '', totpSecret = '', requestCode, log, recorder = NOOP_RECORDER }) {
   const mark = (id, meta) => recorder.record(id, typeof meta === 'string' ? { note: meta } : meta).catch(() => {});
   let landing = null;

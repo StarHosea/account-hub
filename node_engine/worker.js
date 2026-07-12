@@ -14,7 +14,7 @@
 import { emit, log, requestCode, onStop, startStdin } from './protocol.js';
 import { launchSession } from './cloakbrowser.js';
 import { sleep } from './utils.js';
-import { registerChatGPT, secureExistingChatGPT, loginChatGPT } from './flows/openai/register.js';
+import { registerChatGPT, secureExistingChatGPT, loginChatGPT, sessionRefreshChatGPT } from './flows/openai/register.js';
 import { createRecorder } from './flows/openai/dom-recorder.js';
 import { attachStaticCache } from './static-cache.js';
 
@@ -102,6 +102,21 @@ async function runDryRun(job) {
   });
 }
 
+function parseFingerprintSeed(raw) {
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+async function attachStorageState(session, data) {
+  if (!session?.context || !data || typeof data !== 'object') return data;
+  try {
+    data.storageState = await session.context.storageState();
+  } catch {
+    /* ignore */
+  }
+  return data;
+}
+
 async function runReal(job) {
   const timeoutMs = Number(job.timeoutMs) > 0 ? Number(job.timeoutMs) : 300000;
   let session = null;
@@ -114,10 +129,11 @@ async function runReal(job) {
   const flow = (async () => {
     session = await launchSession(job.proxyUrl || '', {
       headless: Boolean(job.headless),
-      fingerprintSeed: Number.isInteger(job.fingerprintSeed) ? job.fingerprintSeed : null,
+      fingerprintSeed: parseFingerprintSeed(job.fingerprintSeed),
       locale: job.locale || null,
       timezone: job.timezone || null,
       acceptLanguage: job.acceptLanguage || null,
+      storageState: job.storageState && typeof job.storageState === 'object' ? job.storageState : null,
       log: (m) => log(m),
     });
     const seed = session.seed;
@@ -158,7 +174,14 @@ async function runReal(job) {
     };
 
     let data;
-    if (job.mode === 'login') {
+    if (job.mode === 'session_refresh') {
+      data = await sessionRefreshChatGPT({
+        ...common,
+        password: job.loginPassword || '',
+        totpSecret: job.existingTotpSecret || '',
+        fallbackLogin: job.fallbackLogin !== false,
+      });
+    } else if (job.mode === 'login') {
       // 老账号仅登录取 token（刷新/重登主流程用；用存的 password+totp 过 2FA，
       // 无密码/密码错时 loginChatGPT 内部走邮箱 OTP / 忘记密码兜底）。
       data = await loginChatGPT({
@@ -190,6 +213,7 @@ async function runReal(job) {
       }
     }
     data.fingerprintSeed = seed;
+    data = await attachStorageState(session, data);
     return data;
   })();
 

@@ -51,6 +51,8 @@ export type Account = {
   password?: string | null;
   created_at?: string | null;
   last_token_refresh_at?: string | null;
+  last_token_rotate_at?: string | null;
+  last_token_rotate_error?: string | null;
   mail_link?: string | null;
   // 2FA (TOTP) 相关字段
   totp_secret?: string | null;
@@ -562,6 +564,19 @@ export async function refreshAccounts(accessTokens: string[]) {
 
 export async function fetchRefreshProgress(progressId: string) {
   return httpRequest<RefreshProgressResponse>(`/api/accounts/refresh/progress/${progressId}`);
+}
+
+export async function refreshAccountTokens(accessTokens: string[]) {
+  return httpRequest<{ progress_id: string }>("/api/accounts/refresh-token", {
+    method: "POST",
+    body: { access_tokens: accessTokens },
+  });
+}
+
+export async function fetchRefreshTokenProgress(progressId: string) {
+  return httpRequest<RefreshProgressResponse & { status_counts?: Record<string, number> }>(
+    `/api/accounts/refresh-token/progress/${progressId}`,
+  );
 }
 
 export async function reLoginAccounts(accessTokens: string[]) {

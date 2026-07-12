@@ -20,8 +20,9 @@ from services.phone_service import phone_service
 def startup_recover() -> dict:
     """对账清理并返回各项计数。幂等：可安全重复调用。"""
     activations = account_service.reconcile_stuck_activations()
+    migrated = account_service.migrate_plus_review_accounts()
     cdks = cdk_service.clear_reservations()
     mailboxes = mailbox_service.reconcile_in_use()
     phones = phone_service.reconcile_reserved()
-    print(f"[recover] activations reset={activations}, cdks released={cdks}, mailboxes freed={mailboxes}, phones released={phones}")
-    return {"activations": activations, "cdks": cdks, "mailboxes": mailboxes, "phones": phones}
+    print(f"[recover] activations reset={activations}, plus_review migrated={migrated}, cdks released={cdks}, mailboxes freed={mailboxes}, phones released={phones}")
+    return {"activations": activations, "plus_review_migrated": migrated, "cdks": cdks, "mailboxes": mailboxes, "phones": phones}

@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
-from services.account_lifecycle import STAGE_ACTIVATING, STAGE_PLUS_REVIEW, STAGE_REGISTERED
+from services.account_lifecycle import STAGE_ACTIVATING, STAGE_PLUS_ACTIVATED, STAGE_PLUS_REVIEW, STAGE_REGISTERED, enrich_account
 from services.activation_service import ActivationService, is_activation_eligible
 from services.account_service import AccountService
 from test.test_account_export import MemoryStorage
@@ -42,7 +42,38 @@ class ActivationReviewTest(unittest.TestCase):
         self.assertEqual(summary["not_plus_by_type"], 3)
         self.assertEqual(targets, ["eyJok"])
 
-    def test_is_activation_eligible_skips_unavailable_and_review(self):
+    def test_enrich_retires_plus_review(self):
+        item = enrich_account({
+            "email": "review@x.com",
+            "access_token": "eyJreview",
+            "stage": STAGE_PLUS_REVIEW,
+            "plan": "free",
+            "type": "free",
+            "plus_status": "已激活",
+        })
+        self.assertEqual(item["stage"], STAGE_PLUS_ACTIVATED)
+        self.assertEqual(item["plan"], "plus")
+
+    def test_migrate_plus_review_accounts_persists(self):
+        storage = MemoryStorage([
+            {
+                "email": "review@x.com",
+                "access_token": "eyJreview",
+                "stage": STAGE_PLUS_REVIEW,
+                "plan": "free",
+                "plus_status": "已激活",
+                "plus_activated_at": "2026-01-01T00:00:00+00:00",
+            },
+        ])
+        svc = AccountService(storage)
+        changed = svc.migrate_plus_review_accounts()
+        self.assertEqual(changed, 1)
+        item = svc.get_account("eyJreview")
+        assert item is not None
+        self.assertEqual(item.get("stage"), STAGE_PLUS_ACTIVATED)
+        self.assertEqual(item.get("plan"), "plus")
+
+    def test_is_activation_eligible_skips_unavailable_and_activated(self):
         pending = {
             "email": "free@x.com",
             "access_token": "eyJfree",
@@ -62,7 +93,7 @@ class ActivationReviewTest(unittest.TestCase):
         self.assertFalse(is_activation_eligible(unavailable))
         self.assertFalse(is_activation_eligible(review))
 
-    def test_resolve_targets_skips_plus_review_and_activated_at(self):
+    def test_resolve_targets_skips_activated_accounts(self):
         svc = ActivationService()
         review = {
             "email": "review@x.com",

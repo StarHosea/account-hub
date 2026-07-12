@@ -222,7 +222,7 @@ def create_router() -> APIRouter:
         elif activation == "failed":
             items = [a for a in items if a.get("plus_status") == "激活失败"]
         elif activation == "review":
-            items = [a for a in items if a.get("stage") == STAGE_PLUS_REVIEW]
+            items = [a for a in items if a.get("stage") == STAGE_PLUS_ACTIVATED]
         if used is not None:
             items = [a for a in items if bool(a.get("dispatch", {}).get("dispatched")) == used]
 

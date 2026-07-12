@@ -11,7 +11,6 @@ from services.account_lifecycle import (
     PLAN_FREE,
     STAGE_ACTIVATING,
     STAGE_PLUS_ACTIVATED,
-    STAGE_PLUS_REVIEW,
     STAGE_REGISTERED,
     apply_stage,
     enrich_account,
@@ -34,7 +33,6 @@ from services.cdk_redeem_client import (
 )
 from services.activation_audit_service import (
     OUTCOME_FAILED,
-    OUTCOME_REVIEW,
     OUTCOME_SUCCESS,
     ActivationAuditRecorder,
     activation_audit_service,
@@ -45,8 +43,8 @@ from services.activation_audit_context import clear_recorder, get_recorder, set_
 
 CDK_TYPES = ("UPI", "IDEL")
 
-# 已完成 CDK 兑换（含待人工核查）的 stage，下轮激活不再选中。
-_ACTIVATION_DONE_STAGES = frozenset({STAGE_PLUS_ACTIVATED, STAGE_PLUS_REVIEW})
+# 已完成 CDK 兑换的 stage，下轮激活不再选中。
+_ACTIVATION_DONE_STAGES = frozenset({STAGE_PLUS_ACTIVATED})
 
 # _attempt 结束轮询的服务端明确终态；其余（pending/unknown）继续轮询直到大兜底。
 _TERMINAL_CLS = frozenset({"success", "fail", "cdk_invalid", "timeout", "cancelled"})
@@ -60,8 +58,7 @@ def is_activation_eligible(account: dict) -> bool:
     if item.get("plus_activated_at"):
         return False
     if item.get("plus_redeem_locked"):
-        # 已对该账号提交并被服务端受理过一张 CDK：即便当前档位仍非 Plus（服务端延迟/假失败/超时），
-        # 也不再自动提交第二张卡，避免重复激活烧卡；异议账号转人工核查(review)。
+        # 已对该账号提交并被服务端受理过一张 CDK：不再自动提交第二张卡，避免重复激活烧卡。
         return False
     if item.get("plus_unavailable"):
         return False
@@ -147,13 +144,6 @@ class ActivationService:
         # 与上面基于 plus_status 的 free/activated 口径分开：这两个字段供工作台卡片展示用。
         plus_by_type = sum(1 for a in accounts if str(a.get("type") or "").strip().lower() == "plus")
         not_plus_by_type = len(accounts) - plus_by_type
-        # 不一致告警：plus_status 已判定为「已激活」，但真实档位仍非 Plus（例如 CDK 服务端「假成功」，
-        # 或激活链路提前置位）。这类账号计入待激活口径无意义，需人工核查真实档位与 CDK 归属。
-        needs_review = sum(
-            1 for a in accounts
-            if a.get("plus_status") == STATUS_ACTIVATED
-            and str(a.get("type") or "").strip().lower() != "plus"
-        )
         pending = sum(1 for a in accounts if is_activation_eligible(a))
         return {
             "free": free,
@@ -162,7 +152,6 @@ class ActivationService:
             "total": len(accounts),
             "plus_by_type": plus_by_type,
             "not_plus_by_type": not_plus_by_type,
-            "needs_review": needs_review,
             "pending": pending,
         }
 
@@ -429,7 +418,7 @@ class ActivationService:
         if skipped:
             parts.append(f"跳过重复 {skipped}")
         if review:
-            parts.append(f"转人工核查 {review}")
+            parts.append(f"已标记激活 {review}")
         suffix = f"，{ '，'.join(parts)}" if parts else ""
         self._append_log(f"激活任务结束，成功 {success}，失败 {fail}{suffix}", "yellow")
 
@@ -504,8 +493,8 @@ class ActivationService:
                     if outcome == "success":
                         return True
                     if outcome == "review":
-                        self._to_review(token, email, last_cdk, last_cdk_type, audit, log_sink)
-                        return "review"
+                        self._mark_activated_after_submit(token, email, last_cdk, last_cdk_type, audit, log_sink)
+                        return True
                     if outcome == "stopped":
                         break
                     # outcome == "next_card"：换下一张卡继续（attempts 已按需在单卡逻辑内递增）
@@ -586,7 +575,7 @@ class ActivationService:
 
           success   —— 兑换成功（已 consume、已置激活）
           next_card —— 该卡不再重试，换下一张卡（失败已计入 attempts / not_found / 重试超上限）
-          review    —— 转人工核查（timeout 重试超限 / 大兜底到点仍 pending），持久锁已在，不再烧卡
+          review    —— 已受理但未出明确终态，按已激活收尾（timeout 重试超限 / 大兜底到点仍 pending），持久锁已在
           stopped   —— 收到停止信号
 
         重试策略：timeout（服务端超时/长时间无终态）走 /cdkey-jobs/retry 复用同卡、不计失败次数、
@@ -670,13 +659,13 @@ class ActivationService:
                         action = "retry"
                         continue
                     self._append_log(
-                        f"[{email}] {cdk_type} 超时重试已达上限（{timeout_retry_max}），转人工核查", "yellow", log_sink)
+                        f"[{email}] {cdk_type} 超时重试已达上限（{timeout_retry_max}），已标记为已激活", "yellow", log_sink)
                     return "review"
 
                 if cls == "poll_exhausted":
                     if self._stop.is_set():
                         return "stopped"
-                    self._append_log(f"[{email}] {cdk_type} 轮询大兜底到点仍无终态，转人工核查", "yellow", log_sink)
+                    self._append_log(f"[{email}] {cdk_type} 轮询大兜底到点仍无终态，已标记为已激活", "yellow", log_sink)
                     return "review"
 
                 if cls in ("cancelled", "retry_rejected"):
@@ -716,19 +705,26 @@ class ActivationService:
             if not consumed:
                 cdk_service.release(cdk)
 
-    def _to_review(self, token: str, email: str, cdk, cdk_type, audit, log_sink) -> None:
-        """把「已受理但未确认成功」的账号转人工核查：保留持久锁，不再自动烧卡。"""
-        msg = "CDK 已提交受理但未确认成功，转人工核查（不再自动烧卡）"
+    def _mark_activated_after_submit(self, token: str, email: str, cdk, cdk_type, audit, log_sink) -> None:
+        """CDK 已受理但未拿到明确成功终态：仍按已激活收尾，保留持久锁、不再自动烧卡。"""
+        msg = "CDK 已提交受理，已标记为已激活"
         acct = account_service.get_account(token)
         if acct:
+            item = enrich_account(acct)
             account_service.update_account(
                 token,
-                apply_stage(enrich_account(acct), STAGE_PLUS_REVIEW, plus_last_message=msg),
+                apply_stage(
+                    item,
+                    STAGE_PLUS_ACTIVATED,
+                    plan="plus",
+                    activated_at=item.get("activated_at") or item.get("plus_activated_at") or _now(),
+                    plus_last_message=msg,
+                ),
                 quiet=True,
             )
-        self._append_log(f"[{email}] {msg}", "yellow", log_sink)
+        self._append_log(f"[{email}] {msg}", "green", log_sink)
         if audit and not audit.finished_at:
-            self._end_audit(audit, OUTCOME_REVIEW, msg, token, cdk=cdk, cdk_type=cdk_type, cdk_consumed=audit.cdk_consumed)
+            self._end_audit(audit, OUTCOME_SUCCESS, msg, token, cdk=cdk, cdk_type=cdk_type, cdk_consumed=audit.cdk_consumed)
 
     def _log_raw(self, cdk: str, phase: str, js: object, log_sink=None) -> None:
         """把兑换接口的原始响应（脱敏 + 截断）写进激活日志，便于本地定位真实信封结构与状态词。"""

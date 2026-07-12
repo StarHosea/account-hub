@@ -492,8 +492,7 @@ export type AccountStage =
   | "registering"
   | "registered"
   | "activating"
-  | "plus_activated"
-  | "plus_review";
+  | "plus_activated";
 
 export type AccountView = "free" | "plus";
 
@@ -528,13 +527,11 @@ export type AccountSummary = {
   registered?: number;
   activating?: number;
   plus_activated?: number;
-  plus_review?: number;
   // legacy fields for older callers
   alive?: number;
   dead?: number;
   activated?: number;
   pending?: number;
-  needs_review?: number;
   unused?: number;
 };
 
@@ -828,7 +825,7 @@ export async function fetchPhonesExportText(onlyUnused = false): Promise<string>
 export type DispatchKind = "phone" | "account";
 export type DispatchAction = "checkout" | "cooldown" | "invalid" | "release";
 
-export type DispatchField = { label: string; value: string };
+export type DispatchField = { label: string; value: string; copyable?: boolean };
 
 export type DispatchItem = {
   kind: DispatchKind;

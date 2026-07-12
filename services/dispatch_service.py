@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 from services.account_lifecycle import is_dispatchable
 from services.account_service import account_service
+from services.mailbox_service import mailbox_service
 from services.phone_service import phone_service
 
 # Plus 账号发号预占过期时间（秒）：超时自动释放，防止占用泄漏。
@@ -53,14 +54,15 @@ class DispatchService:
     def _account_card(account: dict) -> dict:
         email = str(account.get("email") or "").strip()
         token = str(account.get("access_token") or "")
-        # 发号信息只需要邮箱、密码、2FA 密钥。
+        fetch_url = str(account.get("fetch_url") or "").strip() or (mailbox_service.get_fetch_url(email) or "")
         fields = [
             {"label": "邮箱", "value": email},
-            {"label": "密码", "value": str(account.get("password") or "")},
-            {"label": "2FA 密钥", "value": str(account.get("totp_secret") or "")},
+            {"label": "邮箱接码地址", "value": fetch_url},
+            {"label": "密码", "value": str(account.get("password") or "").strip()},
+            {"label": "2FA", "value": str(account.get("totp_secret") or "").strip()},
         ]
-        # 仅保留有值的字段，避免卡片出现空行。
-        fields = [f for f in fields if f["value"]]
+        # 邮箱与接码地址始终展示；密码、2FA 仅在有值时展示。
+        fields = [f for f in fields if f["value"] or f["label"] in ("邮箱", "邮箱接码地址")]
         return {"kind": "account", "id": token, "title": email or token[:12], "fields": fields}
 
     def list_dispatchable_accounts(self) -> list[dict]:
@@ -149,7 +151,7 @@ class DispatchService:
         fields = [
             {"label": "手机号", "value": str(phone.get("phone") or "")},
             {"label": "接码地址", "value": str(phone.get("fetch_url") or "")},
-            {"label": "已用次数", "value": f"{int(phone.get('used_count') or 0)}/{MAX_USES}"},
+            {"label": "已用次数", "value": f"{int(phone.get('used_count') or 0)}/{MAX_USES}", "copyable": False},
         ]
         fields = [f for f in fields if f["value"]]
         return {

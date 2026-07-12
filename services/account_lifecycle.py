@@ -134,9 +134,7 @@ def infer_stage_from_legacy(account: dict[str, Any]) -> str:
     if plus_status in (LEGACY_PLUS_QUEUED, LEGACY_PLUS_ACTIVATING):
         return STAGE_ACTIVATING
     if plus_status == LEGACY_PLUS_ACTIVATED:
-        if plan == PLAN_PLUS:
-            return STAGE_PLUS_ACTIVATED
-        return STAGE_PLUS_REVIEW
+        return STAGE_PLUS_ACTIVATED
     if plus_status == LEGACY_PLUS_FAILED:
         return STAGE_REGISTERED
     if token:
@@ -254,12 +252,23 @@ def _normalize_activation(account: dict[str, Any]) -> dict[str, Any]:
     return activation
 
 
+def _retire_plus_review_stage(item: dict[str, Any]) -> None:
+    """plus_review 已废弃：激活成功即已激活，读盘时统一升格为 plus_activated。"""
+    if str(item.get("stage") or "") != STAGE_PLUS_REVIEW:
+        return
+    item["stage"] = STAGE_PLUS_ACTIVATED
+    item["plan"] = PLAN_PLUS
+    if not item.get("plus_activated_at") and not item.get("activated_at"):
+        item["plus_activated_at"] = _now()
+
+
 def enrich_account(account: dict[str, Any]) -> dict[str, Any]:
     """Normalize lifecycle fields and keep legacy fields in sync for older code paths."""
     raw_plus_status = str(account.get("plus_status") or "").strip()
     item = deepcopy(account)
     item["plan"] = infer_plan_from_legacy(item)
     item["stage"] = infer_stage_from_legacy(item)
+    _retire_plus_review_stage(item)
     item["token_status"] = item.get("token_status") or _legacy_token_status(item.get("status"))
     item["dispatch"] = _normalize_dispatch(item.get("dispatch"), item)
     _migrate_legacy_activation_error(item, raw_plus_status)
@@ -319,22 +328,18 @@ def account_in_view(account: dict[str, Any], view: str) -> bool:
             return False
         return True
     if view == "plus":
-        if stage == STAGE_PLUS_REVIEW:
-            return True
         if stage not in PLUS_STAGES:
             return False
         if stage == STAGE_ACTIVATING and plan != PLAN_PLUS:
             return False
-        return plan == PLAN_PLUS or stage == STAGE_PLUS_REVIEW
+        return plan == PLAN_PLUS
     return True
 
 
 def is_dispatchable(account: dict[str, Any]) -> bool:
     item = enrich_account(account)
     stage = str(item.get("stage"))
-    if stage not in (STAGE_PLUS_ACTIVATED, STAGE_PLUS_REVIEW):
-        return False
-    if stage == STAGE_PLUS_ACTIVATED and str(item.get("plan")) != PLAN_PLUS:
+    if stage != STAGE_PLUS_ACTIVATED or str(item.get("plan")) != PLAN_PLUS:
         return False
     return (
         str(item.get("token_status")) == TOKEN_OK
@@ -382,7 +387,6 @@ def summary_for_view(accounts: list[dict[str, Any]], view: str) -> dict[str, int
         summary.update({
             "activating": buckets.get(STAGE_ACTIVATING, 0),
             "plus_activated": buckets.get(STAGE_PLUS_ACTIVATED, 0),
-            "plus_review": buckets.get(STAGE_PLUS_REVIEW, 0),
         })
     return summary
 

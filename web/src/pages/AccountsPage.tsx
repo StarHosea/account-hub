@@ -29,7 +29,6 @@ import {
   IconKey,
   IconCopy,
   IconSearch,
-  IconClose,
 } from "@douyinfe/semi-icons";
 import type { ColumnProps } from "@douyinfe/semi-ui-19/lib/es/table";
 
@@ -41,7 +40,6 @@ import {
   createAccounts,
   exportAccounts,
   markAccountsUsed,
-  revokeActivation,
   type Account,
   type AccountImportPayload,
   type AccountSummary,
@@ -67,7 +65,6 @@ const STAGE_TAG_COLOR: Record<string, string> = {
   registered: "cyan",
   activating: "orange",
   plus_activated: "green",
-  plus_review: "red",
 };
 
 function stageTag(a: Account, isRefreshing: boolean) {
@@ -167,10 +164,6 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
   const [exportOpen, setExportOpen] = useState(false);
   const [exportScope, setExportScope] = useState<"selected" | "filtered">("selected");
   const [exportMarkDispatched, setExportMarkDispatched] = useState(false);
-
-  const [revokeActivationOpen, setRevokeActivationOpen] = useState(false);
-  const [revokeActivationTokens, setRevokeActivationTokens] = useState<string[]>([]);
-  const [revokeActivationRevokeCdk, setRevokeActivationRevokeCdk] = useState(true);
 
   const [importOpen, setImportOpen] = useState(false);
   const [importText, setImportText] = useState("");
@@ -302,39 +295,6 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
       Toast.success(`已标记 ${data.updated} 个为${used ? "已出库" : "未出库"}`);
     } catch (e) {
       Toast.error(e instanceof Error ? e.message : "标记失败");
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const openRevokeActivationModal = (tokens: string[]) => {
-    if (!tokens.length) {
-      Toast.warning("请先选择账号");
-      return;
-    }
-    setRevokeActivationTokens(tokens);
-    setRevokeActivationRevokeCdk(true);
-    setRevokeActivationOpen(true);
-  };
-
-  const handleRevokeActivation = async () => {
-    if (!revokeActivationTokens.length) return;
-    setBusy(true);
-    try {
-      const data = await revokeActivation(revokeActivationTokens, revokeActivationRevokeCdk);
-      setRevokeActivationOpen(false);
-      setRevokeActivationTokens([]);
-      await load(true);
-      if (data.updated) {
-        const cdkPart = revokeActivationRevokeCdk && data.cdk_revoked ? `，已撤销 ${data.cdk_revoked} 个 CDK` : "";
-        Toast.success(`已撤销 ${data.updated} 个账号的激活状态${cdkPart}`);
-      } else if (data.skipped) {
-        Toast.info("所选账号均非「需核查」状态，未做变更");
-      } else {
-        Toast.info("没有需要变更的账号");
-      }
-    } catch (e) {
-      Toast.error(e instanceof Error ? e.message : "撤销失败");
     } finally {
       setBusy(false);
     }
@@ -605,16 +565,6 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
               loading={refreshing.has(accountKey(a))}
               onClick={() => void handleRefresh([accountOpKey(a)])}
             />
-            {planType === "plus" && a.stage === "plus_review" ? (
-              <Button
-                size="small"
-                theme="borderless"
-                type="warning"
-                title="撤销激活"
-                icon={<IconClose />}
-                onClick={() => openRevokeActivationModal([accountOpKey(a)])}
-              />
-            ) : null}
             <Popconfirm title="删除该账号？" onConfirm={() => void handleDelete([accountKey(a)])}>
               <Button size="small" theme="borderless" type="danger" icon={<IconDelete />} title="删除" />
             </Popconfirm>
@@ -641,7 +591,6 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
           { label: "未出库", value: summary.undispatched ?? 0, color: "var(--semi-color-primary)" },
           { label: "激活中", value: summary.activating ?? 0, color: "var(--semi-color-warning)" },
           { label: "已激活", value: summary.plus_activated ?? 0, color: "var(--semi-color-success)" },
-          { label: "需核查", value: summary.plus_review ?? 0, color: "var(--semi-color-danger)" },
         ];
 
   const stageOptions =
@@ -654,7 +603,6 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
           { label: "全部状态", value: "" },
           { label: "激活中", value: "activating" },
           { label: "已激活", value: "plus_activated" },
-          { label: "需核查", value: "plus_review" },
         ];
 
   const filterControls = (
@@ -740,15 +688,6 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
                       撤销出库
                     </Button>
                   </Popconfirm>
-                  <Button
-                    size="small"
-                    type="warning"
-                    theme="light"
-                    loading={busy}
-                    onClick={() => openRevokeActivationModal(selectedKeys)}
-                  >
-                    撤销激活
-                  </Button>
                 </>
               ) : null}
               <span style={{ width: 1, height: 18, background: "var(--semi-color-border)", display: "inline-block" }} />
@@ -920,34 +859,6 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
             导出后标记为已出库
           </Checkbox>
         </div>
-      </Modal>
-
-      <Modal
-        title="撤销激活"
-        visible={revokeActivationOpen}
-        onCancel={() => {
-          setRevokeActivationOpen(false);
-          setRevokeActivationTokens([]);
-        }}
-        onOk={() => void handleRevokeActivation()}
-        okText="确认撤销"
-        confirmLoading={busy}
-        maskClosable={false}
-        fullScreen={isMobile}
-      >
-        <Text>
-          将把选中的 {revokeActivationTokens.length} 个「需核查」账号复位为免费已注册态，重新进入激活队列。
-        </Text>
-        <div style={{ marginTop: 16 }}>
-          <Checkbox checked={revokeActivationRevokeCdk} onChange={(e) => setRevokeActivationRevokeCdk(!!e.target?.checked)}>
-            同时撤销 CDK 使用状态（将 CDK 标记为可用）
-          </Checkbox>
-        </div>
-        {!revokeActivationRevokeCdk ? (
-          <Text type="tertiary" size="small" style={{ display: "block", marginTop: 8 }}>
-            不撤销时仅复位账号，已消耗的 CDK 保持已使用状态。
-          </Text>
-        ) : null}
       </Modal>
     </div>
   );

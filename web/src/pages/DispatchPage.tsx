@@ -1,10 +1,9 @@
 import { useEffect, useState } from "react";
-import { Card, Button, Typography, Toast, Space, Tag, RadioGroup, Radio, Spin, Popconfirm, Modal, Input, Checkbox, Table } from "@douyinfe/semi-ui-19";
+import { Card, Button, Typography, Toast, Space, Tag, RadioGroup, Radio, Spin, Popconfirm, Modal, Input, Checkbox } from "@douyinfe/semi-ui-19";
 import { IconCopy, IconSend, IconTickCircle, IconClose, IconRefresh, IconClock } from "@douyinfe/semi-icons";
 
 import {
   fetchDispatchSummary,
-  fetchDispatchAccounts,
   acquireDispatch,
   dispatchAction,
   dispatchCheckout,
@@ -30,8 +29,6 @@ export default function DispatchPage() {
   const [xianyu, setXianyu] = useState("");
   const [plan, setPlan] = useState("");
   const [note, setNote] = useState("");
-  const [dispatchAccounts, setDispatchAccounts] = useState<Array<{ email: string | null; access_token: string; activated_at?: string | null }>>([]);
-  const [selectedToken, setSelectedToken] = useState("");
   const [relatedPhone, setRelatedPhone] = useState("");
   const [relatedAccountToken, setRelatedAccountToken] = useState("");
 
@@ -43,19 +40,8 @@ export default function DispatchPage() {
     }
   };
 
-  const refreshDispatchAccounts = async () => {
-    try {
-      const data = await fetchDispatchAccounts();
-      setDispatchAccounts(data.items);
-      setSummary(data.summary);
-    } catch {
-      /* ignore */
-    }
-  };
-
   useEffect(() => {
     void refreshSummary();
-    void refreshDispatchAccounts();
   }, []);
 
   const [pairCheckout, setPairCheckout] = useState(false);
@@ -75,15 +61,10 @@ export default function DispatchPage() {
     void refreshSummary();
   };
 
-  const acquire = async (releaseId?: string, token?: string) => {
+  const acquire = async (releaseId?: string) => {
     setBusy(true);
     try {
-      const pick = token || selectedToken;
-      if (kind === "account" && !pick) {
-        Toast.warning("请先选择要出库的 Plus 账号");
-        return;
-      }
-      const res = await acquireDispatch(kind, releaseId, pick || undefined);
+      const res = await acquireDispatch(kind, releaseId);
       setSummary(res.summary);
       setItem(res.item);
       if (!res.item) Toast.warning(kind === "account" ? "暂无可发的 Plus 账号" : "暂无可发的手机号（可能都在冷却/已用尽）");
@@ -125,6 +106,14 @@ export default function DispatchPage() {
     setCheckoutOpen(true);
   };
 
+  const isCopyableField = (f: DispatchItem["fields"][number]) => f.copyable !== false;
+
+  const formatDispatchText = (dispatchItem: DispatchItem) =>
+    dispatchItem.fields
+      .filter((f) => f.value && isCopyableField(f))
+      .map((f) => `${f.label}: ${f.value}`)
+      .join("\n");
+
   const submitCheckout = async () => {
     if (!item) return;
     setBusy(true);
@@ -145,6 +134,9 @@ export default function DispatchPage() {
         setCheckoutOpen(false);
         return;
       }
+      if (kind === "account") {
+        void copy(formatDispatchText(item), "出库信息");
+      }
       setItem(null);
       setCheckoutOpen(false);
       Toast.success(pairCheckout ? "已完成成套出库" : "已出库");
@@ -157,8 +149,7 @@ export default function DispatchPage() {
 
   const copyAll = () => {
     if (!item) return;
-    const text = item.fields.map((f) => `${f.label}: ${f.value}`).join("\n");
-    void copy(text, "全部信息");
+    void copy(formatDispatchText(item), "全部信息");
   };
 
   const kindLabel = kind === "account" ? "Plus 账号" : "手机号";
@@ -195,32 +186,6 @@ export default function DispatchPage() {
           </Button>
         </div>
 
-        {kind === "account" ? (
-          <div style={{ marginBottom: 14 }}>
-            <Table
-              dataSource={dispatchAccounts}
-              rowKey="access_token"
-              size="small"
-              pagination={false}
-              rowSelection={{
-                type: "radio",
-                selectedRowKeys: selectedToken ? [selectedToken] : [],
-                onChange: (keys) => setSelectedToken(String((keys ?? [])[0] || "")),
-              }}
-              columns={[
-                { title: "邮箱", dataIndex: "email" },
-                {
-                  title: "激活时间",
-                  dataIndex: "activated_at",
-                  render: (v: string | null) => (v ? new Date(v).toLocaleString() : "—"),
-                },
-              ]}
-              scroll={{ y: 200 }}
-              empty="暂无可出库 Plus 账号"
-            />
-          </div>
-        ) : null}
-
         <div style={{ marginTop: 14 }}>
           <Button
             theme="solid"
@@ -229,13 +194,13 @@ export default function DispatchPage() {
             icon={<IconSend />}
             block
             loading={busy && !item}
-            disabled={(kind === "account" ? !selectedToken && availableOf(kind) <= 0 : availableOf(kind) <= 0) && !item}
-            onClick={() => void acquire(item?.id, selectedToken)}
+            disabled={availableOf(kind) <= 0 && !item}
+            onClick={() => void acquire(item?.id)}
           >
             {item ? "重新发一个" : `发一个${kindLabel}`}
           </Button>
           <Text type="tertiary" size="small" style={{ display: "block", marginTop: 8, textAlign: "center" }}>
-            {kind === "account" ? "先勾选 Plus 账号，再预占并发号" : "按导入时间最老优先"}
+            {kind === "account" ? "按激活时间最老优先自动预占" : "按导入时间最老优先"}
           </Text>
         </div>
       </Card>
@@ -261,24 +226,42 @@ export default function DispatchPage() {
           }
         >
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            {item.fields.map((f) => (
-              <div
-                key={f.label}
-                style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, minWidth: 0 }}
-              >
-                <Text type="tertiary" size="small" style={{ flexShrink: 0, width: 76 }}>
-                  {f.label}
-                </Text>
-                <Text
-                  ellipsis={{ showTooltip: true }}
-                  style={{ flex: 1, fontFamily: "monospace", fontSize: 13 }}
-                  onClick={() => void copy(f.value, f.label)}
+            {item.fields.map((f) => {
+              const copyable = isCopyableField(f);
+              return (
+                <div
+                  key={f.label}
+                  style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, minWidth: 0 }}
                 >
-                  {f.value}
-                </Text>
-                <Button size="small" theme="borderless" icon={<IconCopy />} onClick={() => void copy(f.value, f.label)} />
-              </div>
-            ))}
+                  <Text type="tertiary" size="small" style={{ flexShrink: 0, width: 76 }}>
+                    {f.label}
+                  </Text>
+                  <Text
+                    ellipsis={{ showTooltip: true }}
+                    style={{
+                      flex: 1,
+                      fontFamily: copyable ? "monospace" : undefined,
+                      fontSize: 13,
+                      cursor: copyable && f.value ? "pointer" : undefined,
+                    }}
+                    onClick={() => copyable && f.value && void copy(f.value, f.label)}
+                  >
+                    {f.value || "—"}
+                  </Text>
+                  {copyable ? (
+                    <Button
+                      size="small"
+                      theme="borderless"
+                      icon={<IconCopy />}
+                      disabled={!f.value}
+                      onClick={() => void copy(f.value, f.label)}
+                    />
+                  ) : (
+                    <span style={{ width: 32, flexShrink: 0 }} />
+                  )}
+                </div>
+              );
+            })}
           </div>
 
           {/* 标记动作 */}

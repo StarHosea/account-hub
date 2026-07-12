@@ -1,9 +1,8 @@
 import unittest
 from unittest.mock import patch
 
-from services.account_lifecycle import PLAN_FREE, STAGE_PLUS_REVIEW, STAGE_REGISTERED, enrich_account
+from services.account_lifecycle import STAGE_PLUS_ACTIVATED, STAGE_PLUS_REVIEW, STAGE_REGISTERED, enrich_account
 from services.account_service import AccountService
-from services.activation_service import is_activation_eligible
 from services.cdk_service import STATUS_AVAILABLE, STATUS_USED
 from test.utils import InMemoryStorage
 
@@ -26,45 +25,14 @@ class RevokeActivationTest(unittest.TestCase):
             "activation": {"cdk": cdk, "cdk_type": "UPI", "attempts": {"UPI": 1, "IDEL": 0}},
         }
 
-    def test_revoke_activation_without_revoke_cdk(self):
+    def test_revoke_activation_skips_retired_plus_review(self):
         self.svc._accounts["eyJreview"] = self._review_account()
-        with patch("services.cdk_service.cdk_service.revoke_use") as mock_revoke, patch(
-            "services.activation_audit_service.activation_audit_service.delete_by_access_tokens",
-            return_value=1,
-        ) as mock_audit_del:
-            result = self.svc.revoke_activation(["eyJreview"], revoke_cdk=False)
-        mock_revoke.assert_not_called()
-        mock_audit_del.assert_called_once_with(["eyJreview"])
-        self.assertEqual(result["updated"], 1)
-        item = enrich_account(self.svc._accounts["eyJreview"])
-        self.assertEqual(item["stage"], STAGE_REGISTERED)
-        self.assertEqual(item["plan"], PLAN_FREE)
-        self.assertFalse(item.get("plus_unavailable"))
-        self.assertIsNone(item.get("plus_cdk"))
-        self.assertIsNone(item.get("plus_last_message"))
-        self.assertIsNone(item.get("last_activation_audit_id"))
-
-    def test_revoke_activation_clears_redeem_lock(self):
-        acct = self._review_account()
-        acct["plus_redeem_locked"] = True
-        self.svc._accounts["eyJreview"] = acct
         with patch("services.activation_audit_service.activation_audit_service.delete_by_access_tokens", return_value=0):
             result = self.svc.revoke_activation(["eyJreview"], revoke_cdk=False)
-        self.assertEqual(result["updated"], 1)
+        self.assertEqual(result["updated"], 0)
+        self.assertEqual(result["skipped"], 1)
         item = enrich_account(self.svc._accounts["eyJreview"])
-        self.assertFalse(item.get("plus_redeem_locked"))
-        self.assertTrue(is_activation_eligible(item))
-
-    def test_revoke_activation_revokes_cdk(self):
-        self.svc._accounts["eyJreview"] = self._review_account(cdk="CDK-ABC")
-        with patch("services.cdk_service.cdk_service.revoke_use", return_value=1) as mock_revoke, patch(
-            "services.activation_audit_service.activation_audit_service.delete_by_access_tokens",
-            return_value=1,
-        ):
-            result = self.svc.revoke_activation(["eyJreview"], revoke_cdk=True)
-        mock_revoke.assert_called_once_with(["CDK-ABC"])
-        self.assertEqual(result["updated"], 1)
-        self.assertEqual(result["cdk_revoked"], 1)
+        self.assertEqual(item["stage"], STAGE_PLUS_ACTIVATED)
 
     def test_revoke_activation_skips_non_review(self):
         self.svc._accounts["eyJok"] = {

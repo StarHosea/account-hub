@@ -138,7 +138,7 @@ class AccountService:
         不动 plus_unavailable 及「已激活/激活失败」终态。同时把 stage 从 activating 复位为 registered。
         返回复位数量。
         """
-        from services.account_lifecycle import STAGE_ACTIVATING, STAGE_PLUS_REVIEW, STAGE_REGISTERED, apply_stage, enrich_account
+        from services.account_lifecycle import PLAN_PLUS, STAGE_ACTIVATING, STAGE_PLUS_ACTIVATED, STAGE_REGISTERED, apply_stage, enrich_account
 
         reset = 0
         for acct in self.list_accounts():
@@ -155,11 +155,12 @@ class AccountService:
             if not stuck_plus and not stuck_stage:
                 continue
             if item.get("plus_redeem_locked"):
-                # 重启前已提交并被服务端受理过 CDK：绝不复位为可激活（否则会用第二张卡重复激活），
-                # 转人工核查并保留持久锁。服务端真实结果留待人工/后续核实确认。
+                # 重启前已提交并被服务端受理过 CDK：按已激活保留，避免重复烧卡。
                 patch = apply_stage(
-                    {**item, "plus_last_message": "重启前已提交 CDK，转人工核查（防重复烧卡）"},
-                    STAGE_PLUS_REVIEW,
+                    {**item, "plus_last_message": "重启前已提交 CDK，已标记为已激活"},
+                    STAGE_PLUS_ACTIVATED,
+                    plan=PLAN_PLUS,
+                    activated_at=item.get("activated_at") or item.get("plus_activated_at") or None,
                 )
                 self.update_account(token, patch, quiet=True)
                 reset += 1
@@ -175,6 +176,31 @@ class AccountService:
             self.update_account(token, patch, quiet=True)
             reset += 1
         return reset
+
+    def migrate_plus_review_accounts(self) -> int:
+        """将历史 plus_review 账号持久化为 plus_activated。幂等。"""
+        from services.account_lifecycle import PLAN_PLUS, STAGE_PLUS_ACTIVATED, STAGE_PLUS_REVIEW, apply_stage, enrich_account
+
+        changed = 0
+        with self._lock:
+            for key, raw in list(self._accounts.items()):
+                stage = str(raw.get("stage") or "")
+                if stage != STAGE_PLUS_REVIEW:
+                    continue
+                item = apply_stage(
+                    enrich_account(raw),
+                    STAGE_PLUS_ACTIVATED,
+                    plan=PLAN_PLUS,
+                    activated_at=raw.get("plus_activated_at") or raw.get("activated_at"),
+                )
+                account = self._normalize_account(item)
+                if account is None:
+                    continue
+                self._accounts[key] = account
+                changed += 1
+            if changed:
+                self._save_accounts()
+        return changed
 
     @staticmethod
     def _now() -> str:

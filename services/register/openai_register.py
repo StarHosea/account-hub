@@ -46,6 +46,7 @@ config = {
     "total": 10,
     "threads": 3,
     "enable_2fa": True,
+    "auto_set_password": True,
     "regions": ["US"],
     "ipweb_rotate": False,
     "ip_duration": 120,
@@ -67,7 +68,7 @@ config = {
 }
 _CONFIG_KEYS = (
     "mail", "proxy", "total", "threads", "regions", "ipweb_rotate", "ip_duration",
-    "enable_2fa", "headless", "register_timeout", "node_bin", "ip_probe_retries",
+    "enable_2fa", "auto_set_password", "headless", "register_timeout", "node_bin", "ip_probe_retries",
     "static_cache_enabled", "static_cache_max_age_days", "static_cache_dir",
     "record_enabled", "record_dir", "record_keep", "diag_public_url",
 )
@@ -694,6 +695,7 @@ def _run_browser_job(
         "proxyUrl": browser_proxy,
         "fingerprintSeed": None,
         "enable2fa": bool(config.get("enable_2fa")),
+        "autoSetPassword": bool(config.get("auto_set_password", True)),
         "headless": bool(config.get("headless")),
         "chatgptUrl": chatgpt_url,
         "timeoutMs": timeout_s * 1000,

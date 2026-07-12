@@ -419,6 +419,7 @@ export type RegisterConfig = {
   total: number;
   threads: number;
   enable_2fa?: boolean;
+  auto_set_password?: boolean;
   regions?: string[];
   ipweb_rotate?: boolean;
   ip_duration?: number;

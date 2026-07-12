@@ -4,7 +4,7 @@
 // ----------------------------------------------------------------------------
 // 用法：node worker.js '<job-json>'      （job 也可从 stdin 首行读入）
 // job JSON 字段：
-//   { email, proxyUrl, fingerprintSeed, enable2fa, headless,
+//   { email, proxyUrl, fingerprintSeed, enable2fa, autoSetPassword, headless,
 //     chatgptUrl, timeoutMs, locale, loginPassword, existingTotpSecret,
 //     forceReset2fa, mode, dryRun }
 // 通过 NDJSON 与 Python 编排器通信（见 protocol.js）。验证码由 Python 经 requestCode 回传。
@@ -151,6 +151,7 @@ async function runReal(job) {
       email: job.email,
       chatgptUrl: job.chatgptUrl || 'https://chatgpt.com/',
       enable2fa: job.enable2fa !== false,
+      autoSetPassword: job.autoSetPassword !== false,
       requestCode,
       log: (m, level) => log(m, level),
       recorder,

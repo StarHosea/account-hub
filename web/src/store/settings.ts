@@ -71,6 +71,7 @@ type SettingsStore = {
   setRegisterTotal: (value: string) => void;
   setRegisterThreads: (value: string) => void;
   setRegisterEnable2fa: (value: boolean) => void;
+  setRegisterAutoSetPassword: (value: boolean) => void;
   setRegisterRegions: (values: string[]) => void;
   setRegisterTimeoutMinutes: (value: number) => void;
   setRegisterStaticCacheEnabled: (value: boolean) => void;
@@ -128,6 +129,7 @@ function buildRegisterPayload(config: RegisterConfig): Partial<RegisterConfig> {
     total: Math.max(1, Number(config.total) || 1),
     threads: Math.max(1, Number(config.threads) || 1),
     enable_2fa: Boolean(config.enable_2fa),
+    auto_set_password: config.auto_set_password !== false,
     regions: config.regions && config.regions.length ? config.regions : ["US"],
     ipweb_rotate: proxyPayload.ipweb_rotate,
     register_timeout,
@@ -301,6 +303,12 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   setRegisterEnable2fa: (value) => {
     set((state) =>
       state.registerConfig ? { registerConfig: { ...state.registerConfig, enable_2fa: value } } : {},
+    );
+  },
+
+  setRegisterAutoSetPassword: (value) => {
+    set((state) =>
+      state.registerConfig ? { registerConfig: { ...state.registerConfig, auto_set_password: value } } : {},
     );
   },
 

@@ -64,6 +64,7 @@ def _default_config() -> dict:
         "threads": 3,
         "enabled": False,
         "enable_2fa": True,
+        "auto_set_password": True,
         "regions": ["US"],
         "ipweb_rotate": False,
         "ip_duration": 120,
@@ -156,6 +157,7 @@ def _normalize(raw: dict) -> dict:
     cfg["enabled"] = bool(raw.get("enabled"))
     # 缺失时回退到默认（现默认开），避免旧配置文件没有该键就被强制关掉。
     cfg["enable_2fa"] = bool(raw.get("enable_2fa", cfg["enable_2fa"]))
+    cfg["auto_set_password"] = bool(raw.get("auto_set_password", cfg["auto_set_password"]))
     valid_regions = set(openai_register.fingerprint.REGIONS.keys())
     raw_regions = raw.get("regions") if isinstance(raw.get("regions"), list) else []
     cfg["regions"] = [r for r in raw_regions if r in valid_regions] or ["US"]
@@ -322,7 +324,7 @@ class RegisterService:
         openai_register.config.update({
             k: self._config[k]
             for k in (
-                "mail", "proxy", "total", "threads", "enable_2fa", "regions", "ipweb_rotate",
+                "mail", "proxy", "total", "threads", "enable_2fa", "auto_set_password", "regions", "ipweb_rotate",
                 "ip_duration", "ip_probe_retries", "engine", "headless", "register_timeout", "node_bin",
                 "static_cache_enabled", "static_cache_max_age_days", "static_cache_dir",
                 "record_enabled", "record_dir", "record_keep", "diag_public_url",

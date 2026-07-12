@@ -45,6 +45,7 @@ export default function RegisterConfigCard() {
   const setTotal = useSettingsStore((s) => s.setRegisterTotal);
   const setThreads = useSettingsStore((s) => s.setRegisterThreads);
   const setEnable2fa = useSettingsStore((s) => s.setRegisterEnable2fa);
+  const setAutoSetPassword = useSettingsStore((s) => s.setRegisterAutoSetPassword);
   const setRegions = useSettingsStore((s) => s.setRegisterRegions);
   const setRegisterTimeoutMinutes = useSettingsStore((s) => s.setRegisterTimeoutMinutes);
   const setStaticCacheEnabled = useSettingsStore((s) => s.setRegisterStaticCacheEnabled);
@@ -217,6 +218,12 @@ export default function RegisterConfigCard() {
           </div>
         </div>
         <div style={{ marginTop: 16 }}>
+          <Space align="center">
+            <Switch checked={config.auto_set_password !== false} onChange={setAutoSetPassword} disabled={running} />
+            <Text>注册成功后自动设置密码（关闭后账号以无密码/OTP 方式保存）</Text>
+          </Space>
+        </div>
+        <div style={{ marginTop: 12 }}>
           <Space align="center">
             <Switch checked={!!config.enable_2fa} onChange={setEnable2fa} disabled={running} />
             <Text>注册成功后自动开启 2FA（密钥随账号保存/导出）</Text>

@@ -15,7 +15,8 @@ const NOOP_RECORDER = { enabled: false, async record() {}, async finalize() { re
 //   2) 「邮箱已注册」不再 throw，而是 registerChatGPT 返回 { emailExists:true }，
 //      由 worker 分流到 secureExistingChatGPT（OTP 登录 → 设新密码 → 开 2FA → 取 token）。
 //   3) enable2fa=false 时 step8 只设密码、跳过 2FA。
-//   4) 诊断截图默认关闭，仅当设置环境变量 REG_DIAG_DIR 时落盘。
+//   4) autoSetPassword=false 时跳过注册密码页与 step8 设密码（仍可单独开 2FA）。
+//   5) 诊断截图默认关闭，仅当设置环境变量 REG_DIAG_DIR 时落盘。
 // ============================================================================
 
 // 提交类按钮要排除的第三方登录/其它入口，避免把"使用 Google 账户继续"当成邮箱"继续"
@@ -589,6 +590,30 @@ function isLoggedInUrl(url) {
   }
 }
 
+// Plus 促销落地页（/?promo_campaign=…）不展示注册入口，注册机应跳过。
+function isPromoCampaignUrl(url) {
+  try {
+    const u = new URL(url);
+    return /(^|\.)chatgpt\.com$/i.test(u.hostname) && u.searchParams.has('promo_campaign');
+  } catch {
+    return false;
+  }
+}
+
+async function skipPromoCampaignLanding(page, log) {
+  let current;
+  try { current = page.url(); } catch { return false; }
+  if (!isPromoCampaignUrl(current)) return false;
+
+  const u = new URL(current);
+  const promo = u.searchParams.get('promo_campaign') || '';
+  const target = `${u.origin}${u.pathname || '/'}`;
+  log(`跳过促销落地页（promo_campaign=${promo}）→ ${target}`);
+  await page.goto(target, { waitUntil: 'commit', timeout: 90000 });
+  await waitForDomReady(page, { timeoutMs: 45000 }).catch(() => {});
+  return true;
+}
+
 // 失败现场快照：默认关闭；仅当设置 REG_DIAG_DIR 时截图落盘 + 记录 URL/输入框/按钮。
 async function snapshot(page, tag, log) {
   if (!DIAG_DIR) return;
@@ -617,6 +642,7 @@ async function openWithRetry(page, url, log, { attempts = 3, recorder = NOOP_REC
         () => /免费注册|sign up|登录|log ?in|無料でサインアップ|ログイン/i.test(document.body?.innerText || ''),
         { timeout: 30000 }
       ).catch(() => {});
+      await skipPromoCampaignLanding(page, log).catch(() => {});
       const txt = await pageText(page);
       if (txt && txt.length > 20) {
         log(`已打开页面（第 ${i} 次），标题：${await page.title().catch(() => '')}`);
@@ -1478,8 +1504,8 @@ function hasStoredTotpSecret(partial, existingTotpSecret = '') {
 
 // step8（设密码 + 开 2FA）失败后的收尾决策：2FA 为可选加固，其失败不否定已成功的密码设置。
 // require2fa=true 时若无任何可落库 secret，返回 null（避免「2FA 已开但密钥空」静默入池）。
-function resolveStep8Tolerance(partial, passwordOk, { require2fa = false, existingTotpSecret = '' } = {}) {
-  if (!passwordOk) return null;
+function resolveStep8Tolerance(partial, passwordOk, { require2fa = false, requirePassword = true, existingTotpSecret = '' } = {}) {
+  if (requirePassword && !passwordOk) return null;
   const hasSecret = hasStoredTotpSecret(partial, existingTotpSecret);
   if (require2fa && !hasSecret) return null;
   return {
@@ -1495,21 +1521,42 @@ function shouldForceReset2faWhenAlreadyEnabled() {
 }
 
 // 老账号：登录已注册账号 → 设密码 + 开 2FA → 取 token。复用 loginChatGPT + step8。
-export async function secureExistingChatGPT({ page, email, loginPassword = '', enable2fa = true, forceReset2fa = false, existingTotpSecret = '', chatgptUrl = 'https://chatgpt.com/', requestCode, log, recorder = NOOP_RECORDER }) {
-  const newPassword = generatePassword();
-  log(`已有账号 · 生成新密码：${newPassword}`);
+export async function secureExistingChatGPT({ page, email, loginPassword = '', enable2fa = true, autoSetPassword = true, forceReset2fa = false, existingTotpSecret = '', chatgptUrl = 'https://chatgpt.com/', requestCode, log, recorder = NOOP_RECORDER }) {
+  const newPassword = autoSetPassword ? generatePassword() : '';
+  if (autoSetPassword) log(`已有账号 · 生成新密码：${newPassword}`);
   if (loginPassword) log(`已有账号 · 使用历史密码登录：${loginPassword}`);
 
   log('已有账号 · 开始登录');
   const login = await loginChatGPT({ page, email, password: loginPassword, totpSecret: existingTotpSecret, chatgptUrl, requestCode, log, recorder });
 
-  log(`已有账号 · ${enable2fa ? '设置/重设双重验证，并设置密码' : '跳过双重验证，仅设置密码'}`);
+  if (!autoSetPassword && !enable2fa) {
+    log('已有账号 · 已关闭自动设密码与双重验证，跳过 step8');
+    return {
+      email,
+      password: login.resetPassword || '',
+      passwordSet: Boolean(login.resetPassword),
+      twoFactorSecret: '',
+      twoFactorUri: '',
+      recoveryCodes: [],
+      twoFactorSet: false,
+      accessToken: login.accessToken,
+      user: login.user,
+      expires: login.expires,
+      mode: 'existing',
+    };
+  }
+
+  const step8Label = autoSetPassword
+    ? (enable2fa ? '设置/重设双重验证，并设置密码' : '跳过双重验证，仅设置密码')
+    : (enable2fa ? '跳过设密码，仅开启双重验证' : '跳过双重验证与设密码');
+  log(`已有账号 · ${step8Label}`);
   let secure;
   try {
     secure = await step8_setupPasswordAnd2FA(page, {
       email,
       password: newPassword,
       enable2fa,
+      autoSetPassword,
       forceReset2fa,
       existingTotpSecret,
       requestCode,
@@ -1522,6 +1569,7 @@ export async function secureExistingChatGPT({ page, email, loginPassword = '', e
     const require2fa = Boolean(enable2fa);
     const tolerated = resolveStep8Tolerance(partial, passwordOk, {
       require2fa,
+      requirePassword: autoSetPassword,
       existingTotpSecret: '',
     });
     if (tolerated) {
@@ -1531,8 +1579,8 @@ export async function secureExistingChatGPT({ page, email, loginPassword = '', e
       e._partial = {
         email,
         // 最终密码：忘记密码重设 > step8 真正新设 > 用于登录的原密码（passwordChanged 才是"确实改了"）
-        password: login.resetPassword || (partial.passwordChanged ? newPassword : (loginPassword || '')),
-        passwordSet: Boolean(login.resetPassword) || partial.passwordSet || false,
+        password: login.resetPassword || (autoSetPassword && partial.passwordChanged ? newPassword : (loginPassword || '')),
+        passwordSet: Boolean(login.resetPassword) || (autoSetPassword && partial.passwordSet) || false,
         // 2FA：老账号加固只落库 step8 新开的 secret，不回退旧密钥
         twoFactorSecret: partial.twoFactorSecret || '',
         twoFactorUri: partial.twoFactorUri || '',
@@ -1547,11 +1595,12 @@ export async function secureExistingChatGPT({ page, email, loginPassword = '', e
     }
   }
 
+  const finalPassword = login.resetPassword
+    || (autoSetPassword && secure.passwordChanged ? newPassword : (autoSetPassword ? (loginPassword || '') : ''));
   return {
     email,
-    // 最终密码：忘记密码重设 > step8 真正新设 > 用于登录的原密码（passwordChanged 才是"确实改了"）
-    password: login.resetPassword || (secure.passwordChanged ? newPassword : (loginPassword || '')),
-    passwordSet: Boolean(login.resetPassword) || secure.passwordSet,
+    password: finalPassword,
+    passwordSet: Boolean(login.resetPassword) || (autoSetPassword && secure.passwordSet),
     // 2FA：老账号加固只落库 step8 新开的 secret
     twoFactorSecret: secure.twoFactorSecret || '',
     twoFactorUri: secure.twoFactorUri,
@@ -1566,9 +1615,9 @@ export async function secureExistingChatGPT({ page, email, loginPassword = '', e
 
 // 新注册：register → password → code → profile → success → token → step8。
 // 若检测到「邮箱已注册」，返回 { emailExists:true } 让 worker 分流到 secureExistingChatGPT。
-export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatgpt.com/', enable2fa = true, requestCode, log, recorder = NOOP_RECORDER }) {
-  const password = generatePassword();
-  log(`已生成注册密码：${password}`);
+export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatgpt.com/', enable2fa = true, autoSetPassword = true, requestCode, log, recorder = NOOP_RECORDER }) {
+  const password = autoSetPassword ? generatePassword() : '';
+  if (autoSetPassword) log(`已生成注册密码：${password}`);
   const { firstName, lastName } = generateRandomName();
   const birthday = generateRandomBirthday();
   const mark = (id, meta) => recorder.record(id, typeof meta === 'string' ? { note: meta } : meta).catch(() => {});
@@ -1676,8 +1725,8 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
     }
   }
 
-  // 步骤3：密码（仅当跳转到密码页时才填；很多流程 email 后直接发码、无密码页）
-  if (landing === 'password') {
+  // 步骤3：密码（仅当跳转到密码页且开启自动设密码时才填；很多流程 email 后直接发码、无密码页）
+  if (landing === 'password' && autoSetPassword) {
     log(`注册 · 填写注册密码：${password}`);
     const pwdInput = await firstVisible(page, S.PASSWORD_INPUT, { timeout: 15000 });
     if (pwdInput) {
@@ -1686,6 +1735,8 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
       log('注册 · 密码已提交，等待验证码页');
       await waitForCodePage(page, log, { timeoutMs: 120000 });
     }
+  } else if (landing === 'password') {
+    log('注册 · 已关闭自动设密码，跳过注册密码页');
   } else {
     log('注册 · 跳过密码步骤，直接进入验证码页');
   }
@@ -1699,8 +1750,9 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
   }
   log('注册 · 开始填写邮箱验证码');
   // 经密码页时，邮箱提交后可能已发过一封验证码；密码提交后 OpenAI 会换码，须重发并忽略信箱里旧邮件。
-  const needCodeOptions = landing === 'password' ? { use_mailbox_baseline: true } : {};
-  if (landing === 'password') {
+  const usedPasswordPage = landing === 'password' && autoSetPassword;
+  const needCodeOptions = usedPasswordPage ? { use_mailbox_baseline: true } : {};
+  if (usedPasswordPage) {
     log('注册 · 路径经密码页，先重新发送验证码以免误用密码页之前的旧码');
     await clickResendVerificationCode(page, log);
     await sleep(3000);
@@ -1813,24 +1865,50 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
   log('注册 · 已获取登录凭证');
   await mark('register-06-token', '已取到 accessToken，准备 step8');
 
-  // 步骤8：设置密码（必须成功）+ 开启 TOTP 2FA（可选加固，失败可容忍、不影响账号入池）
-  log(enable2fa ? '注册 · 设置账号密码并开启双重验证' : '注册 · 设置账号密码');
+  // 步骤8：设置密码（可选）+ 开启 TOTP 2FA（可选加固，失败可容忍、不影响账号入池）
+  if (!autoSetPassword && !enable2fa) {
+    log('注册 · 已关闭自动设密码与双重验证，跳过 step8');
+    return {
+      email,
+      password: '',
+      passwordSet: false,
+      twoFactorSecret: '',
+      twoFactorUri: '',
+      recoveryCodes: [],
+      twoFactorSet: false,
+      firstName,
+      lastName,
+      birthday,
+      accessToken: tokenResult.accessToken,
+      user: tokenResult.user,
+      expires: tokenResult.expires,
+      mode: 'register',
+    };
+  }
+
+  const step8Log = autoSetPassword
+    ? (enable2fa ? '注册 · 设置账号密码并开启双重验证' : '注册 · 设置账号密码')
+    : '注册 · 跳过设密码，仅尝试开启双重验证';
+  log(step8Log);
   let secure;
   try {
-    secure = await step8_setupPasswordAnd2FA(page, { email, password, enable2fa, requestCode, log, recorder });
+    secure = await step8_setupPasswordAnd2FA(page, { email, password, enable2fa, autoSetPassword, requestCode, log, recorder });
   } catch (e) {
     const partial = e._secure || {};
     // 2FA 为可选加固：只要密码已设成功，就按「无 2FA 账号」正常返回（照常入号池、标记注册成功），
     // 只有连密码都没设成才算 step8 失败，走异常清单分流。
-    const tolerated = resolveStep8Tolerance(partial, Boolean(partial.passwordSet), { require2fa: enable2fa });
+    const tolerated = resolveStep8Tolerance(partial, Boolean(partial.passwordSet), {
+      require2fa: enable2fa,
+      requirePassword: autoSetPassword,
+    });
     if (tolerated) {
       log(`注册 · 双重验证未完成，密码已设置，按普通账号保存：${e.message}`, 'yellow');
       secure = tolerated;
     } else {
       e._partial = {
         email,
-        password: partial.passwordSet ? password : '',
-        passwordSet: partial.passwordSet || false,
+        password: autoSetPassword && partial.passwordSet ? password : '',
+        passwordSet: autoSetPassword && partial.passwordSet || false,
         twoFactorSecret: partial.twoFactorSecret || '',
         twoFactorUri: partial.twoFactorUri || '',
         recoveryCodes: partial.recoveryCodes || [],
@@ -1847,8 +1925,8 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
 
   return {
     email,
-    password: secure.passwordSet ? password : '',
-    passwordSet: secure.passwordSet,
+    password: autoSetPassword && secure.passwordSet ? password : '',
+    passwordSet: autoSetPassword && secure.passwordSet,
     twoFactorSecret: secure.twoFactorSecret,
     twoFactorUri: secure.twoFactorUri,
     recoveryCodes: secure.recoveryCodes,
@@ -2206,6 +2284,8 @@ export const __test = {
   fillBirthday,
   classifyRetryableNetworkError,
   clickRetryIfError,
+  isPromoCampaignUrl,
+  skipPromoCampaignLanding,
 };
 
 async function checkConsentIfAny(page, log) {
@@ -2649,7 +2729,7 @@ async function hasExistingPassword(page) {
   }).catch(() => false);
 }
 
-async function step8_setupPasswordAnd2FA(page, { email, password, enable2fa = true, forceReset2fa = false, existingTotpSecret = '', requestCode, log, recorder = NOOP_RECORDER }) {
+async function step8_setupPasswordAnd2FA(page, { email, password, enable2fa = true, autoSetPassword = true, forceReset2fa = false, existingTotpSecret = '', requestCode, log, recorder = NOOP_RECORDER }) {
   const mark = (id, meta) => recorder.record(id, typeof meta === 'string' ? { note: meta } : meta).catch(() => {});
   // passwordChanged=true 仅当本次「确实设置/更改了密码」；检测到已存在而跳过时保持 false，
   // 供 secureExistingChatGPT 判断该存"新密码"还是"沿用登录用的原密码"。
@@ -2657,6 +2737,7 @@ async function step8_setupPasswordAnd2FA(page, { email, password, enable2fa = tr
   try {
     if (!/chatgpt\.com/.test(page.url())) {
       await page.goto('https://chatgpt.com/', { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+      await skipPromoCampaignLanding(page, log).catch(() => {});
       await sleep(3000);
     }
     await dumpUi(page, '00-loggedin', log);
@@ -2669,6 +2750,7 @@ async function step8_setupPasswordAnd2FA(page, { email, password, enable2fa = tr
     await mark('step8-01-security', '已进入安全tab');
 
     // —— 设密码 ——（幂等：已设过则跳过。老号登录后密码常已存在，用鲁棒检测识别，命中即不走添加流程）
+    if (autoSetPassword) {
     const pwAlready = await hasExistingPassword(page);
     if (pwAlready) {
       log('安全设置 · 账号已有密码，跳过设置');
@@ -2741,6 +2823,9 @@ async function step8_setupPasswordAnd2FA(page, { email, password, enable2fa = tr
         }
       }
     }
+    } else {
+      log('安全设置 · 已关闭自动设密码，跳过设置密码');
+    }
 
     // 2FA 关闭：只设密码即可返回
     if (!enable2fa) {
@@ -2768,6 +2853,7 @@ async function step8_setupPasswordAnd2FA(page, { email, password, enable2fa = tr
       log('安全设置 · 重新打开设置，准备开启双重验证');
       if (!/chatgpt\.com/.test(page.url())) {
         await page.goto('https://chatgpt.com/', { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+        await skipPromoCampaignLanding(page, log).catch(() => {});
         await sleep(2500);
       }
       await dismissWelcomeOverlays(page, log);

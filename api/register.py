@@ -37,6 +37,7 @@ class RegisterConfigRequest(BaseModel):
     total: int | None = None
     threads: int | None = None
     enable_2fa: bool | None = None
+    auto_set_password: bool | None = None
     regions: list[str] | None = None
     ipweb_rotate: bool | None = None
     ip_duration: int | None = None

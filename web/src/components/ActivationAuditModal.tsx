@@ -1,5 +1,7 @@
-import { useEffect, useState } from "react";
-import { Modal, Spin, Typography, Tag, Empty, Collapse } from "@douyinfe/semi-ui-19";
+import { useEffect, useMemo, useState } from "react";
+import { Modal, Spin, Typography, Tag, Empty } from "@douyinfe/semi-ui-19";
+import { IconChevronDown, IconChevronUp, IconGlobe, IconTerminal, IconVerify } from "@douyinfe/semi-icons";
+import clsx from "clsx";
 
 import {
   fetchActivationAuditDetail,
@@ -17,9 +19,24 @@ const OUTCOME_LABEL: Record<string, { text: string; color: string }> = {
   running: { text: "进行中", color: "blue" },
 };
 
+const EVENT_KIND_META = {
+  log: { label: "日志", icon: IconTerminal, className: "activation-audit-event--log" },
+  http: { label: "HTTP", icon: IconGlobe, className: "activation-audit-event--http" },
+  plan_verify: { label: "核实", icon: IconVerify, className: "activation-audit-event--verify" },
+} as const;
+
 function fmtTime(iso: string): string {
   try {
     return new Date(iso).toLocaleString();
+  } catch {
+    return iso;
+  }
+}
+
+function fmtTimeShort(iso: string): string {
+  try {
+    const d = new Date(iso);
+    return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
   } catch {
     return iso;
   }
@@ -31,139 +48,251 @@ function maskSecret(s: string): string {
   return `${v.slice(0, 4)}…${v.slice(-4)}`;
 }
 
-function JsonBlock({ value }: { value: unknown }) {
+function JsonBlock({ value, compact = false }: { value: unknown; compact?: boolean }) {
   if (value == null) return <Text type="tertiary">—</Text>;
   let text = "";
   try {
     text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+    if (typeof value === "string") {
+      try {
+        text = JSON.stringify(JSON.parse(value), null, 2);
+      } catch {
+        /* keep raw string */
+      }
+    }
   } catch {
     text = String(value);
   }
   return (
     <pre
-      style={{
-        margin: 0,
-        padding: 10,
-        borderRadius: 6,
-        background: "var(--semi-color-fill-0)",
-        fontSize: 11,
-        lineHeight: "18px",
-        overflow: "auto",
-        maxHeight: 360,
-        whiteSpace: "pre-wrap",
-        wordBreak: "break-all",
-      }}
+      className={clsx("activation-audit-json", compact && "activation-audit-json--compact")}
     >
       {text}
     </pre>
   );
 }
 
+function parseLogText(text: string): { title: string; payload?: unknown } {
+  const raw = String(text || "").trim();
+  const respMatch = raw.match(/^(.+?原始响应:)\s*([\s\S]+)$/);
+  if (respMatch) {
+    const payloadRaw = respMatch[2].trim();
+    try {
+      return { title: respMatch[1].trim(), payload: JSON.parse(payloadRaw) };
+    } catch {
+      return { title: respMatch[1].trim(), payload: payloadRaw };
+    }
+  }
+  return { title: raw };
+}
+
 function phaseLabel(phase: string): string {
   const raw = String(phase || "http");
   if (raw === "cdk_submit") return "提交激活";
   if (raw.startsWith("cdk_status")) return "查询激活";
+  if (raw.startsWith("cdk_retry")) return "重试激活";
   if (raw.startsWith("openai_")) return `OpenAI ${raw.slice("openai_".length)}`;
   return raw;
 }
 
-function httpEventTitle(event: ActivationAuditEvent): string {
-  const parts = [
-    phaseLabel(String(event.phase || "http")),
-    event.method,
-    event.path,
-    event.http_status != null ? `HTTP ${event.http_status}` : null,
-    event.attempt != null ? `第 ${event.attempt} 次` : null,
-    event.retrying ? "将重试" : null,
-  ].filter(Boolean);
-  return parts.join(" · ");
+function httpStatusColor(status: number | null | undefined): string {
+  if (status == null) return "grey";
+  if (status >= 200 && status < 300) return "green";
+  if (status >= 400) return "red";
+  return "orange";
 }
 
-function httpEventColor(event: ActivationAuditEvent): string {
-  if (event.retrying) return "orange";
-  if (event.error) return "red";
-  const status = event.http_status;
-  if (status != null && status >= 200 && status < 300) return "green";
-  if (status != null && status >= 400) return "red";
-  return "blue";
+function logLevelClass(level?: string): string {
+  const lv = String(level || "info").toLowerCase();
+  if (lv === "red" || lv === "error" || lv === "danger") return "activation-audit-log--danger";
+  if (lv === "yellow" || lv === "warn" || lv === "warning") return "activation-audit-log--warn";
+  if (lv === "green" || lv === "success") return "activation-audit-log--success";
+  return "";
 }
 
-function HttpEventRow({ event, index }: { event: ActivationAuditEvent; index: number }) {
+function LogEventRow({ event }: { event: ActivationAuditEvent }) {
+  const parsed = parseLogText(event.text || "");
+  const emailPrefix = parsed.title.match(/^\[([^\]]+)\]\s*(.*)$/);
+  const headline = emailPrefix ? emailPrefix[2] || emailPrefix[1] : parsed.title;
+  const emailTag = emailPrefix?.[1];
+
   return (
-    <Collapse style={{ marginBottom: 8 }} defaultActiveKey={[]}>
-      <Collapse.Panel
-        header={
-          <span style={{ display: "inline-flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-            <Text size="small" type="tertiary">{fmtTime(event.time)}</Text>
-            <Tag size="small" color={httpEventColor(event) as never}>{httpEventTitle(event)}</Tag>
-          </span>
-        }
-        itemKey={`http-${index}`}
-      >
-        <Text type="tertiary" size="small" style={{ display: "block", marginBottom: 4 }}>请求参数</Text>
-        <JsonBlock value={event.request} />
-        <Text type="tertiary" size="small" style={{ display: "block", margin: "10px 0 4px" }}>响应参数</Text>
-        <JsonBlock value={event.response} />
-        {event.error ? (
-          <Text type="danger" size="small" style={{ display: "block", marginTop: 8 }}>{event.error}</Text>
-        ) : null}
-      </Collapse.Panel>
-    </Collapse>
+    <div className={clsx("activation-audit-event-body-inner", logLevelClass(event.level))}>
+      <div className="activation-audit-log-text">
+        {emailTag ? <Tag size="small" color="grey" style={{ marginRight: 6 }}>{emailTag}</Tag> : null}
+        <Text size="small">{headline}</Text>
+      </div>
+      {parsed.payload != null ? (
+        <div className="activation-audit-log-payload">
+          <Text type="tertiary" size="small">原始响应</Text>
+          <JsonBlock value={parsed.payload} compact />
+        </div>
+      ) : null}
+    </div>
   );
 }
 
-function EventRow({ event, index }: { event: ActivationAuditEvent; index: number }) {
-  if (event.kind === "log") {
-    return (
-      <div style={{ marginBottom: 10 }}>
-        <Text type="tertiary" size="small">{fmtTime(event.time)} </Text>
-        <Text size="small">{event.text}</Text>
+function HttpEventRow({ event }: { event: ActivationAuditEvent }) {
+  const [open, setOpen] = useState(false);
+  const statusColor = event.error ? "red" : httpStatusColor(event.http_status);
+  const borderColor = event.retrying ? "orange" : statusColor;
+
+  return (
+    <div className="activation-audit-event-body-inner">
+      <button
+        type="button"
+        className="activation-audit-http-head"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+      >
+        <div className="activation-audit-http-head-main">
+          <Tag size="small" color={event.method === "POST" ? "blue" : "cyan"}>{event.method || "HTTP"}</Tag>
+          <Text size="small" strong className="activation-audit-http-phase">{phaseLabel(String(event.phase || "http"))}</Text>
+          <Text size="small" code className="activation-audit-http-path">{event.path || event.url || "—"}</Text>
+          {event.http_status != null ? (
+            <Tag size="small" color={statusColor as never}>HTTP {event.http_status}</Tag>
+          ) : null}
+          {event.attempt != null ? <Tag size="small" color="grey">第 {event.attempt} 次</Tag> : null}
+          {event.retrying ? <Tag size="small" color="orange">将重试</Tag> : null}
+        </div>
+        <span className="activation-audit-http-toggle" aria-hidden>
+          {open ? <IconChevronUp size="small" /> : <IconChevronDown size="small" />}
+        </span>
+      </button>
+      {event.error ? (
+        <Text type="danger" size="small" className="activation-audit-http-error">{event.error}</Text>
+      ) : null}
+      {open ? (
+        <div className="activation-audit-http-detail" style={{ borderLeftColor: `var(--semi-color-${borderColor === "grey" ? "text-2" : borderColor})` }}>
+          <div className="activation-audit-http-section">
+            <Text type="tertiary" size="small">请求</Text>
+            <JsonBlock value={event.request} />
+          </div>
+          <div className="activation-audit-http-section">
+            <Text type="tertiary" size="small">响应</Text>
+            <JsonBlock value={event.response} />
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function PlanVerifyEventRow({ event }: { event: ActivationAuditEvent }) {
+  return (
+    <div className="activation-audit-event-body-inner">
+      <Text size="small" strong>{event.phase || "套餐核实"}</Text>
+      {event.tier ? <Text size="small" style={{ display: "block", marginTop: 4 }}>档位：{event.tier}</Text> : null}
+      {event.error ? <Text type="danger" size="small" style={{ display: "block", marginTop: 4 }}>{event.error}</Text> : null}
+    </div>
+  );
+}
+
+function EventRow({ event }: { event: ActivationAuditEvent }) {
+  const meta = EVENT_KIND_META[event.kind] ?? EVENT_KIND_META.log;
+  const Icon = meta.icon;
+
+  return (
+    <div className={clsx("activation-audit-event", meta.className)}>
+      <div className="activation-audit-event-rail">
+        <span className="activation-audit-event-dot">
+          <Icon size="small" />
+        </span>
       </div>
-    );
-  }
-  if (event.kind === "plan_verify") {
-    return (
-      <Collapse style={{ marginBottom: 8 }} defaultActiveKey={[]}>
-        <Collapse.Panel
-          header={
-            <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
-              <Text size="small" type="tertiary">{fmtTime(event.time)}</Text>
-              <Tag size="small" color="purple">套餐核实 · {event.phase}</Tag>
-            </span>
-          }
-          itemKey={`verify-${index}`}
-        >
-          {event.tier ? <Text size="small" style={{ display: "block" }}>档位：{event.tier}</Text> : null}
-          {event.error ? <Text type="danger" size="small" style={{ display: "block" }}>{event.error}</Text> : null}
-        </Collapse.Panel>
-      </Collapse>
-    );
-  }
-  return <HttpEventRow event={event} index={index} />;
+      <div className="activation-audit-event-card">
+        <div className="activation-audit-event-head">
+          <Tag size="small" color={event.kind === "http" ? "blue" : event.kind === "plan_verify" ? "purple" : "grey"}>
+            {meta.label}
+          </Tag>
+          <Text type="tertiary" size="small" title={fmtTime(event.time)}>
+            {fmtTimeShort(event.time)}
+          </Text>
+        </div>
+        {event.kind === "log" ? <LogEventRow event={event} /> : null}
+        {event.kind === "http" ? <HttpEventRow event={event} /> : null}
+        {event.kind === "plan_verify" ? <PlanVerifyEventRow event={event} /> : null}
+      </div>
+    </div>
+  );
+}
+
+function EventLegend({ events }: { events: ActivationAuditEvent[] }) {
+  const counts = useMemo(() => {
+    const log = events.filter((e) => e.kind === "log").length;
+    const http = events.filter((e) => e.kind === "http").length;
+    const verify = events.filter((e) => e.kind === "plan_verify").length;
+    return { log, http, verify, total: events.length };
+  }, [events]);
+
+  return (
+    <div className="activation-audit-legend">
+      <span className="activation-audit-legend-item">
+        <Tag size="small" color="grey">日志</Tag>
+        <Text size="small" type="tertiary">{counts.log}</Text>
+      </span>
+      <span className="activation-audit-legend-item">
+        <Tag size="small" color="blue">HTTP</Tag>
+        <Text size="small" type="tertiary">{counts.http}</Text>
+      </span>
+      <span className="activation-audit-legend-item">
+        <Tag size="small" color="purple">核实</Tag>
+        <Text size="small" type="tertiary">{counts.verify}</Text>
+      </span>
+      <Text size="small" type="tertiary">共 {counts.total} 条</Text>
+    </div>
+  );
 }
 
 export function ActivationAuditDetail({ record }: { record: ActivationAuditRecord }) {
   const outcome = OUTCOME_LABEL[record.outcome] ?? { text: record.outcome, color: "grey" };
-  const httpCount = (record.events ?? []).filter((e) => e.kind === "http").length;
+  const events = record.events ?? [];
+
   return (
-    <div>
-      <div style={{ display: "grid", gap: 6, marginBottom: 12 }}>
-        <Text><Text type="tertiary">邮箱：</Text>{record.email || "—"}</Text>
-        <Text><Text type="tertiary">结果：</Text><Tag color={outcome.color as never}>{outcome.text}</Tag></Text>
-        <Text><Text type="tertiary">摘要：</Text>{record.summary || "—"}</Text>
-        <Text><Text type="tertiary">CDK：</Text>{record.cdk ? maskSecret(record.cdk) : "—"} {record.cdk_type ? `(${record.cdk_type})` : ""}</Text>
-        <Text><Text type="tertiary">CDK 已消耗：</Text>{record.cdk_consumed ? "是" : "否"}</Text>
-        <Text type="tertiary" size="small">开始 {fmtTime(record.started_at)}{record.finished_at ? ` · 结束 ${fmtTime(record.finished_at)}` : ""}</Text>
+    <div className="activation-audit-detail">
+      <div className="activation-audit-summary">
+        <div className="activation-audit-summary-row">
+          <Text type="tertiary" size="small">邮箱</Text>
+          <Text size="small">{record.email || "—"}</Text>
+        </div>
+        <div className="activation-audit-summary-row">
+          <Text type="tertiary" size="small">结果</Text>
+          <Tag color={outcome.color as never}>{outcome.text}</Tag>
+        </div>
+        <div className="activation-audit-summary-row activation-audit-summary-row--full">
+          <Text type="tertiary" size="small">摘要</Text>
+          <Text size="small">{record.summary || "—"}</Text>
+        </div>
+        <div className="activation-audit-summary-row">
+          <Text type="tertiary" size="small">CDK</Text>
+          <Text size="small">
+            {record.cdk ? maskSecret(record.cdk) : "—"}
+            {record.cdk_type ? ` (${record.cdk_type})` : ""}
+          </Text>
+        </div>
+        <div className="activation-audit-summary-row">
+          <Text type="tertiary" size="small">CDK 已消耗</Text>
+          <Text size="small">{record.cdk_consumed ? "是" : "否"}</Text>
+        </div>
+        <div className="activation-audit-summary-row activation-audit-summary-row--full">
+          <Text type="tertiary" size="small">时间</Text>
+          <Text type="tertiary" size="small">
+            {fmtTime(record.started_at)}
+            {record.finished_at ? ` → ${fmtTime(record.finished_at)}` : ""}
+          </Text>
+        </div>
       </div>
-      <Text strong style={{ display: "block", marginBottom: 4 }}>
-        完整链路（{record.events?.length ?? 0} 条，含 {httpCount} 次 HTTP 请求）
+
+      <div className="activation-audit-chain-header">
+        <Text strong>完整链路</Text>
+        <EventLegend events={events} />
+      </div>
+      <Text type="tertiary" size="small" className="activation-audit-chain-hint">
+        日志为运行过程输出；HTTP 为实际请求/响应（点击展开详情）。原始响应类日志已自动格式化 JSON。
       </Text>
-      <Text type="tertiary" size="small" style={{ display: "block", marginBottom: 8 }}>
-        持久化于独立激活审计表；含 CDK 兑换、OpenAI 套餐核实（/me、accounts/check 等）及浏览器续期登录的完整请求/响应。
-      </Text>
-      <div style={{ maxHeight: 520, overflow: "auto" }}>
-        {record.events?.length ? (
-          record.events.map((event, i) => <EventRow key={i} event={event} index={i} />)
+
+      <div className="activation-audit-timeline">
+        {events.length ? (
+          events.map((event, i) => <EventRow key={i} event={event} />)
         ) : (
           <Empty description="无事件" />
         )}
@@ -205,8 +334,9 @@ export default function ActivationAuditModal({ visible, auditId, accessToken, em
       visible={visible}
       onCancel={onClose}
       footer={null}
-      width={860}
+      width={920}
       style={{ maxWidth: "96vw" }}
+      bodyStyle={{ paddingTop: 12 }}
     >
       {loading ? (
         <div style={{ textAlign: "center", padding: 32 }}><Spin /></div>

@@ -698,14 +698,17 @@ class AccountService:
         self.update_account(new_token, updates, quiet=True)
         return new_token
 
-    def rotate_access_token(self, access_token: str, *, event: str = "rotate_access_token") -> tuple[str, bool]:
-        """强制刷新 access_token（与 fetch_remote_info 解耦，无条件走浏览器换 JWT）。"""
+    def rotate_access_token(self, access_token: str, *, event: str = "rotate_access_token") -> tuple[str, bool, bool]:
+        """强制刷新 access_token（与 fetch_remote_info 解耦，无条件走浏览器换 JWT）。
+
+        返回 (token, ok, changed)：changed 表示 access_token 字符串是否相对刷新前发生变化。
+        """
         if not access_token:
-            return "", False
+            return "", False, False
         with self._token_refresh_lock:
             resolved_token, account = self._get_account_for_token(access_token)
             if not account:
-                return access_token, False
+                return access_token, False, False
             active_token = str(account.get("access_token") or resolved_token or access_token)
 
         from services.register import openai_account_ops
@@ -713,12 +716,12 @@ class AccountService:
         result = openai_account_ops.run_token_refresh(account)
         if not result.get("ok"):
             self._record_token_rotate_error(active_token, event, str(result.get("error") or ""))
-            return active_token, False
+            return active_token, False, False
 
         new_token = str(result.get("access_token") or "").strip()
         if not new_token:
             self._record_token_rotate_error(active_token, event, "浏览器未返回 access_token")
-            return active_token, False
+            return active_token, False, False
 
         token_data = {"access_token": new_token}
         applied = self._apply_refreshed_tokens(active_token, token_data, event)
@@ -741,7 +744,8 @@ class AccountService:
             updates["password"] = reset_pwd
         self.update_account(applied, updates, quiet=True)
 
-        if applied == active_token:
+        changed = applied != active_token
+        if not changed:
             log_service.add(
                 LOG_TYPE_ACCOUNT,
                 "刷新 Token 完成（JWT 未变化，已更新 browser_session）",
@@ -761,7 +765,7 @@ class AccountService:
                     "via_session": bool(result.get("via_session")),
                 },
             )
-        return applied, True
+        return applied, True, changed
 
     def _record_token_rotate_error(self, access_token: str, event: str, error: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
@@ -1088,6 +1092,22 @@ class AccountService:
             return None
         _, account = self._get_account_for_token(access_token)
         return account
+
+    def get_account_detail(self, *, access_token: str = "", email: str = "") -> dict | None:
+        """详情查询：返回完整账号（含 browser_session），供管理端「详情」查看。"""
+        account = None
+        token = str(access_token or "").strip()
+        if token:
+            account = self.get_account(token)
+        if account is None:
+            account = self.find_by_email(email)
+        if account is None:
+            return None
+        item = enrich_account(dict(account))
+        tok = str(item.get("access_token") or "").strip()
+        with self._lock:
+            item["image_inflight"] = int(self._image_inflight.get(tok, 0))
+        return item
 
     @staticmethod
     def _strip_sensitive_for_list(account: dict) -> dict:
@@ -1956,21 +1976,32 @@ class AccountService:
                 "processed": 0,
                 "done": False,
                 "error": None,
-                "status_counts": {"成功": 0, "失败": 0, "跳过": 0},
+                "status_counts": {"已变化": 0, "未变化": 0, "失败": 0, "跳过": 0},
             }
 
-    def update_token_rotate_progress(self, progress_id: str, token: str, *, ok: bool, skipped: bool = False) -> None:
+    def update_token_rotate_progress(
+        self,
+        progress_id: str,
+        token: str,
+        *,
+        ok: bool,
+        skipped: bool = False,
+        changed: bool = False,
+    ) -> None:
         with self._token_rotate_progress_lock:
             progress = self._token_rotate_progress.get(progress_id)
             if progress is None:
                 return
             progress["processed"] += 1
+            counts = progress["status_counts"]
             if skipped:
-                progress["status_counts"]["跳过"] = progress["status_counts"].get("跳过", 0) + 1
+                counts["跳过"] = counts.get("跳过", 0) + 1
+            elif ok and changed:
+                counts["已变化"] = counts.get("已变化", 0) + 1
             elif ok:
-                progress["status_counts"]["成功"] = progress["status_counts"].get("成功", 0) + 1
+                counts["未变化"] = counts.get("未变化", 0) + 1
             else:
-                progress["status_counts"]["失败"] = progress["status_counts"].get("失败", 0) + 1
+                counts["失败"] = counts.get("失败", 0) + 1
 
     def finish_token_rotate_progress(self, progress_id: str, result: dict | None = None, error: str | None = None) -> None:
         with self._token_rotate_progress_lock:
@@ -2011,20 +2042,20 @@ class AccountService:
         if progress_id:
             self.init_token_rotate_progress(progress_id, len(access_tokens))
 
-        def _rotate_one(token: str) -> tuple[bool, bool, str | None]:
+        def _rotate_one(token: str) -> tuple[bool, bool, bool, str | None]:
             account = self.get_account(token)
             if not account:
-                return False, True, "账号不存在"
+                return False, True, False, "账号不存在"
             email = str(account.get("email") or "").strip()
             password = str(account.get("password") or "").strip()
             if not email or not password:
-                return False, True, "无邮箱密码"
-            _, ok = self.rotate_access_token(token, event="refresh_account_tokens")
+                return False, True, False, "无邮箱密码"
+            _, ok, changed = self.rotate_access_token(token, event="refresh_account_tokens")
             if not ok:
                 acct = self.get_account(token) or {}
                 err = str(acct.get("last_token_rotate_error") or "刷新失败")
-                return False, False, err
-            return True, False, None
+                return False, False, False, err
+            return True, False, changed, None
 
         executor = ThreadPoolExecutor(max_workers=max_workers)
         try:
@@ -2032,12 +2063,12 @@ class AccountService:
             for future in as_completed(futures):
                 token = futures[future]
                 try:
-                    ok, skipped, err = future.result()
+                    ok, skipped, changed, err = future.result()
                 except (KeyboardInterrupt, SystemExit):
                     executor.shutdown(wait=False, cancel_futures=True)
                     raise
                 except Exception as exc:
-                    ok, skipped, err = False, False, str(exc)
+                    ok, skipped, changed, err = False, False, False, str(exc)
                 if skipped:
                     if err:
                         errors.append({"token": anonymize_token(token), "error": err})
@@ -2046,7 +2077,13 @@ class AccountService:
                 else:
                     errors.append({"token": anonymize_token(token), "error": err or "刷新失败"})
                 if progress_id:
-                    self.update_token_rotate_progress(progress_id, token, ok=ok and not skipped, skipped=skipped)
+                    self.update_token_rotate_progress(
+                        progress_id,
+                        token,
+                        ok=ok and not skipped,
+                        skipped=skipped,
+                        changed=changed,
+                    )
         except (KeyboardInterrupt, SystemExit):
             if progress_id:
                 self.finish_token_rotate_progress(progress_id, error="cancelled")

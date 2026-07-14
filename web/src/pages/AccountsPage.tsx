@@ -6,6 +6,7 @@ import {
   Tag,
   Toast,
   Modal,
+  SideSheet,
   Select,
   Input,
   Spin,
@@ -29,6 +30,7 @@ import {
   IconKey,
   IconCopy,
   IconSearch,
+  IconInfoCircle,
 } from "@douyinfe/semi-icons";
 import type { ColumnProps } from "@douyinfe/semi-ui-19/lib/es/table";
 
@@ -38,11 +40,13 @@ import {
   fetchRefreshProgress,
   refreshAccountTokens,
   fetchRefreshTokenProgress,
+  fetchAccountDetail,
   deleteAccounts,
   createAccounts,
   exportAccounts,
   markAccountsUsed,
   type Account,
+  type AccountDetail,
   type AccountImportPayload,
   type AccountSummary,
   type AccountListParams,
@@ -174,6 +178,10 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
   const [importDragging, setImportDragging] = useState(false);
   const importFileRef = useRef<HTMLInputElement>(null);
 
+  const [detailOpen, setDetailOpen] = useState(false);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detail, setDetail] = useState<AccountDetail | null>(null);
+
   // 读取本地文件内容填入导入文本框（点击选择 / 拖拽共用）。
   const readImportFile = (file: File | null | undefined) => {
     if (!file) return;
@@ -302,12 +310,20 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
       if (final.error) {
         Toast.error(final.error);
       } else {
-        const ok = final.status_counts?.成功 ?? 0;
+        const changed = final.status_counts?.已变化 ?? final.status_counts?.成功 ?? 0;
+        const unchanged = final.status_counts?.未变化 ?? 0;
         const fail = final.status_counts?.失败 ?? 0;
+        const skip = final.status_counts?.跳过 ?? 0;
+        const parts = [`已变化 ${changed}`, `未变化 ${unchanged}`];
+        if (fail) parts.push(`失败 ${fail}`);
+        if (skip) parts.push(`跳过 ${skip}`);
+        const summaryText = parts.join("，");
         if (fail > 0) {
-          Toast.warning(`Token 刷新完成：成功 ${ok}，失败 ${fail}`);
+          Toast.warning(`Token 刷新完成：${summaryText}`);
+        } else if (changed > 0) {
+          Toast.success(`Token 已刷新：${summaryText}`);
         } else {
-          Toast.success(`Token 已刷新（${ok} 个）`);
+          Toast.info(`Token 刷新完成：${summaryText}`);
         }
       }
       await load(true);
@@ -315,6 +331,24 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
       Toast.error(e instanceof Error ? e.message : "刷新 Token 失败");
     } finally {
       tokens.forEach((t) => setRotateFlag(t, false));
+    }
+  };
+
+  const handleOpenDetail = async (a: Account) => {
+    setDetailOpen(true);
+    setDetail(null);
+    setDetailLoading(true);
+    try {
+      const data = await fetchAccountDetail({
+        access_token: a.access_token || undefined,
+        email: a.email || undefined,
+      });
+      setDetail(data.item);
+    } catch (e) {
+      Toast.error(e instanceof Error ? e.message : "加载账号详情失败");
+      setDetailOpen(false);
+    } finally {
+      setDetailLoading(false);
     }
   };
 
@@ -593,12 +627,19 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
     },
     {
       title: "操作",
-      width: 210,
+      width: 250,
       fixed: "right",
       render: (_: unknown, a: Account) => {
         const key = accountKey(a);
         return (
           <Space spacing={2}>
+            <Button
+              size="small"
+              theme="borderless"
+              icon={<IconInfoCircle />}
+              title="详情"
+              onClick={() => void handleOpenDetail(a)}
+            />
             <Button
               size="small"
               theme="borderless"
@@ -800,6 +841,7 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
           onToggle={toggleOne}
           onRefresh={(t) => void handleRefresh([t])}
           onRotateToken={(t) => void handleRotateToken([t])}
+          onDetail={(a) => void handleOpenDetail(a)}
           onDelete={(t) => void handleDelete([t])}
           page={page}
           pageSize={PAGE_SIZE}
@@ -931,6 +973,107 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
           </Checkbox>
         </div>
       </Modal>
+
+      <SideSheet
+        title={detail?.email ? `账号详情 · ${detail.email}` : "账号详情"}
+        visible={detailOpen}
+        onCancel={() => {
+          setDetailOpen(false);
+          setDetail(null);
+        }}
+        width={isMobile ? "100%" : 560}
+        bodyStyle={{ paddingBottom: 24 }}
+      >
+        {detailLoading ? (
+          <div style={{ padding: 40, textAlign: "center" }}>
+            <Spin />
+          </div>
+        ) : detail ? (
+          <AccountDetailBody detail={detail} />
+        ) : (
+          <Text type="tertiary">暂无数据</Text>
+        )}
+      </SideSheet>
+    </div>
+  );
+}
+
+function DetailField({
+  label,
+  value,
+  mono,
+  copyLabel,
+}: {
+  label: string;
+  value?: string | null;
+  mono?: boolean;
+  copyLabel?: string;
+}) {
+  const text = String(value || "").trim();
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
+        <Text type="tertiary" size="small">
+          {label}
+        </Text>
+        {text && copyLabel ? (
+          <Button size="small" theme="borderless" icon={<IconCopy />} onClick={() => copy(text, copyLabel)} />
+        ) : null}
+      </div>
+      {text ? (
+        <Text
+          style={{
+            fontFamily: mono ? "monospace" : undefined,
+            fontSize: mono ? 12 : 13,
+            wordBreak: "break-all",
+            whiteSpace: "pre-wrap",
+          }}
+        >
+          {text}
+        </Text>
+      ) : (
+        <Text type="tertiary">—</Text>
+      )}
+    </div>
+  );
+}
+
+function AccountDetailBody({ detail }: { detail: AccountDetail }) {
+  const session = detail.browser_session;
+  const cookies = Array.isArray(session?.cookies) ? session!.cookies! : [];
+  const sessionJson = session ? JSON.stringify(session, null, 2) : "";
+  return (
+    <div>
+      <DetailField label="邮箱" value={detail.email} copyLabel="邮箱" />
+      <DetailField label="Access Token" value={detail.access_token} mono copyLabel="Access Token" />
+      <DetailField label="Refresh Token" value={detail.refresh_token} mono copyLabel="Refresh Token" />
+      <DetailField label="ID Token" value={detail.id_token} mono copyLabel="ID Token" />
+      <DetailField label="密码" value={detail.password} copyLabel="密码" />
+      <DetailField label="2FA 密钥" value={detail.totp_secret} mono copyLabel="2FA 密钥" />
+      <DetailField label="代理" value={detail.proxy} mono copyLabel="代理" />
+      <DetailField label="指纹 Seed" value={detail.fingerprint_seed != null ? String(detail.fingerprint_seed) : ""} />
+      <DetailField label="Session 更新时间" value={detail.browser_session_at || ""} />
+      <DetailField label="最近刷新 Token" value={detail.last_token_rotate_at || detail.last_token_refresh_at || ""} />
+      <div style={{ marginBottom: 8 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
+          <Text type="tertiary" size="small">
+            Browser Session（Cookies {cookies.length}）
+          </Text>
+          {sessionJson ? (
+            <Button size="small" theme="borderless" icon={<IconCopy />} onClick={() => copy(sessionJson, "Browser Session")} />
+          ) : null}
+        </div>
+        {sessionJson ? (
+          <TextArea
+            value={sessionJson}
+            readonly
+            autosize={{ minRows: 8, maxRows: 20 }}
+            style={{ fontFamily: "monospace", fontSize: 11 }}
+          />
+        ) : (
+          <Text type="tertiary">无 browser_session（尚未通过登录/刷新写入）</Text>
+        )}
+      </div>
     </div>
   );
 }
@@ -948,6 +1091,7 @@ type AccountMobileListProps = {
   onToggle: (token: string) => void;
   onRefresh: (token: string) => void;
   onRotateToken: (token: string) => void;
+  onDetail: (account: Account) => void;
   onDelete: (token: string) => void;
   page: number;
   pageSize: number;
@@ -966,6 +1110,7 @@ function AccountMobileList({
   onToggle,
   onRefresh,
   onRotateToken,
+  onDetail,
   onDelete,
   page,
   pageSize,
@@ -1041,6 +1186,13 @@ function AccountMobileList({
 
               {/* 操作行 */}
               <div style={{ display: "flex", gap: 4, marginTop: 12, justifyContent: "space-between" }}>
+                <Button
+                  size="small"
+                  theme="borderless"
+                  icon={<IconInfoCircle />}
+                  title="详情"
+                  onClick={() => onDetail(a)}
+                />
                 <Button
                   size="small"
                   theme="borderless"

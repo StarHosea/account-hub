@@ -15,7 +15,8 @@
 | `failed_step` register-04* | manifest register-04 note | fillCode、submitCodeForm | selector 命中、填回值校验 |
 | `failed_step` step8-* | visible_ui、pageState | 安全页 selector、密码/2FA | step8 各子步 record note |
 | register-05* + new_needs_profile + 二次验证码 | isOnCodePage、manifest register-05b | 资料页未提交/二次 OTP 无效 | PROFILE_SUBMIT_TEXTS、assertProfileReady、register-05b record |
-| register-05-profile-submitted + final `Oops`/`Operation timed out` + reason 含 accessToken/HTML | `visible_ui.body_preview`、profile-submitted `submitBusy`/`hasOops`、提交后截图按钮是否仍 spinner | 资料创建请求服务端超时 | `waitForSuccess` 内 `clickRetryIfError`（含 `operation timed out`）；重试后期望进官网首页取 token |
+| register-05-profile-submitted + final `Oops`/`Operation timed out` + reason 含 accessToken/HTML | `visible_ui.body_preview`、profile-submitted `submitBusy`/`hasOops`、提交后截图按钮是否仍 spinner | 资料创建请求服务端超时 | `waitForSuccess` 内 `clickRetryIfError`；重试后若仍 `about-you` 且 name 空 → `needs_profile` 重填提交（最多 3 轮） |
+| final 仍 `about-you` + `How old are you` + name `value=""` + accessToken/HTML | manifest 有 `register-05-profile-resubmit`？inputs 是否空 | 点 Try again 打回空资料页后未重填 | 见上：`needs_profile` 闭环 |
 | `reason` 浏览器引擎未返回结果 + final-error-scene note | engine_error、abnormal_reason | Python EOF 未读 error 事件 | `_drain_worker_events`；brief 优先 manifest note |
 | `logs_tail` 代理/连接错误 | 错误码原文 | 基础设施 | NDJSON 连接错误详情 |
 | 无 failed_step、无存证 | kill_reason | 进程被强杀 | Python 杀进程前写入 |

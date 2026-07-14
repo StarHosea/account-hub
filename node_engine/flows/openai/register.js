@@ -15,7 +15,8 @@ const NOOP_RECORDER = { enabled: false, async record() {}, async finalize() { re
 //   2) 「邮箱已注册」不再 throw，而是 registerChatGPT 返回 { emailExists:true }，
 //      由 worker 分流到 secureExistingChatGPT（OTP 登录 → 设新密码 → 开 2FA → 取 token）。
 //   3) enable2fa=false 时 step8 只设密码、跳过 2FA。
-//   4) autoSetPassword=false 时跳过注册密码页与 step8 设密码（仍可单独开 2FA）。
+//   4) autoSetPassword=false 时跳过 step8 设密码（仍可单独开 2FA）；
+//      但 OpenAI /create-account/password 是注册必经，仍会生成并填写一次密码。
 //   5) 诊断截图默认关闭，仅当设置环境变量 REG_DIAG_DIR 时落盘。
 // ============================================================================
 
@@ -1662,7 +1663,9 @@ export async function secureExistingChatGPT({ page, email, loginPassword = '', e
 // 新注册：register → password → code → profile → success → token → step8。
 // 若检测到「邮箱已注册」，返回 { emailExists:true } 让 worker 分流到 secureExistingChatGPT。
 export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatgpt.com/', enable2fa = true, autoSetPassword = true, requestCode, log, recorder = NOOP_RECORDER }) {
-  const password = autoSetPassword ? generatePassword() : '';
+  let password = autoSetPassword ? generatePassword() : '';
+  // 创建密码页填密成功后置 true（与 autoSetPassword/step8 无关，账号实际已有密码）
+  let passwordSetAtSignup = false;
   if (autoSetPassword) log(`已生成注册密码：${password}`);
   const { firstName, lastName } = generateRandomName();
   const birthday = generateRandomBirthday();
@@ -1671,7 +1674,11 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
   log('注册 · 打开 ChatGPT 官网');
   await openWithRetry(page, chatgptUrl, log, { recorder });
   await waitForHomeReady(page);
-  await mark('register-01-home', '已打开官网');
+  await mark('register-01-home', {
+    note: `已打开官网 autoSetPassword=${Boolean(autoSetPassword)} enable2fa=${Boolean(enable2fa)}`,
+    autoSetPassword: Boolean(autoSetPassword),
+    enable2fa: Boolean(enable2fa),
+  });
 
   log('注册 · 进入注册入口');
   const step2Deadline = Date.now() + 90000;
@@ -1771,18 +1778,30 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
     }
   }
 
-  // 步骤3：密码（仅当跳转到密码页且开启自动设密码时才填；很多流程 email 后直接发码、无密码页）
-  if (landing === 'password' && autoSetPassword) {
-    log(`注册 · 填写注册密码：${password}`);
+  // 步骤3：密码。很多流程 email 后直接发码；若落到 /create-account/password 则必须填密
+  // （注册必经，不可因 autoSetPassword=false 跳过，否则永远到不了验证码页）。
+  if (landing === 'password') {
+    if (!password) password = generatePassword();
+    log(
+      autoSetPassword
+        ? `注册 · 填写注册密码：${password}`
+        : `注册 · 创建密码页必经，已生成并填写密码（autoSetPassword=false，仍写入账号）：${password}`,
+    );
+    await mark('register-02-password-fill', {
+      note: `landing=password autoSetPassword=${Boolean(autoSetPassword)} url=${page.url()}`,
+      autoSetPassword: Boolean(autoSetPassword),
+      landing,
+    });
     const pwdInput = await firstVisible(page, S.PASSWORD_INPUT, { timeout: 15000 });
-    if (pwdInput) {
-      await humanType(pwdInput, password);
-      await humanClickByText(page, S.CONTINUE_TEXTS, { timeout: 12000, exclude: OAUTH_EXCLUDE, awaitPageLoad: true, log });
-      log('注册 · 密码已提交，等待验证码页');
-      await waitForCodePage(page, log, { timeoutMs: 120000 });
+    if (!pwdInput) {
+      await snapshot(page, 'password-input-miss', log);
+      throw new Error('已到创建密码页但未找到密码输入框');
     }
-  } else if (landing === 'password') {
-    log('注册 · 已关闭自动设密码，跳过注册密码页');
+    await humanType(pwdInput, password);
+    await humanClickByText(page, S.CONTINUE_TEXTS, { timeout: 12000, exclude: OAUTH_EXCLUDE, awaitPageLoad: true, log });
+    log('注册 · 密码已提交，等待验证码页');
+    await waitForCodePage(page, log, { timeoutMs: 120000 });
+    passwordSetAtSignup = true;
   } else {
     log('注册 · 跳过密码步骤，直接进入验证码页');
   }
@@ -1796,7 +1815,7 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
   }
   log('注册 · 开始填写邮箱验证码');
   // 经密码页时，邮箱提交后可能已发过一封验证码；密码提交后 OpenAI 会换码，须重发并忽略信箱里旧邮件。
-  const usedPasswordPage = landing === 'password' && autoSetPassword;
+  const usedPasswordPage = passwordSetAtSignup;
   const needCodeOptions = usedPasswordPage ? { use_mailbox_baseline: true } : {};
   if (usedPasswordPage) {
     log('注册 · 路径经密码页，先重新发送验证码以免误用密码页之前的旧码');
@@ -1856,12 +1875,35 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
   log(`注册 · 已提交个人资料（${submitted}）`);
   await sleep(3000);
   const urlAfterProfile = page.url();
+  const afterProfileUi = await page.evaluate(() => {
+    const text = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
+    const btn = [...document.querySelectorAll('button,[role="button"]')]
+      .find((b) => /finish creating account|创建账号|完成/i.test((b.innerText || '').trim()))
+      || document.querySelector('button[type="submit"]');
+    const busy = !!(btn && (btn.getAttribute('aria-busy') === 'true' || btn.disabled
+      || !!btn.querySelector('svg, [class*="spinner"], [class*="Spinner"]')));
+    return {
+      title: document.title || '',
+      busy,
+      hasOops: /oops.*error occurred|operation timed out/i.test(text),
+      preview: text.slice(0, 240),
+    };
+  }).catch(() => ({ title: '', busy: false, hasOops: false, preview: '' }));
   if (/\/about-you(?:[/?#]|$)/i.test(urlAfterProfile)) {
     await assertProfileReady(page, log).catch((e) => {
       throw new Error(`资料提交后仍停在资料页：${e.message}`);
     });
   }
-  await mark('register-05-profile-submitted', `submit=${submitted} urlBefore=${urlBeforeProfile} urlAfter=${urlAfterProfile}`);
+  await mark('register-05-profile-submitted', {
+    note: `submit=${submitted} urlBefore=${urlBeforeProfile} urlAfter=${urlAfterProfile} busy=${afterProfileUi.busy} oops=${afterProfileUi.hasOops} title=${afterProfileUi.title || '-'}`,
+    submit: submitted,
+    urlBefore: urlBeforeProfile,
+    urlAfter: urlAfterProfile,
+    submitBusy: afterProfileUi.busy,
+    hasOops: afterProfileUi.hasOops,
+    pageTitle: afterProfileUi.title || '',
+    bodyPreview: afterProfileUi.preview || '',
+  });
 
   await humanClickByText(page, ['agree', 'continue', '同意', '继续', 'okay', 'ok', 'got it', 'stay logged out'], { timeout: 6000, exclude: OAUTH_EXCLUDE, awaitPageLoad: true, log }).catch(() => {});
 
@@ -1913,11 +1955,12 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
 
   // 步骤8：设置密码（可选）+ 开启 TOTP 2FA（可选加固，失败可容忍、不影响账号入池）
   if (!autoSetPassword && !enable2fa) {
-    log('注册 · 已关闭自动设密码与双重验证，跳过 step8');
+    log('注册 · 已关闭自动设密码与双重验证，跳过 step8'
+      + (passwordSetAtSignup ? '（保留创建密码页已设密码）' : ''));
     return {
       email,
-      password: '',
-      passwordSet: false,
+      password: passwordSetAtSignup ? password : '',
+      passwordSet: passwordSetAtSignup,
       twoFactorSecret: '',
       twoFactorUri: '',
       recoveryCodes: [],
@@ -1951,10 +1994,11 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
       log(`注册 · 双重验证未完成，密码已设置，按普通账号保存：${e.message}`, 'yellow');
       secure = tolerated;
     } else {
+      const pwdOk = passwordSetAtSignup || (autoSetPassword && partial.passwordSet);
       e._partial = {
         email,
-        password: autoSetPassword && partial.passwordSet ? password : '',
-        passwordSet: autoSetPassword && partial.passwordSet || false,
+        password: pwdOk ? password : '',
+        passwordSet: Boolean(pwdOk),
         twoFactorSecret: partial.twoFactorSecret || '',
         twoFactorUri: partial.twoFactorUri || '',
         recoveryCodes: partial.recoveryCodes || [],
@@ -1969,10 +2013,11 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
     }
   }
 
+  const pwdOk = passwordSetAtSignup || (autoSetPassword && secure.passwordSet);
   return {
     email,
-    password: autoSetPassword && secure.passwordSet ? password : '',
-    passwordSet: autoSetPassword && secure.passwordSet,
+    password: pwdOk ? password : '',
+    passwordSet: Boolean(pwdOk),
     twoFactorSecret: secure.twoFactorSecret,
     twoFactorUri: secure.twoFactorUri,
     recoveryCodes: secure.recoveryCodes,
@@ -2060,8 +2105,8 @@ async function fillCode(page, code, log) {
 }
 
 // OpenAI 可重试的网络/路由异常页（非 rate_limit_exceeded）。brief 实测：
-// 「Oops, an error occurred!」+ Route Error (400 Invalid content type…) + Try again。
-const RETRYABLE_NETWORK_ERROR_RE = /网络.*(异常|错误)|network error|出了点问题|something went wrong|请稍后.*重试|不明なエラー|unknown error|fail.*fetch|failed to fetch|"code":\s*"invalid_type"|oops.*error occurred|route error|invalid content type/i;
+// 「Oops, an error occurred!」+ Route Error / Operation timed out + Try again。
+const RETRYABLE_NETWORK_ERROR_RE = /网络.*(异常|错误)|network error|出了点问题|something went wrong|请稍后.*重试|不明なエラー|unknown error|fail.*fetch|failed to fetch|"code":\s*"invalid_type"|oops.*error occurred|operation timed out|route error|invalid content type/i;
 
 function classifyRetryableNetworkError(text) {
   return RETRYABLE_NETWORK_ERROR_RE.test(String(text || ''));
@@ -2360,6 +2405,7 @@ async function checkConsentIfAny(page, log) {
 async function waitForSuccess(page, log, timeoutMs = 120000) {
   const deadline = Date.now() + timeoutMs;
   let lastUrl = '';
+  let networkRetryRounds = 0;
   while (Date.now() < deadline) {
     const url = page.url();
     if (url !== lastUrl) {
@@ -2367,6 +2413,17 @@ async function waitForSuccess(page, log, timeoutMs = 120000) {
       lastUrl = url;
     }
     const text = await pageText(page);
+    // 资料提交后常见 Oops / Operation timed out；点 Try again 后大概率进官网首页。
+    if (classifyRetryableNetworkError(text) && networkRetryRounds < 2) {
+      networkRetryRounds += 1;
+      log(`注册 · 等待完成时检测到异常页，尝试点重试（第 ${networkRetryRounds}/2 轮）：${text.replace(/\s+/g, ' ').trim().slice(0, 160)}`, 'warn');
+      const did = await clickRetryIfError(page, log, { max: 3, cooldownMs: 4000 });
+      if (did) {
+        await sleep(3000);
+        await waitForPageFullyLoaded(page, { log }).catch(() => {});
+        continue;
+      }
+    }
     if (S.SUCCESS_TEXTS.some((t) => text.includes(t))) {
       log('注册 · 已进入主界面，注册完成');
       return true;

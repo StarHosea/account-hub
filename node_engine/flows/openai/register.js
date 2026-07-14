@@ -1083,9 +1083,25 @@ async function waitForLoginPasswordOutcome(page, beforeUrl, { timeoutMs = 8000, 
   }
 }
 
-// 老账号登录（OTP 收码登录）。验证码通过 requestCode('login') 向 Python 请求。
-// totpSecret：若账号已开 2FA，登录后会要求验证器码，传入 secret 则自动生成 TOTP 填入。
+// 登录态就绪后：强制刷新页面再读 /api/auth/session，尽量拿到新的 AccessToken。
+async function reloadAndReadAccessToken(page, log, { chatgptUrl = 'https://chatgpt.com/', attempts = 5 } = {}) {
+  log('刷新 · 重新加载页面后再次读取 AccessToken');
+  await page.reload({ waitUntil: 'domcontentloaded', timeout: 90000 }).catch(async (err) => {
+    log(`刷新 · reload 异常，改为重新打开首页：${err?.message || err}`, 'yellow');
+    await openWithRetry(page, chatgptUrl, log);
+  });
+  await sleep(2500);
+  await waitForHomeReady(page).catch(() => {});
+  let t = await readAccessToken(page);
+  for (let i = 0; i < attempts && !t.accessToken; i += 1) {
+    await sleep(1500);
+    t = await readAccessToken(page);
+  }
+  return t;
+}
+
 // 用已保存的 browser session（cookies/localStorage）恢复登录态，失败时可 fallback 到 loginChatGPT。
+// 无论会话是否仍有效：登录态确认后都会 reload 页面再读 AccessToken（刷新 Token 主路径）。
 export async function sessionRefreshChatGPT({
   page,
   email,
@@ -1102,35 +1118,44 @@ export async function sessionRefreshChatGPT({
   await openWithRetry(page, chatgptUrl, log, { recorder });
   await sleep(2500);
 
+  let viaSession = true;
   let t = await readAccessToken(page);
   for (let i = 0; i < 3 && !t.accessToken; i += 1) {
     await sleep(1500);
     t = await readAccessToken(page);
   }
   if (t.accessToken) {
-    log('刷新 · 会话恢复成功，已读取 accessToken');
-    await mark('session-refresh-ok', '会话恢复成功');
-    return { accessToken: t.accessToken, user: t.user, expires: t.expires, viaSession: true };
+    log('刷新 · 会话恢复成功，准备 reload 后再取 AccessToken');
+    await mark('session-refresh-ok', '会话恢复成功，准备 reload');
+  } else {
+    if (!fallbackLogin) {
+      throw new Error(`会话已失效：${t.error || '未取到 accessToken'}`);
+    }
+    log('刷新 · 会话失效，改用密码登录', 'yellow');
+    viaSession = false;
+    await loginChatGPT({
+      page,
+      email,
+      chatgptUrl,
+      password,
+      totpSecret,
+      requestCode,
+      log,
+      recorder,
+    });
   }
 
-  if (!fallbackLogin) {
-    throw new Error(`会话已失效：${t.error || '未取到 accessToken'}`);
+  t = await reloadAndReadAccessToken(page, log, { chatgptUrl });
+  if (!t.accessToken) {
+    throw new Error(`刷新后未取到 accessToken：${t.error || '未知'}`);
   }
-
-  log('刷新 · 会话失效，改用密码登录', 'yellow');
-  const login = await loginChatGPT({
-    page,
-    email,
-    chatgptUrl,
-    password,
-    totpSecret,
-    requestCode,
-    log,
-    recorder,
-  });
-  return { ...login, viaSession: false };
+  log('刷新 · 已重新加载页面并取得 AccessToken');
+  await mark('session-refresh-reloaded', 'reload 后已取 AccessToken');
+  return { accessToken: t.accessToken, user: t.user, expires: t.expires, viaSession };
 }
 
+// 老账号登录（OTP 收码登录）。验证码通过 requestCode('login') 向 Python 请求。
+// totpSecret：若账号已开 2FA，登录后会要求验证器码，传入 secret 则自动生成 TOTP 填入。
 export async function loginChatGPT({ page, email, chatgptUrl = 'https://chatgpt.com/', password = '', totpSecret = '', requestCode, log, recorder = NOOP_RECORDER }) {
   const mark = (id, meta) => recorder.record(id, typeof meta === 'string' ? { note: meta } : meta).catch(() => {});
   let landing = null;
@@ -1855,90 +1880,116 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
     return { emailExists: true };
   }
 
-  // 步骤5：资料（姓名 + 生日）
-  log('注册 · 填写姓名和生日');
-  if (await clickRetryIfError(page, log)) {
-    log('注册 · 进入资料页前检测到网络异常（fail fetch 等），已点重试', 'warn');
-    await sleep(3000);
-  }
-  await fillProfile(page, { firstName, lastName, birthday }, log);
-  await checkConsentIfAny(page, log);
-  const profileFields = await assertProfileReady(page, log);
-  await mark('register-05-profile-filled', `age=${profileFields.age || '-'} birthday=${profileFields.birthday || '-'}`);
-
-  const urlBeforeProfile = page.url();
-  const submitted = await humanClickByText(page, S.PROFILE_SUBMIT_TEXTS, { timeout: 12000, exclude: OAUTH_EXCLUDE, awaitPageLoad: true, log });
-  if (!submitted) {
-    await snapshot(page, 'profile-submit-miss', log);
-    throw new Error('资料页未找到提交按钮');
-  }
-  log(`注册 · 已提交个人资料（${submitted}）`);
-  await sleep(3000);
-  const urlAfterProfile = page.url();
-  const afterProfileUi = await page.evaluate(() => {
-    const text = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
-    const btn = [...document.querySelectorAll('button,[role="button"]')]
-      .find((b) => /finish creating account|创建账号|完成/i.test((b.innerText || '').trim()))
-      || document.querySelector('button[type="submit"]');
-    const busy = !!(btn && (btn.getAttribute('aria-busy') === 'true' || btn.disabled
-      || !!btn.querySelector('svg, [class*="spinner"], [class*="Spinner"]')));
-    return {
-      title: document.title || '',
-      busy,
-      hasOops: /oops.*error occurred|operation timed out/i.test(text),
-      preview: text.slice(0, 240),
-    };
-  }).catch(() => ({ title: '', busy: false, hasOops: false, preview: '' }));
-  if (/\/about-you(?:[/?#]|$)/i.test(urlAfterProfile)) {
-    await assertProfileReady(page, log).catch((e) => {
-      throw new Error(`资料提交后仍停在资料页：${e.message}`);
-    });
-  }
-  await mark('register-05-profile-submitted', {
-    note: `submit=${submitted} urlBefore=${urlBeforeProfile} urlAfter=${urlAfterProfile} busy=${afterProfileUi.busy} oops=${afterProfileUi.hasOops} title=${afterProfileUi.title || '-'}`,
-    submit: submitted,
-    urlBefore: urlBeforeProfile,
-    urlAfter: urlAfterProfile,
-    submitBusy: afterProfileUi.busy,
-    hasOops: afterProfileUi.hasOops,
-    pageTitle: afterProfileUi.title || '',
-    bodyPreview: afterProfileUi.preview || '',
-  });
-
-  await humanClickByText(page, ['agree', 'continue', '同意', '继续', 'okay', 'ok', 'got it', 'stay logged out'], { timeout: 6000, exclude: OAUTH_EXCLUDE, awaitPageLoad: true, log }).catch(() => {});
-
-  // 步骤5.5：资料提交后可能被打回"二次邮箱验证"（auth.openai.com/email-verification）。
-  for (let round = 1; round <= 2; round += 1) {
-    const onCodePage = await isOnCodePage(page);
-    if (!onCodePage) break;
-    log(`注册 · 需要再次验证邮箱，第 ${round} 次`);
-    await humanClickByText(page, RESEND_CODE_TEXTS, { timeout: 6000, exclude: OAUTH_EXCLUDE }).catch(() => {});
-    const code2Result = await requestCodeWithResend(page, requestCode, log, { purpose: 'register' });
-    const fillAudit2 = await fillCode(page, code2Result.code, log);
-    await submitCodeForm(page, log, { code: code2Result.code });
-    const code2Audit = buildCodeAuditFromResult(code2Result, fillAudit2, {
-      submitMethod: 'form-submit',
-      round,
-    });
-    await mark(`register-05b-second-code-${round}`, {
-      note: buildCodeAuditNote(code2Audit, { label: `二次邮箱验证码已填 round=${round}` }),
-      ...code2Audit,
-    });
-    await sleep(4000);
-    if (!isChromeErrorUrl(page.url()) && await isOnCodePage(page) && await detectInvalidCode(page)) {
-      const invalidHintText = await extractInvalidCodeHint(page);
-      await mark(`register-05b-second-code-invalid-${round}`, {
-        note: `二次验证码无效 round=${round} hint=${invalidHintText || '-'}`,
-        ...code2Audit,
-        invalidHintText: invalidHintText || '',
+  // 步骤5：资料（姓名 + 生日）。提交后若 Oops/超时点重试，OpenAI 常打回空的 about-you
+  // （brief: name value=""），需重新填写并提交，不能只在 waitForSuccess 空转。
+  const MAX_PROFILE_ROUNDS = 3;
+  let profileWaitOutcome = 'timeout';
+  for (let profileRound = 1; profileRound <= MAX_PROFILE_ROUNDS; profileRound += 1) {
+    log(profileRound === 1
+      ? '注册 · 填写姓名和生日'
+      : `注册 · 重试后回到资料页，重新填写姓名和生日（第 ${profileRound}/${MAX_PROFILE_ROUNDS} 轮）`);
+    if (profileRound === 1) {
+      if (await clickRetryIfError(page, log)) {
+        log('注册 · 进入资料页前检测到网络异常（fail fetch 等），已点重试', 'warn');
+        await sleep(3000);
+      }
+    } else {
+      await mark('register-05-profile-resubmit', {
+        note: `needs_profile round=${profileRound} url=${page.url()}`,
+        profileRound,
       });
-      throw new Error('二次验证码无效');
     }
-  }
+    await fillProfile(page, { firstName, lastName, birthday }, log);
+    await checkConsentIfAny(page, log);
+    const profileFields = await assertProfileReady(page, log);
+    await mark('register-05-profile-filled', {
+      note: `age=${profileFields.age || '-'} birthday=${profileFields.birthday || '-'} round=${profileRound}`,
+      profileRound,
+      age: profileFields.age || '',
+      birthday: profileFields.birthday || '',
+    });
 
-  // 步骤6：等待注册成功
-  log('注册 · 等待注册完成');
-  await waitForSuccess(page, log);
+    const urlBeforeProfile = page.url();
+    const submitted = await humanClickByText(page, S.PROFILE_SUBMIT_TEXTS, { timeout: 12000, exclude: OAUTH_EXCLUDE, awaitPageLoad: true, log });
+    if (!submitted) {
+      await snapshot(page, 'profile-submit-miss', log);
+      throw new Error('资料页未找到提交按钮');
+    }
+    log(`注册 · 已提交个人资料（${submitted}）round=${profileRound}`);
+    await sleep(3000);
+    const urlAfterProfile = page.url();
+    const afterProfileUi = await page.evaluate(() => {
+      const text = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
+      const btn = [...document.querySelectorAll('button,[role="button"]')]
+        .find((b) => /finish creating account|创建账号|完成/i.test((b.innerText || '').trim()))
+        || document.querySelector('button[type="submit"]');
+      const busy = !!(btn && (btn.getAttribute('aria-busy') === 'true' || btn.disabled
+        || !!btn.querySelector('svg, [class*="spinner"], [class*="Spinner"]')));
+      return {
+        title: document.title || '',
+        busy,
+        hasOops: /oops.*error occurred|operation timed out/i.test(text),
+        preview: text.slice(0, 240),
+      };
+    }).catch(() => ({ title: '', busy: false, hasOops: false, preview: '' }));
+    if (/\/about-you(?:[/?#]|$)/i.test(urlAfterProfile)) {
+      await assertProfileReady(page, log).catch((e) => {
+        throw new Error(`资料提交后仍停在资料页：${e.message}`);
+      });
+    }
+    await mark('register-05-profile-submitted', {
+      note: `submit=${submitted} urlBefore=${urlBeforeProfile} urlAfter=${urlAfterProfile} busy=${afterProfileUi.busy} oops=${afterProfileUi.hasOops} title=${afterProfileUi.title || '-'} round=${profileRound}`,
+      submit: submitted,
+      urlBefore: urlBeforeProfile,
+      urlAfter: urlAfterProfile,
+      submitBusy: afterProfileUi.busy,
+      hasOops: afterProfileUi.hasOops,
+      pageTitle: afterProfileUi.title || '',
+      bodyPreview: afterProfileUi.preview || '',
+      profileRound,
+    });
+
+    await humanClickByText(page, ['agree', 'continue', '同意', '继续', 'okay', 'ok', 'got it', 'stay logged out'], { timeout: 6000, exclude: OAUTH_EXCLUDE, awaitPageLoad: true, log }).catch(() => {});
+
+    // 步骤5.5：资料提交后可能被打回"二次邮箱验证"（auth.openai.com/email-verification）。
+    for (let round = 1; round <= 2; round += 1) {
+      const onCodePage = await isOnCodePage(page);
+      if (!onCodePage) break;
+      log(`注册 · 需要再次验证邮箱，第 ${round} 次`);
+      await humanClickByText(page, RESEND_CODE_TEXTS, { timeout: 6000, exclude: OAUTH_EXCLUDE }).catch(() => {});
+      const code2Result = await requestCodeWithResend(page, requestCode, log, { purpose: 'register' });
+      const fillAudit2 = await fillCode(page, code2Result.code, log);
+      await submitCodeForm(page, log, { code: code2Result.code });
+      const code2Audit = buildCodeAuditFromResult(code2Result, fillAudit2, {
+        submitMethod: 'form-submit',
+        round,
+      });
+      await mark(`register-05b-second-code-${round}`, {
+        note: buildCodeAuditNote(code2Audit, { label: `二次邮箱验证码已填 round=${round}` }),
+        ...code2Audit,
+      });
+      await sleep(4000);
+      if (!isChromeErrorUrl(page.url()) && await isOnCodePage(page) && await detectInvalidCode(page)) {
+        const invalidHintText = await extractInvalidCodeHint(page);
+        await mark(`register-05b-second-code-invalid-${round}`, {
+          note: `二次验证码无效 round=${round} hint=${invalidHintText || '-'}`,
+          ...code2Audit,
+          invalidHintText: invalidHintText || '',
+        });
+        throw new Error('二次验证码无效');
+      }
+    }
+
+    // 步骤6：等待注册成功；点重试后若回到空资料页则进入下一轮重填
+    log('注册 · 等待注册完成');
+    profileWaitOutcome = await waitForSuccess(page, log);
+    if (profileWaitOutcome === 'ok') break;
+    if (profileWaitOutcome === 'needs_profile' && profileRound < MAX_PROFILE_ROUNDS) {
+      log('注册 · 等待完成后仍回到资料页，准备重新填写', 'warn');
+      continue;
+    }
+    break;
+  }
 
   // 步骤7：读取 accessToken
   log('注册 · 获取登录凭证');
@@ -2402,6 +2453,31 @@ async function checkConsentIfAny(page, log) {
   } catch { /* ignore */ }
 }
 
+/** 是否停在 about-you 资料页（姓名/年龄）。 */
+async function isAboutYouProfilePage(page) {
+  try {
+    if (/\/about-you(?:[/?#]|$)/i.test(page.url())) return true;
+  } catch { /* ignore */ }
+  return page.evaluate(() => {
+    const text = document.body?.innerText || '';
+    if (!/how old are you|你多大|歳ですか|finish creating account|创建账号/i.test(text)) return false;
+    const name = document.querySelector('input[name="name"], input[autocomplete="name"]');
+    const age = document.querySelector('input[name="age"]');
+    const vis = (el) => {
+      if (!el) return false;
+      const r = el.getBoundingClientRect();
+      const s = getComputedStyle(el);
+      return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+    };
+    return vis(name) || vis(age);
+  }).catch(() => false);
+}
+
+/**
+ * 等待注册成功。
+ * @returns {'ok'|'needs_profile'|'timeout'}
+ *   needs_profile：点重试/刷新后回到空的 about-you，调用方应重新 fill+submit。
+ */
 async function waitForSuccess(page, log, timeoutMs = 120000) {
   const deadline = Date.now() + timeoutMs;
   let lastUrl = '';
@@ -2413,7 +2489,7 @@ async function waitForSuccess(page, log, timeoutMs = 120000) {
       lastUrl = url;
     }
     const text = await pageText(page);
-    // 资料提交后常见 Oops / Operation timed out；点 Try again 后大概率进官网首页。
+    // 资料提交后常见 Oops / Operation timed out；点 Try again 后可能进首页，也可能打回空资料页。
     if (classifyRetryableNetworkError(text) && networkRetryRounds < 2) {
       networkRetryRounds += 1;
       log(`注册 · 等待完成时检测到异常页，尝试点重试（第 ${networkRetryRounds}/2 轮）：${text.replace(/\s+/g, ' ').trim().slice(0, 160)}`, 'warn');
@@ -2421,25 +2497,53 @@ async function waitForSuccess(page, log, timeoutMs = 120000) {
       if (did) {
         await sleep(3000);
         await waitForPageFullyLoaded(page, { log }).catch(() => {});
+        if (await isAboutYouProfilePage(page)) {
+          const fields = await readProfileFields(page);
+          log(`注册 · 点重试后回到资料页（name=${fields.name || '(空)'}），需重新填写`, 'warn');
+          return 'needs_profile';
+        }
         continue;
+      }
+    }
+    // 静默打回：未捕获 Oops 文案，但 about-you 姓名已被清空（提交中 busy 时暂不判定，避免抢跑）
+    if (await isAboutYouProfilePage(page)) {
+      const fields = await readProfileFields(page);
+      if (!fields.name) {
+        const submitBusy = await page.evaluate(() => {
+          const btn = [...document.querySelectorAll('button,[role="button"]')]
+            .find((b) => /finish creating account|创建账号|完成/i.test((b.innerText || '').trim()))
+            || document.querySelector('button[type="submit"]');
+          if (!btn) return false;
+          return btn.getAttribute('aria-busy') === 'true' || btn.disabled
+            || !!btn.querySelector('svg, [class*="spinner"], [class*="Spinner"]');
+        }).catch(() => false);
+        if (!submitBusy) {
+          log('注册 · 资料页姓名已清空，需重新填写', 'warn');
+          return 'needs_profile';
+        }
       }
     }
     if (S.SUCCESS_TEXTS.some((t) => text.includes(t))) {
       log('注册 · 已进入主界面，注册完成');
-      return true;
+      return 'ok';
     }
     if (isLoggedInUrl(url)) {
       const t = await readAccessToken(page);
       if (t.accessToken) {
         log('注册 · 登录状态已建立，注册完成');
-        return true;
+        return 'ok';
       }
     }
     await sleep(2500);
   }
+  if (await isAboutYouProfilePage(page)) {
+    log('注册 · 等待完成超时且仍在资料页，需重新填写', 'warn');
+    await snapshot(page, 'wait-success-timeout-profile', log);
+    return 'needs_profile';
+  }
   log('注册 · 等待完成超时，继续尝试获取登录凭证');
   await snapshot(page, 'wait-success-timeout', log);
-  return false;
+  return 'timeout';
 }
 
 // 观察用：dump 可见按钮/输入/提示。默认仅在 REG_DIAG_DIR 时输出详细日志 + 截图。

@@ -326,6 +326,10 @@ class ApiMailboxProvider(BaseMailProvider):
 
         reserved = register_service.pop_reserved_mailbox()
         if reserved:
+            address = str(reserved.get("address") or "").strip()
+            # 预选路径原先不 acquire，失败时 release 会空操作；这里补占用以统一生命周期。
+            if address and not mailbox_service.claim(address):
+                raise MailboxPoolExhaustedError(f"预选邮箱不可用：{address}")
             return reserved
         acquired = mailbox_service.acquire_unused()
         if not acquired:
@@ -563,22 +567,11 @@ def peek_received_at(mail_config: dict, mailbox: dict) -> datetime | None:
 # 环境类失败释放后的冷却秒数（Cloudflare/网络/验证码超时等，与邮箱本身无关，稍后可重试）。
 _RELEASE_COOLDOWN_SECONDS = 120
 
-# 「邮箱疑似已注册过账号」的失败特征：命中则永久标坏邮箱，不再领用。
-# 通用兜底：浏览器引擎正常会用 emailExists 在流程内分流，不走这里；此标记仅防
-# 引擎抛出含「已存在」字样的失败时把邮箱回收。
-_BAD_MAILBOX_MARKERS = ("already exists", "email_exists")
-
-
-def _is_bad_mailbox_error(error: Exception | str | None) -> bool:
-    text = str(error or "").lower()
-    return any(marker in text for marker in _BAD_MAILBOX_MARKERS)
-
 
 def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str | None = None) -> None:
     """注册流程结束后更新邮箱池状态（仅 API 邮箱池）：
-    - 成功：绑定账号并标 used；
-    - 邮箱疑似已注册（命中 _BAD_MAILBOX_MARKERS）：标坏邮箱（used=True），不再领用；
-    - 其它（环境类）失败：释放并短暂冷却，避免下个任务立刻重领同一邮箱空转。
+    - 仅当注册成功且拿到 access_token（已入免费号池）时：绑定账号并标 used（已注册）；
+    - 其余一律回到待注册（带短暂冷却），禁止「未入号池却标已注册」。
 
     CloudMail 为按需生成地址、非池化，无需回写状态。
     """
@@ -587,26 +580,22 @@ def mark_mailbox_result(mailbox: dict, *, success: bool, error: Exception | str 
     address = str(mailbox.get("address") or "").strip()
     if not address:
         return
-    if success:
-        token = str(mailbox.get("access_token") or "")
+    token = str(mailbox.get("access_token") or "").strip()
+    if success and token:
         mailbox_service.bind_account(address, token)
-        if token:
-            reg_payload: dict = {"access_token": token}
-            for field in ("password", "totp_secret", "otpauth_url"):
-                val = str(mailbox.get(field) or "").strip()
-                if val:
-                    reg_payload[field] = val
-            account_service.complete_registration(address, reg_payload)
-    elif _is_bad_mailbox_error(error):
-        mailbox_service.mark_used_bad(address, note="疑似已注册过账号，注册机自动标记不可用")
-        account_service.release_registration(
-            address, error=str(error or ""), remove_placeholder=True,
-        )
-    else:
-        mailbox_service.release(address, cooldown_seconds=_RELEASE_COOLDOWN_SECONDS)
-        account_service.release_registration(
-            address, error=str(error or ""), remove_placeholder=True,
-        )
+        reg_payload: dict = {"access_token": token}
+        for field in ("password", "totp_secret", "otpauth_url"):
+            val = str(mailbox.get(field) or "").strip()
+            if val:
+                reg_payload[field] = val
+        account_service.complete_registration(address, reg_payload)
+        return
+
+    # 未入免费号池：强制待注册（含 email_exists / 半完成 token / 空 success）
+    mailbox_service.release_for_retry(address, cooldown_seconds=_RELEASE_COOLDOWN_SECONDS)
+    account_service.release_registration(
+        address, error=str(error or ""), remove_placeholder=True,
+    )
 
 
 def release_mailbox(mailbox: dict) -> None:

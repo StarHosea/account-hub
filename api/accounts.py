@@ -283,6 +283,24 @@ def create_router() -> APIRouter:
             "items": result.get("items", []),
         }
 
+    @router.get("/api/accounts/detail")
+    async def get_account_detail(
+        authorization: str | None = Header(default=None),
+        access_token: str | None = Query(default=None),
+        email: str | None = Query(default=None),
+    ):
+        """账号详情（含 browser_session / cookies），仅管理端；列表接口仍不返回 session。"""
+        require_admin(authorization)
+        token = str(access_token or "").strip()
+        em = str(email or "").strip()
+        if not token and not em:
+            raise HTTPException(status_code=400, detail={"error": "access_token 或 email 必填其一"})
+        item = account_service.get_account_detail(access_token=token, email=em)
+        if item is None:
+            raise HTTPException(status_code=404, detail={"error": "账号不存在"})
+        _attach_mail_link([item])
+        return {"item": item}
+
     @router.delete("/api/accounts")
     async def delete_accounts(body: AccountDeleteRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)

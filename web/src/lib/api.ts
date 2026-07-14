@@ -23,6 +23,12 @@ export type AuthRole = "admin" | "user";
 
 export type PlusStatus = "未激活" | "排队中" | "激活中" | "已激活" | "激活失败";
 
+export type AccountBrowserSession = {
+  cookies?: unknown[];
+  origins?: unknown[];
+  [key: string]: unknown;
+};
+
 export type Account = {
   access_token: string;
   type: AccountType;
@@ -32,6 +38,10 @@ export type Account = {
   image_quota_unknown?: boolean;
   email?: string | null;
   user_id?: string | null;
+  refresh_token?: string | null;
+  id_token?: string | null;
+  browser_session?: AccountBrowserSession | null;
+  browser_session_at?: string | null;
   limits_progress?: Array<{
     feature_name?: string;
     remaining?: number;
@@ -577,6 +587,20 @@ export async function fetchRefreshTokenProgress(progressId: string) {
   return httpRequest<RefreshProgressResponse & { status_counts?: Record<string, number> }>(
     `/api/accounts/refresh-token/progress/${progressId}`,
   );
+}
+
+export type AccountDetail = Account & {
+  refresh_token?: string | null;
+  id_token?: string | null;
+  browser_session?: AccountBrowserSession | null;
+  browser_session_at?: string | null;
+};
+
+export async function fetchAccountDetail(params: { access_token?: string; email?: string }) {
+  const q = new URLSearchParams();
+  if (params.access_token) q.set("access_token", params.access_token);
+  if (params.email) q.set("email", params.email);
+  return httpRequest<{ item: AccountDetail }>(`/api/accounts/detail?${q.toString()}`);
 }
 
 export async function reLoginAccounts(accessTokens: string[]) {

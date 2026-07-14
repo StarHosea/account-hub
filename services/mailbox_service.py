@@ -294,6 +294,40 @@ class MailboxService:
                     item["cooldown_until"] = None
                 self._save()
 
+    def release_for_retry(self, email: str, cooldown_seconds: float = 0) -> None:
+        """注册未入免费号池：强制回到待注册（used=False），可带短暂冷却。
+
+        与 release() 不同：无论当前 in_use/used 是什么都复位，避免「未成功入号池却
+        仍显示已注册」或预选邮箱未 acquire 时 release 空操作。
+        """
+        with self._lock:
+            item = self._mailboxes.get(_norm_email(email))
+            if item is None:
+                return
+            item["used"] = False
+            item["in_use"] = False
+            item["in_use_at"] = None
+            item["account_token"] = None
+            item["registered_at"] = None
+            if cooldown_seconds and cooldown_seconds > 0:
+                until = datetime.now(timezone.utc) + timedelta(seconds=cooldown_seconds)
+                item["cooldown_until"] = until.isoformat()
+            else:
+                item["cooldown_until"] = None
+            self._save()
+
+    def claim(self, email: str) -> bool:
+        """占用以开始注册（预选邮箱路径）；邮箱不存在或已 used 时返回 False。"""
+        with self._lock:
+            item = self._mailboxes.get(_norm_email(email))
+            if item is None or item.get("used"):
+                return False
+            item["in_use"] = True
+            item["in_use_at"] = _now()
+            item["cooldown_until"] = None
+            self._save()
+            return True
+
     def append_note(self, email: str, fragment: str) -> None:
         """在邮箱备注前追加一段文本（去重）。"""
         key = _norm_email(email)

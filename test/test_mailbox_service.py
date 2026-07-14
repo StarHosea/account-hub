@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 from services.mailbox_service import MailboxService
 from services.register import mail_provider as mp
@@ -107,7 +108,7 @@ class AcquireUnusedTests(unittest.TestCase):
 
 
 class MarkMailboxResultTests(unittest.TestCase):
-    """mark_mailbox_result：按失败原因分类处置邮箱。"""
+    """mark_mailbox_result：只有入免费号池才标已注册，其余回待注册。"""
 
     def setUp(self) -> None:
         self._dir = tempfile.TemporaryDirectory()
@@ -115,20 +116,26 @@ class MarkMailboxResultTests(unittest.TestCase):
         self.svc.import_text("bad@x.com----http://bad\nenv@x.com----http://env")
         self._orig = mp.mailbox_service
         mp.mailbox_service = self.svc
+        self._acct_patch = patch.object(mp, "account_service", MagicMock())
+        self._acct_patch.start()
 
     def tearDown(self) -> None:
+        self._acct_patch.stop()
         mp.mailbox_service = self._orig
         self._dir.cleanup()
 
     def _mailbox(self, address: str) -> dict:
         return {"provider": mp.API_MAILBOX_TYPE, "address": address}
 
-    def test_email_exists_marks_used_bad(self) -> None:
+    def test_email_exists_keeps_unused(self) -> None:
+        """邮箱已存在但未入免费号池时，应回到待注册，不再永久标坏。"""
         self.svc.acquire_unused()  # 占用第一个（bad@x.com）
         err = RuntimeError("register failed: email_exists")
         mp.mark_mailbox_result(self._mailbox("bad@x.com"), success=False, error=err)
         item = self.svc._mailboxes["bad@x.com"]
-        self.assertTrue(item["used"])  # 永久标坏
+        self.assertFalse(item["used"])
+        self.assertFalse(item["in_use"])
+        self.assertIsNotNone(item["cooldown_until"])
 
     def test_environment_failure_releases_with_cooldown(self) -> None:
         self.svc.acquire_unused()
@@ -145,6 +152,35 @@ class MarkMailboxResultTests(unittest.TestCase):
         mailbox = self._mailbox("bad@x.com")
         mailbox["access_token"] = "eyJpartial.token"
         mp.mark_mailbox_result(mailbox, success=False, error=RuntimeError("2FA 设置失败"))
+        item = self.svc._mailboxes["bad@x.com"]
+        self.assertFalse(item["used"])
+        self.assertFalse(item["in_use"])
+        self.assertIsNone(item.get("account_token"))
+
+    def test_success_without_token_stays_unused(self) -> None:
+        """success=True 但无 access_token 不算入免费号池，邮箱保持待注册。"""
+        self.svc.acquire_unused()
+        mp.mark_mailbox_result(self._mailbox("bad@x.com"), success=True)
+        item = self.svc._mailboxes["bad@x.com"]
+        self.assertFalse(item["used"])
+        self.assertFalse(item["in_use"])
+        self.assertIsNone(item.get("account_token"))
+
+    def test_success_with_token_marks_used(self) -> None:
+        self.svc.acquire_unused()
+        mailbox = self._mailbox("bad@x.com")
+        mailbox["access_token"] = "eyJreal.token"
+        mp.mark_mailbox_result(mailbox, success=True)
+        item = self.svc._mailboxes["bad@x.com"]
+        self.assertTrue(item["used"])
+        self.assertEqual(item.get("account_token"), "eyJreal.token")
+        mp.account_service.complete_registration.assert_called_once()
+
+    def test_release_for_retry_clears_stale_used(self) -> None:
+        """曾被误标已注册的邮箱，失败回写应强制回到待注册。"""
+        self.svc.acquire_unused()
+        self.svc.mark_used_bad("bad@x.com", note="旧逻辑误标")
+        mp.mark_mailbox_result(self._mailbox("bad@x.com"), success=False, error="Oops timed out")
         item = self.svc._mailboxes["bad@x.com"]
         self.assertFalse(item["used"])
         self.assertFalse(item["in_use"])

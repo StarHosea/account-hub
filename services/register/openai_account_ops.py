@@ -112,11 +112,13 @@ def run_token_refresh(
     if not email or not password:
         return {"ok": False, "error": "无邮箱或密码，无法刷新 token"}
 
+    # 统一走 session_refresh：确认登录态后会 reload 再读 AccessToken；
+    # 无 browser_session 时由 fallbackLogin 走密码登录。
     session = _browser_session_from_account(account)
-    job = _build_browser_job(account, mode="session_refresh" if session else "login")
+    job = _build_browser_job(account, mode="session_refresh")
+    job["fallbackLogin"] = True
     if session:
         job["storageState"] = session
-        job["fallbackLogin"] = True
     mail_config, mailbox = _account_mail_ctx(email)
 
     with _login_sem:

@@ -11,9 +11,11 @@
 | `visible_ui.hints` 验证码/无效 | failed_step、pageState、`fetch_url` | 收码慢、旧码、填码 selector、chrome-error | **取件页 `limit` 放大**看历史邮件时间与正文；fillCode note、submit 后 URL |
 | `reason` 含验证码/收码/OTP/mail | `fetch_url`、logs_tail 收码相关行 | 邮件未到、旧码、基线时间过滤、取件页解析 | 浏览器打开 `fetch_url` 改 `limit=10`；对照 subject/到达时间 |
 | `failed_step` register-02* | visible_ui.buttons | 注册按钮/邮箱兜底文案 | record note：点击尝试列表与命中 |
+| `landing=password` + `create-account/password` + 密码框空 + ~60s 后 `未跳转到验证码` | manifest `register-01-home.autoSetPassword`、`register-02-password-fill`、截图 Password 是否为空 | 旧版 `auto_set_password=false` 跳过创建密码页 | 创建密码页**强制填密**（与 step8 开关解耦）；mark `register-02-password-fill` |
 | `failed_step` register-04* | manifest register-04 note | fillCode、submitCodeForm | selector 命中、填回值校验 |
 | `failed_step` step8-* | visible_ui、pageState | 安全页 selector、密码/2FA | step8 各子步 record note |
 | register-05* + new_needs_profile + 二次验证码 | isOnCodePage、manifest register-05b | 资料页未提交/二次 OTP 无效 | PROFILE_SUBMIT_TEXTS、assertProfileReady、register-05b record |
+| register-05-profile-submitted + final `Oops`/`Operation timed out` + reason 含 accessToken/HTML | `visible_ui.body_preview`、profile-submitted `submitBusy`/`hasOops`、提交后截图按钮是否仍 spinner | 资料创建请求服务端超时 | `waitForSuccess` 内 `clickRetryIfError`（含 `operation timed out`）；重试后期望进官网首页取 token |
 | `reason` 浏览器引擎未返回结果 + final-error-scene note | engine_error、abnormal_reason | Python EOF 未读 error 事件 | `_drain_worker_events`；brief 优先 manifest note |
 | `logs_tail` 代理/连接错误 | 错误码原文 | 基础设施 | NDJSON 连接错误详情 |
 | 无 failed_step、无存证 | kill_reason | 进程被强杀 | Python 杀进程前写入 |

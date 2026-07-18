@@ -774,21 +774,91 @@ async function fillBirthday(page, { year, month, day }, log) {
   }
 
   if (kind === 'spinbutton') {
-    const seq = [
-      ['[role="spinbutton"][data-type="month"]', month],
-      ['[role="spinbutton"][data-type="day"]', day],
-      ['[role="spinbutton"][data-type="year"]', year],
-    ];
-    for (const [sel, val] of seq) {
-      const loc = page.locator(sel).first();
-      if (await loc.count()) {
+    // React Aria DateField：日/月段按位数缓冲，单位数未补零时切到下一段会变 Empty，
+    // hidden input[name=birthday] 被清空（brief: day=dd month=11 year=1997）。
+    // 必须补零 + 读回校验；禁止「只敲不验」假成功。
+    const y = Number(year);
+    const m = Number(month);
+    const d = Number(day);
+    const desired = `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+
+    const readSpin = async () => page.evaluate(() => {
+      const seg = (type) => {
+        const el = document.querySelector(`[role="spinbutton"][data-type="${type}"]`);
+        if (!el) return { present: false, value: null, placeholder: false };
+        const placeholder = el.getAttribute('data-placeholder') === 'true'
+          || /^(Empty|dd|mm|yyyy)$/i.test(String(el.getAttribute('aria-valuetext') || '').trim())
+          || /^(dd|mm|yyyy)$/i.test(String(el.textContent || '').trim());
+        const raw = el.getAttribute('aria-valuenow');
+        const value = placeholder || raw == null || raw === '' ? null : Number(raw);
+        return { present: true, value: Number.isFinite(value) ? value : null, placeholder };
+      };
+      const birthday = String(document.querySelector('input[name="birthday"]')?.value || '').trim();
+      return { day: seg('day'), month: seg('month'), year: seg('year'), birthday };
+    }).catch(() => ({
+      day: { present: false, value: null, placeholder: true },
+      month: { present: false, value: null, placeholder: true },
+      year: { present: false, value: null, placeholder: true },
+      birthday: '',
+    }));
+
+    const spinOk = (st) => {
+      if (st.birthday === desired) return true;
+      return st.day?.value === d && st.month?.value === m && st.year?.value === y
+        && !st.day?.placeholder && !st.month?.placeholder && !st.year?.placeholder;
+    };
+
+    const fillSegments = async (order) => {
+      for (const [type, val, digits] of order) {
+        const loc = page.locator(`[role="spinbutton"][data-type="${type}"]`).first();
+        if (!(await loc.count().catch(() => 0))) continue;
+        const text = digits > 0 ? String(val).padStart(digits, '0') : String(val);
         await loc.click({ delay: 40 }).catch(() => {});
-        await loc.pressSequentially(String(val), { delay: 90 }).catch(() => {});
-        await sleep(200);
+        // 清空旧值，避免在默认「今天」上叠键
+        await page.keyboard.press('ControlOrMeta+A').catch(() => {});
+        await page.keyboard.press('Backspace').catch(() => {});
+        await loc.pressSequentially(text, { delay: 50 }).catch(() => {});
+        await sleep(120);
       }
+      await page.evaluate(() => {
+        try { document.activeElement?.blur?.(); } catch { /* ignore */ }
+      }).catch(() => {});
+      await sleep(200);
+    };
+
+    // 视觉顺序 day/month/year 与 RA 自动跳格一致；失败再试 month/day/year（旧序）。
+    const orders = [
+      [['day', d, 2], ['month', m, 2], ['year', y, 0]],
+      [['month', m, 2], ['day', d, 2], ['year', y, 0]],
+    ];
+
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const order = orders[(attempt - 1) % orders.length];
+      await fillSegments(order);
+      // hidden 可能略滞后于 spin 段
+      let st = await readSpin();
+      if (!spinOk(st) && st.day?.value === d && st.month?.value === m && st.year?.value === y) {
+        const start = Date.now();
+        while (Date.now() - start < 1500) {
+          await sleep(100);
+          st = await readSpin();
+          if (spinOk(st)) break;
+        }
+      }
+      if (spinOk(st)) {
+        log(`已填写生日 ${desired} (spinbutton attempt=${attempt} birthday=${st.birthday || desired})`);
+        return true;
+      }
+      log(
+        `生日 spinbutton 读回失败 attempt=${attempt}/${3} `
+        + `day=${st.day?.placeholder ? 'Empty' : (st.day?.value ?? '-')} `
+        + `month=${st.month?.placeholder ? 'Empty' : (st.month?.value ?? '-')} `
+        + `year=${st.year?.placeholder ? 'Empty' : (st.year?.value ?? '-')} `
+        + `birthday=${st.birthday || '(空)'} want=${desired}`,
+        'warn',
+      );
     }
-    log(`已填写生日 ${year}-${month}-${day}`);
-    return true;
+    return false;
   }
 
   if (kind === 'age') {
@@ -1899,15 +1969,45 @@ export async function registerChatGPT({ page, email, chatgptUrl = 'https://chatg
         profileRound,
       });
     }
-    await fillProfile(page, { firstName, lastName, birthday }, log);
-    await checkConsentIfAny(page, log);
-    const profileFields = await assertProfileReady(page, log);
-    await mark('register-05-profile-filled', {
-      note: `age=${profileFields.age || '-'} birthday=${profileFields.birthday || '-'} round=${profileRound}`,
-      profileRound,
-      age: profileFields.age || '',
-      birthday: profileFields.birthday || '',
-    });
+    try {
+      await fillProfile(page, { firstName, lastName, birthday }, log);
+      await checkConsentIfAny(page, log);
+      const profileFields = await assertProfileReady(page, log);
+      await mark('register-05-profile-filled', {
+        note: `age=${profileFields.age || '-'} birthday=${profileFields.birthday || '-'} round=${profileRound}`,
+        profileRound,
+        age: profileFields.age || '',
+        birthday: profileFields.birthday || '',
+      });
+    } catch (profileErr) {
+      const f = await readProfileFields(page).catch(() => ({}));
+      const spin = await page.evaluate(() => {
+        const one = (t) => {
+          const el = document.querySelector(`[role="spinbutton"][data-type="${t}"]`);
+          if (!el) return null;
+          return {
+            now: el.getAttribute('aria-valuenow'),
+            text: el.getAttribute('aria-valuetext'),
+            ph: el.getAttribute('data-placeholder') === 'true',
+            body: String(el.textContent || '').trim().slice(0, 8),
+          };
+        };
+        return { day: one('day'), month: one('month'), year: one('year') };
+      }).catch(() => null);
+      await mark('register-05-profile-fill-fail', {
+        note: String(profileErr?.message || profileErr),
+        profileRound,
+        age: f.age || '',
+        birthday: f.birthday || '',
+        name: f.name || '',
+        ageInvalid: Boolean(f.ageInvalid),
+        birthdayInvalid: Boolean(f.birthdayInvalid),
+        spinDay: spin?.day || null,
+        spinMonth: spin?.month || null,
+        spinYear: spin?.year || null,
+      });
+      throw profileErr;
+    }
 
     const urlBeforeProfile = page.url();
     const submitted = await humanClickByText(page, S.PROFILE_SUBMIT_TEXTS, { timeout: 12000, exclude: OAUTH_EXCLUDE, awaitPageLoad: true, log });
@@ -2399,7 +2499,14 @@ async function fillProfile(page, { firstName, lastName, birthday }, log) {
     if (ln) await humanType(ln, lastName);
     if (fn || ln) log(`已分字段填写姓名 ${firstName} / ${lastName}`);
   }
-  await fillBirthday(page, birthday, log);
+  const birthdayOk = await fillBirthday(page, birthday, log);
+  if (!birthdayOk) {
+    const f = await readProfileFields(page);
+    throw new Error(
+      `资料页生日填写失败 age=${f.age || '-'} birthday=${f.birthday || '-'} `
+      + `want=${birthday?.year}-${birthday?.month}-${birthday?.day}`,
+    );
+  }
 }
 
 export const __test = {

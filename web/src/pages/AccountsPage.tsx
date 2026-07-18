@@ -130,6 +130,33 @@ function formatDateTime(value?: string | null) {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
+/** 会员页出库状态：已出库(蓝)+时间 / 未出库(灰)。与出库筛选同一字段 dispatch.dispatched。 */
+function renderDispatchStatus(a: Account, opts?: { showTime?: boolean }) {
+  const dispatched = Boolean(a.dispatch?.dispatched);
+  const showTime = opts?.showTime !== false;
+  const at = a.dispatch?.dispatched_at;
+  const tag = dispatched ? (
+    <Tag color="blue" type="light">
+      已出库
+    </Tag>
+  ) : (
+    <Tag color="grey" type="light">
+      未出库
+    </Tag>
+  );
+  if (!dispatched || !showTime || !at) {
+    return tag;
+  }
+  return (
+    <Space spacing={2} vertical align="start">
+      {tag}
+      <Text type="tertiary" size="small">
+        {formatDateTime(at)}
+      </Text>
+    </Space>
+  );
+}
+
 function downloadText(text: string, name: string) {
   const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
   const url = URL.createObjectURL(blob);
@@ -557,6 +584,13 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
       width: 110,
       render: (_: unknown, a: Account) => stageTag(a, refreshing.has(accountKey(a)) || rotatingTokens.has(accountKey(a))),
     },
+    ...(planType === "plus"
+      ? [{
+          title: "出库状态",
+          width: 120,
+          render: (_: unknown, a: Account) => renderDispatchStatus(a),
+        } as ColumnProps<Account>]
+      : []),
     {
       title: "出口IP/国家",
       width: 140,
@@ -837,6 +871,7 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
           allSelected={allOnPageSelected}
           refreshing={refreshing}
           rotatingTokens={rotatingTokens}
+          showDispatchStatus={planType === "plus"}
           onToggleAll={toggleSelectAll}
           onToggle={toggleOne}
           onRefresh={(t) => void handleRefresh([t])}
@@ -855,7 +890,7 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
           loading={loading}
           rowKey={(a) => accountKey(a as Account)}
           tableLayout="fixed"
-          scroll={{ x: 1680 }}
+          scroll={{ x: planType === "plus" ? 1800 : 1680 }}
           pagination={{
             currentPage: page,
             pageSize: PAGE_SIZE,
@@ -1087,6 +1122,7 @@ type AccountMobileListProps = {
   allSelected: boolean;
   refreshing: Set<string>;
   rotatingTokens: Set<string>;
+  showDispatchStatus?: boolean;
   onToggleAll: () => void;
   onToggle: (token: string) => void;
   onRefresh: (token: string) => void;
@@ -1106,6 +1142,7 @@ function AccountMobileList({
   allSelected,
   refreshing,
   rotatingTokens,
+  showDispatchStatus = false,
   onToggleAll,
   onToggle,
   onRefresh,
@@ -1141,13 +1178,14 @@ function AccountMobileList({
           const checked = selected.includes(key);
           const token = a.access_token || "";
           const statusNode = stageTag(a, refreshing.has(key) || rotatingTokens.has(key));
+          const dispatchAt = a.dispatch?.dispatched_at;
           return (
             <Card
               key={key}
               bodyStyle={{ padding: 14 }}
               style={{ borderColor: checked ? "var(--semi-color-primary)" : undefined }}
             >
-              {/* 顶行：勾选 + 邮箱 + 状态 */}
+              {/* 顶行：勾选 + 邮箱 + 状态 (+ 出库状态，仅会员) */}
               <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
                 <Checkbox checked={checked} onChange={() => onToggle(key)} />
                 {a.email ? (
@@ -1164,7 +1202,10 @@ function AccountMobileList({
                     无邮箱
                   </Text>
                 )}
-                {statusNode}
+                <Space spacing={4} wrap>
+                  {statusNode}
+                  {showDispatchStatus ? renderDispatchStatus(a, { showTime: false }) : null}
+                </Space>
               </div>
 
               {/* 标签行：出口信息 */}
@@ -1183,6 +1224,13 @@ function AccountMobileList({
                   {formatDateTime(a.last_token_refresh_at)}
                 </Text>
               </div>
+              {showDispatchStatus && a.dispatch?.dispatched && dispatchAt ? (
+                <div style={{ marginTop: 6 }}>
+                  <Text type="tertiary" size="small">
+                    出库 {formatDateTime(dispatchAt)}
+                  </Text>
+                </div>
+              ) : null}
 
               {/* 操作行 */}
               <div style={{ display: "flex", gap: 4, marginTop: 12, justifyContent: "space-between" }}>

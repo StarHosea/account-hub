@@ -14,6 +14,7 @@
 | `failed_step` register-04* | manifest register-04 note | fillCode、submitCodeForm | selector 命中、填回值校验 |
 | `failed_step` step8-* | visible_ui、pageState | 安全页 selector、密码/2FA | step8 各子步 record note |
 | register-05* + new_needs_profile + 二次验证码 | isOnCodePage、manifest register-05b | 资料页未提交/二次 OTP 无效 | PROFILE_SUBMIT_TEXTS、assertProfileReady、register-05b record |
+| `reason` 资料页生日/年龄未填写 | visible_ui body_preview、008 HTML spinbutton、`register-05-profile-fill-fail` | spinbutton 日/月未补零或读回失败；hidden birthday 空 | fillBirthday spin 读回；mark spinDay/Month/Year；CDP DateField 复测 |
 | `reason` 浏览器引擎未返回结果 + final-error-scene note | engine_error、abnormal_reason | Python EOF 未读 error 事件 | `_drain_worker_events`；brief 优先 manifest note |
 | `logs_tail` 代理/连接错误 | 错误码原文 | 基础设施 | NDJSON 连接错误详情 |
 | 无 failed_step、无存证 | kill_reason | 进程被强杀 | Python 杀进程前写入 |

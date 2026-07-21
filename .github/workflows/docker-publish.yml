@@ -57,5 +57,9 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            CLOAKBROWSER_UPDATE_LATEST=true
+            CLOAKBROWSER_CACHEBUST=${{ github.run_id }}
+            CLOAKBROWSER_LICENSE_KEY=${{ secrets.CLOAKBROWSER_LICENSE_KEY }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

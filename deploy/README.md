@@ -32,6 +32,22 @@ push main ──► .github/workflows/deploy.yml
 
 镜像拉取使用 workflow 内置 `GITHUB_TOKEN`（无需长期凭证）。
 
+### CloakBrowser（指纹浏览器 wrapper）
+
+生产镜像构建**默认**在 `npm install` 后再执行 `cloakbrowser@latest`，并预下载对应 stealth Chromium：
+
+| Build-arg | 默认 | 说明 |
+|---|---|---|
+| `CLOAKBROWSER_UPDATE_LATEST` | `true` | `true` 时拉 npm 最新 wrapper；本地可复现构建可设 `false` 锁 package-lock |
+| `CLOAKBROWSER_CACHEBUST` | `0` | CI 传入 `github.run_id`，打散缓存层，否则 `@latest` 会一直用旧缓存 |
+| `CLOAKBROWSER_LICENSE_KEY` | 空 | 可选；若二进制下载需授权，在 GitHub Secrets 配置同名项 |
+
+本地钉死版本示例：
+
+```bash
+docker build --build-arg CLOAKBROWSER_UPDATE_LATEST=false -t account-hub:local .
+```
+
 ## 手动运维
 
 ```bash

@@ -118,11 +118,16 @@ def _legacy_plus_status(stage: str, plan: str) -> str:
 
 
 def infer_stage_from_legacy(account: dict[str, Any]) -> str:
+    plus_status = str(account.get("plus_status") or LEGACY_PLUS_UNACTIVATED).strip()
+    # 进行中的激活：plus_status 优先于可能仍停留在 registered 的 stage。
+    # 否则 _set_account(plus_status=排队中/激活中) 经 enrich 后会被冲回「未激活」，
+    # 运行监控 activation=activating 过滤也查不到。
+    if plus_status in (LEGACY_PLUS_QUEUED, LEGACY_PLUS_ACTIVATING):
+        return STAGE_ACTIVATING
+
     if account.get("stage") in STAGE_LABELS:
         return str(account["stage"])
 
-    plus_status = str(account.get("plus_status") or LEGACY_PLUS_UNACTIVATED).strip()
-    plan = _legacy_plan(account.get("type"))
     token = str(account.get("access_token") or "").strip()
     email = str(account.get("email") or "").strip()
 
@@ -131,8 +136,6 @@ def infer_stage_from_legacy(account: dict[str, Any]) -> str:
             return STAGE_REGISTERING
         return STAGE_UNREGISTERED
 
-    if plus_status in (LEGACY_PLUS_QUEUED, LEGACY_PLUS_ACTIVATING):
-        return STAGE_ACTIVATING
     if plus_status == LEGACY_PLUS_ACTIVATED:
         return STAGE_PLUS_ACTIVATED
     if plus_status == LEGACY_PLUS_FAILED:
@@ -287,8 +290,12 @@ def enrich_account(account: dict[str, Any]) -> dict[str, Any]:
     item["type"] = _plan_to_legacy(item["plan"])
     item["status"] = _token_status_to_legacy(str(item["token_status"]))
     item["plus_status"] = _legacy_plus_status(str(item["stage"]), str(item["plan"]))
+    # 保留激活服务直接写入的细粒度进度（排队中 / 激活中 / 激活失败），
+    # 避免仅由 stage+plan 推导时把「激活中」压成「排队中」或冲回「未激活」。
     if raw_plus_status == LEGACY_PLUS_FAILED:
         item["plus_status"] = LEGACY_PLUS_FAILED
+    elif raw_plus_status in (LEGACY_PLUS_QUEUED, LEGACY_PLUS_ACTIVATING):
+        item["plus_status"] = raw_plus_status
     item["plus_attempts"] = dict(item["activation"]["attempts"])
     item["plus_cdk"] = item["activation"].get("cdk")
     item["plus_cdk_type"] = item["activation"].get("cdk_type")

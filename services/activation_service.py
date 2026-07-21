@@ -51,7 +51,7 @@ _TERMINAL_CLS = frozenset({"success", "fail", "cdk_invalid", "timeout", "cancell
 
 
 def is_activation_eligible(account: dict) -> bool:
-    """与 start() → _resolve_targets 默认分支相同的可选中口径。"""
+    """与 start() → _resolve_targets 默认分支相同的可选中口径（尚未入队的 registered 免费号）。"""
     item = enrich_account(account)
     if item.get("stage") in _ACTIVATION_DONE_STAGES:
         return False
@@ -63,6 +63,26 @@ def is_activation_eligible(account: dict) -> bool:
     if item.get("plus_unavailable"):
         return False
     return item.get("stage") == STAGE_REGISTERED and item.get("plan") == PLAN_FREE
+
+
+def can_run_activation(account: dict) -> bool:
+    """单账号激活 worker 放行口径：含本轮已标为 activating 的目标。
+
+    _resolve_targets 入选后会把 stage 写成 activating；worker 再跑时不能再用
+    is_activation_eligible（仅 registered），否则会全部被跳过。
+    """
+    item = enrich_account(account)
+    if item.get("stage") in _ACTIVATION_DONE_STAGES:
+        return False
+    if item.get("plus_activated_at"):
+        return False
+    if item.get("plus_redeem_locked"):
+        return False
+    if item.get("plus_unavailable"):
+        return False
+    if item.get("plan") != PLAN_FREE:
+        return False
+    return item.get("stage") in (STAGE_REGISTERED, STAGE_ACTIVATING)
 
 
 STATUS_UNACTIVATED = "未激活"
@@ -353,15 +373,28 @@ class ActivationService:
                         self._append_log(f"账号 {str(item.get('access_token'))[:8]}… 已标记不可用，已跳过（请先标记可用）", "yellow")
                     continue
                 real = str(item.get("access_token") or "")
-                account_service.update_account(real, apply_stage(item, STAGE_ACTIVATING), quiet=True)
-                result.append(real)
-            return self._cap(result, limit)
-        default = [
-            str(enrich_account(a).get("access_token") or "")
-            for a in accounts
-            if is_activation_eligible(a)
-        ]
-        return self._cap([t for t in default if t], limit)
+                if real:
+                    result.append(real)
+            targets = self._cap(result, limit)
+        else:
+            default = [
+                str(enrich_account(a).get("access_token") or "")
+                for a in accounts
+                if is_activation_eligible(a)
+            ]
+            targets = self._cap([t for t in default if t], limit)
+
+        # 入选后立刻标 stage=activating，供运行监控 /api/accounts?activation=activating 展示。
+        # 须在 cap 之后标记，避免 limit 截掉的账号卡住 activating。
+        for token in targets:
+            acct = by_token.get(token)
+            if not acct:
+                acct = account_service.get_account(token)
+            if not acct:
+                continue
+            item = enrich_account(acct)
+            account_service.update_account(token, apply_stage(item, STAGE_ACTIVATING), quiet=True)
+        return targets
 
     @staticmethod
     def _cap(targets: list[str], limit: int | None) -> list[str]:
@@ -436,9 +469,14 @@ class ActivationService:
         try:
             acct = account_service.get_account(token)
             email = (acct or {}).get("email") or token[:8]
-            if not acct or not is_activation_eligible(enrich_account(acct)):
+            if not acct or not can_run_activation(acct):
                 self._record_skip(email, "不满足激活条件，已跳过", log_sink)
                 return None
+            item = enrich_account(acct)
+            # 自动激活不走 _resolve_targets，须在此标 activating；批量路径已标记则幂等。
+            if item.get("stage") != STAGE_ACTIVATING:
+                account_service.update_account(token, apply_stage(item, STAGE_ACTIVATING), quiet=True)
+                acct = account_service.get_account(token) or acct
             if self._stop.is_set():
                 return False
             return self._activate_account_body(client, token, cfg, acct, email, log_sink, source)
@@ -507,7 +545,18 @@ class ActivationService:
                               plus_last_message=summary)
             acct = account_service.get_account(token)
             if acct:
-                account_service.update_account(token, apply_stage(enrich_account(acct), STAGE_REGISTERED), quiet=True)
+                # 保留失败态 plus_status，同时把 stage 从 activating 收回 registered。
+                account_service.update_account(
+                    token,
+                    apply_stage(
+                        enrich_account(acct),
+                        STAGE_REGISTERED,
+                        plus_status=STATUS_FAILED,
+                        plus_unavailable=any_attempt,
+                        plus_last_message=summary,
+                    ),
+                    quiet=True,
+                )
             if any_attempt:
                 self._append_log(f"[{email}] 两种类型 CDK 均激活失败，标记账号不可用（下轮激活将跳过，可人工标记可用）", "red", log_sink)
             if not audit.finished_at:
@@ -531,11 +580,16 @@ class ActivationService:
             if acct:
                 item = enrich_account(acct)
                 if str(item.get("stage")) == STAGE_ACTIVATING:
-                    patch = apply_stage(item, STAGE_REGISTERED)
+                    # 未到终态就退出时复位 stage；若仍是排队中/激活中则一并清空进度字段。
+                    # clear 必须作为 apply_stage extra，否则 enrich 会按 plus_status 再升格 activating。
+                    clear: dict = {}
                     if item.get("plus_status") in (STATUS_QUEUED, STATUS_ACTIVATING):
-                        patch["plus_status"] = STATUS_UNACTIVATED
-                        patch["plus_cdk"] = None
-                        patch["plus_task_id"] = None
+                        clear = {
+                            "plus_status": STATUS_UNACTIVATED,
+                            "plus_cdk": None,
+                            "plus_task_id": None,
+                        }
+                    patch = apply_stage({**item, **clear}, STAGE_REGISTERED, **clear)
                     account_service.update_account(token, patch, quiet=True)
 
     def _preverify_already_plus(self, token: str, email: str, log_sink, audit) -> tuple[bool, str]:

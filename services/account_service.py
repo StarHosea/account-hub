@@ -176,14 +176,15 @@ class AccountService:
                 self.update_account(token, patch, quiet=True)
                 reset += 1
                 continue
-            patch: dict = {
+            clear: dict = {
                 "plus_status": "未激活",
                 "plus_cdk": None,
                 "plus_task_id": None,
                 "plus_last_message": None,
             }
-            if stuck_stage:
-                patch = apply_stage({**item, **patch}, STAGE_REGISTERED)
+            # plus_status 进行中时 enrich 会优先升格 stage=activating；复位必须把 clear 作为
+            # apply_stage extra 传入，避免二次 enrich 再次被 plus_status 顶回 activating。
+            patch = apply_stage({**item, **clear}, STAGE_REGISTERED, **clear)
             self.update_account(token, patch, quiet=True)
             reset += 1
         return reset

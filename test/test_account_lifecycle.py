@@ -1,6 +1,7 @@
 import unittest
 
 from services.account_lifecycle import (
+    STAGE_ACTIVATING,
     STAGE_PLUS_ACTIVATED,
     STAGE_REGISTERED,
     STAGE_UNREGISTERED,
@@ -41,6 +42,38 @@ class AccountLifecycleTest(unittest.TestCase):
             },
         )
         self.assertFalse(account_in_view(activating, "free"))
+
+    def test_enrich_preserves_in_progress_plus_status_over_registered_stage(self):
+        """激活中写入 plus_status 后，即使 stage 仍为 registered，也应升格为 activating。
+
+        否则运行监控 activation=activating / plus_status 过滤会看不到进行中账号。
+        """
+        queued = enrich_account(
+            {
+                "email": "q@b.com",
+                "access_token": "eyJq",
+                "stage": STAGE_REGISTERED,
+                "plan": "free",
+                "plus_status": "排队中",
+                "plus_last_message": "提交 UPI CDK 兑换",
+            },
+        )
+        self.assertEqual(queued["stage"], STAGE_ACTIVATING)
+        self.assertEqual(queued["plus_status"], "排队中")
+        self.assertEqual(queued["plus_last_message"], "提交 UPI CDK 兑换")
+
+        activating = enrich_account(
+            {
+                "email": "a@b.com",
+                "access_token": "eyJa",
+                "stage": STAGE_REGISTERED,
+                "plan": "free",
+                "plus_status": "激活中",
+                "plus_last_message": "等待充值",
+            },
+        )
+        self.assertEqual(activating["stage"], STAGE_ACTIVATING)
+        self.assertEqual(activating["plus_status"], "激活中")
 
     def test_plus_view_filter(self):
         accounts = [

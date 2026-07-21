@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from services.account_lifecycle import STAGE_ACTIVATING, STAGE_PLUS_ACTIVATED, STAGE_PLUS_REVIEW, STAGE_REGISTERED, enrich_account
-from services.activation_service import ActivationService, is_activation_eligible
+from services.activation_service import ActivationService, can_run_activation, is_activation_eligible
 from services.account_service import AccountService
 from test.test_account_export import MemoryStorage
 
@@ -93,6 +93,20 @@ class ActivationReviewTest(unittest.TestCase):
         self.assertFalse(is_activation_eligible(unavailable))
         self.assertFalse(is_activation_eligible(review))
 
+    def test_can_run_activation_allows_already_marked_activating(self):
+        """入选后 stage=activating 仍应允许 worker 继续跑，不能被 is_activation_eligible 挡掉。"""
+        activating = {
+            "email": "run@x.com",
+            "access_token": "eyJrun",
+            "stage": STAGE_ACTIVATING,
+            "plan": "free",
+            "type": "free",
+            "plus_status": "排队中",
+        }
+        self.assertFalse(is_activation_eligible(activating))
+        self.assertTrue(can_run_activation(activating))
+        self.assertFalse(can_run_activation({**activating, "plus_unavailable": True}))
+
     def test_resolve_targets_skips_activated_accounts(self):
         svc = ActivationService()
         review = {
@@ -114,6 +128,57 @@ class ActivationReviewTest(unittest.TestCase):
             with patch("services.activation_service.account_service.update_account"):
                 targets = svc._resolve_targets(None)
         self.assertEqual(targets, ["eyJfree"])
+
+    def test_resolve_targets_default_marks_stage_activating(self):
+        """批量激活默认路径（无 tokens）须把选中账号标为 activating，运行监控才能查到。"""
+        svc = ActivationService()
+        pending = {
+            "email": "free@x.com",
+            "access_token": "eyJfree",
+            "stage": STAGE_REGISTERED,
+            "plan": "free",
+            "type": "free",
+        }
+        updates: list[tuple[str, dict]] = []
+
+        def _capture_update(token, fields, quiet=False):
+            updates.append((token, dict(fields)))
+            return {**pending, **fields}
+
+        with patch("services.activation_service.account_service.list_accounts", return_value=[pending]):
+            with patch("services.activation_service.account_service.update_account", side_effect=_capture_update):
+                targets = svc._resolve_targets(None, limit=1)
+        self.assertEqual(targets, ["eyJfree"])
+        self.assertTrue(updates, "默认路径应 update_account 标记激活中")
+        token, fields = updates[0]
+        self.assertEqual(token, "eyJfree")
+        self.assertEqual(fields.get("stage"), STAGE_ACTIVATING)
+
+    def test_resolve_targets_limit_only_marks_selected(self):
+        """limit 截取后只标记实际入选账号，避免多余账号卡在 activating。"""
+        svc = ActivationService()
+        accounts = [
+            {
+                "email": f"a{i}@x.com",
+                "access_token": f"eyJ{i}",
+                "stage": STAGE_REGISTERED,
+                "plan": "free",
+                "type": "free",
+            }
+            for i in range(3)
+        ]
+        marked: list[str] = []
+
+        def _capture_update(token, fields, quiet=False):
+            if fields.get("stage") == STAGE_ACTIVATING:
+                marked.append(token)
+            return {**next(a for a in accounts if a["access_token"] == token), **fields}
+
+        with patch("services.activation_service.account_service.list_accounts", return_value=accounts):
+            with patch("services.activation_service.account_service.update_account", side_effect=_capture_update):
+                targets = svc._resolve_targets(None, limit=1)
+        self.assertEqual(targets, ["eyJ0"])
+        self.assertEqual(marked, ["eyJ0"])
 
     def test_reconcile_stuck_activations_resets_stage(self):
         storage = MemoryStorage([

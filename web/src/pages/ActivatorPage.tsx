@@ -414,7 +414,7 @@ export default function ActivatorPage() {
             </Text>
           ) : (
             <Text type="tertiary" size="small" style={{ display: "block", marginTop: 6 }}>
-              并发、轮询间隔、大兜底时长、同卡重试等参数请在
+              并发、轮询间隔、同卡重试等参数请在
               <Link to="/settings#settings-activation" style={{ margin: "0 4px" }}>
                 系统设置 → 激活设置
               </Link>

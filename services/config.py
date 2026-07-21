@@ -200,8 +200,8 @@ class ConfigStore:
             "api_key": str(os.getenv("CDK_API_KEY") or raw.get("api_key") or "").strip(),
             "concurrency": max(1, min(10, int(raw.get("concurrency") or 10))),
             "poll_interval": max(1.0, float(raw.get("poll_interval") or 5.0)),
-            # 单张卡轮询查激活结果的大兜底时长：默认 1h。到点仍无终态（一直 pending）
-            # 转人工核查(review)，不判失败、不换卡。改小只会更早打断长排队的正常兑换。
+            # 历史字段：轮询在接口正常且无明确终态时会一直查状态，不再用时间兜底打断。
+            # 保留配置兼容旧前端/API；服务端 status=timeout 的重试仍走 timeout_retry_max。
             "poll_timeout": max(30.0, float(raw.get("poll_timeout") or 3600.0)),
             "max_attempts_per_type": max(1, int(raw.get("max_attempts_per_type") or 3)),
             # 服务端 timeout：同一张卡重入列重试上限（不计入失败次数），超限转 review。

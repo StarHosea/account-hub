@@ -46,7 +46,7 @@ CDK_TYPES = ("UPI", "IDEL")
 # 已完成 CDK 兑换的 stage，下轮激活不再选中。
 _ACTIVATION_DONE_STAGES = frozenset({STAGE_PLUS_ACTIVATED})
 
-# _attempt 结束轮询的服务端明确终态；其余（pending/unknown）继续轮询直到大兜底。
+# _attempt 结束轮询的服务端明确终态；其余（pending/unknown）在接口无服务异常时一直轮询。
 _TERMINAL_CLS = frozenset({"success", "fail", "cdk_invalid", "timeout", "cancelled"})
 
 
@@ -575,12 +575,13 @@ class ActivationService:
 
           success   —— 兑换成功（已 consume、已置激活）
           next_card —— 该卡不再重试，换下一张卡（失败已计入 attempts / not_found / 重试超上限）
-          review    —— 已受理但未出明确终态，按已激活收尾（timeout 重试超限 / 大兜底到点仍 pending），持久锁已在
+          review    —— 已受理但未出明确终态，按已激活收尾（timeout 重试超限），持久锁已在
           stopped   —— 收到停止信号
 
-        重试策略：timeout（服务端超时/长时间无终态）走 /cdkey-jobs/retry 复用同卡、不计失败次数、
+        重试策略：timeout（服务端返回 timeout 终态）走 /cdkey-jobs/retry 复用同卡、不计失败次数、
         上限 timeout_retry_max；failed 走 retry 复用同卡、上限 failed_retry_max，用尽才换卡并计入
-        max_attempts_per_type。任一次被服务端受理即打 plus_redeem_locked 持久锁，杜绝重复烧卡。
+        max_attempts_per_type。轮询阶段接口正常且未出终态时会一直查状态，不因时间兜底报错。
+        任一次被服务端受理即打 plus_redeem_locked 持久锁，杜绝重复烧卡。
         """
         timeout_retry_max = int(cfg.get("timeout_retry_max", 5))
         failed_retry_max = int(cfg.get("failed_retry_max", 3))
@@ -662,11 +663,9 @@ class ActivationService:
                         f"[{email}] {cdk_type} 超时重试已达上限（{timeout_retry_max}），已标记为已激活", "yellow", log_sink)
                     return "review"
 
-                if cls == "poll_exhausted":
-                    if self._stop.is_set():
-                        return "stopped"
-                    self._append_log(f"[{email}] {cdk_type} 轮询大兜底到点仍无终态，已标记为已激活", "yellow", log_sink)
-                    return "review"
+                if cls == "poll_stopped":
+                    # 任务被停止：轮询未等到终态，不判失败、不标激活，释放占用后由上层收尾。
+                    return "stopped"
 
                 if cls in ("cancelled", "retry_rejected"):
                     # 任务已取消 / 服务端拒绝重试：retry 不可复用，回退重新 submit 同卡（受 failed 上限保护）。
@@ -740,12 +739,15 @@ class ActivationService:
 
         返回 (cls, status, message, task_id)，cls 取值：
           - success / fail / timeout / cdk_invalid / cancelled —— 服务端明确状态（见 classify）
-          - poll_exhausted —— 轮询到 poll_timeout 大兜底仍未出终态（一直 pending），应转人工核查
+          - poll_stopped —— 任务停止信号打断轮询（未等到终态）
           - rejected —— 提交未被受理（信封 code!=0 等硬错误），任务可能未建，调用方回退重新 submit
           - retry_rejected —— action=retry 但服务端未受理重试（retried=false），调用方回退重新 submit
 
         判定以「响应里该 CDK 对应的 item.status」为准，忽略外层信封成功码；仅当响应里完全没有该项时，
         才回退用信封 code 判硬错误。timeout/cancelled 现为独立终态（不再混入 fail），交由上层原地重试。
+
+        轮询策略：接口无服务异常且未查到成功/失败等明确终态时，按 poll_interval 一直查，
+        不因 poll_timeout 时间兜底报错或提前收尾（长排队兑换可等任意久）。
         """
         if action == "retry":
             js = client.retry(
@@ -782,12 +784,15 @@ class ActivationService:
                 if code not in (None, 0):
                     return "rejected", f"code={code}", cdk_redeem_client.env_msg(js) or "envelope code!=0", ""
 
-        deadline = time.time() + float(cfg["poll_timeout"])
         interval = float(cfg["poll_interval"])
+        # 心跳日志：避免无限轮询时日志完全静默；默认约每 60 次或至少 5 分钟打一次。
+        heartbeat_every = max(1, int(300.0 / max(interval, 0.01)))
         last_js: object = js_for_poll
         polled = 0
-        while time.time() < deadline and not self._stop.is_set():
+        while not self._stop.is_set():
             time.sleep(interval)
+            if self._stop.is_set():
+                break
             poll_seq = polled + 1
             sjs = client.query_status(
                 [cdk],
@@ -802,6 +807,12 @@ class ActivationService:
             sit = item_for_cdk(sjs, cdk)
             if polled == 1:
                 self._log_raw(cdk, "status#1", sjs, log_sink)
+            elif polled % heartbeat_every == 0:
+                self._append_log(
+                    f"[{scrub(cdk)}] 仍在轮询状态（第 {polled} 次，当前 {status or 'pending'}）",
+                    "",
+                    log_sink,
+                )
             if sit is not None:
                 status = item_status(sit)
                 self._reflect_progress(token, sit)
@@ -810,10 +821,9 @@ class ActivationService:
                     if polled != 1:
                         self._log_raw(cdk, f"status(final,{status or '空'})", sjs, log_sink)
                     return cls, status, item_message(sit), item_task_id(sit) or task_id
-            # sit 为空：可能完成后已从队列消失，也可能仍在处理；继续轮询直到大兜底。
-        # 到点仍未出终态（一直 pending）或被停止：不判失败、不换卡，交上层转人工核查。
-        self._log_raw(cdk, "poll_exhausted", last_js, log_sink)
-        return "poll_exhausted", status or "pending", "轮询大兜底到点仍未出终态（仍在排队/处理）", task_id
+            # sit 为空或非终态：接口正常则继续等，不因时间兜底报错。
+        self._log_raw(cdk, "poll_stopped", last_js, log_sink)
+        return "poll_stopped", status or "pending", "激活任务已停止，轮询未等到终态", task_id
 
     def _reflect_progress(self, token: str, it: dict | None) -> None:
         if not isinstance(it, dict):

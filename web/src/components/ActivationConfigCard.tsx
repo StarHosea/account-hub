@@ -172,15 +172,15 @@ export default function ActivationConfigCard({ registerRunning = false }: { regi
             style={{ width: "100%" }}
           />
         </Field>
-        <Tooltip content="单张 CDK 持续查状态的最长等待；到点仍无终态则转人工核查，不判失败、不换卡">
+        <Tooltip content="接口正常且未出成功/失败终态时会一直轮询，不再按小时打断；此配置仅保留兼容，当前不生效">
           <div>
-            <Field label="轮询大兜底（小时）" hint="默认 1 小时；改小会过早打断长排队兑换">
+            <Field label="轮询大兜底（小时，已停用）" hint="健康响应会一直等到终态，不再超时收尾">
               <InputNumber
                 min={1}
                 max={72}
                 value={pollTimeoutHours}
                 onChange={(v) => setActivationField("poll_timeout", String((Number(v) || 1) * 3600))}
-                disabled={disabled}
+                disabled
                 style={{ width: "100%" }}
               />
             </Field>

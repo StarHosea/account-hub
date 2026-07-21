@@ -184,24 +184,50 @@ class AttemptResponseTest(unittest.TestCase):
         cls, _, _, _ = self._attempt(client)
         self.assertEqual(cls, "cdk_invalid")
 
-    def test_submit_pending_poll_timeout(self) -> None:
+    def test_submit_pending_keeps_polling_until_success(self) -> None:
+        """接口正常且一直 pending 时不因时间兜底报错，等到 success 才结束。"""
         client = MockRedeemClient(
             _item_response(self.cdk, "running"),
-            [_item_response(self.cdk, "running")] * 20,
+            [_item_response(self.cdk, "running")] * 8
+            + [_item_response(self.cdk, "success", message="done")],
         )
         cls, st, msg, _ = self._attempt(client)
-        self.assertEqual(cls, "poll_exhausted")
-        self.assertEqual(st, "running")
-        self.assertIn("大兜底", msg)
+        self.assertEqual(cls, "success")
+        self.assertEqual(st, "success")
+        self.assertEqual(msg, "done")
+        self.assertGreaterEqual(client.poll_calls, 9)
 
-    def test_submit_unknown_then_poll_timeout(self) -> None:
+    def test_submit_unknown_keeps_polling_until_success(self) -> None:
         client = MockRedeemClient(
             _item_response(self.cdk, "weird_state"),
-            [_item_response(self.cdk, "weird_state")] * 20,
+            [_item_response(self.cdk, "weird_state")] * 5
+            + [_item_response(self.cdk, "success")],
         )
-        cls, _, msg, _ = self._attempt(client)
-        self.assertEqual(cls, "poll_exhausted")
-        self.assertIn("大兜底", msg)
+        cls, _, _, _ = self._attempt(client)
+        self.assertEqual(cls, "success")
+        self.assertGreaterEqual(client.poll_calls, 6)
+
+    def test_poll_stops_on_stop_signal(self) -> None:
+        """仅在任务停止时结束轮询（不因时间兜底）。"""
+        import threading
+        import time
+
+        client = MockRedeemClient(
+            _item_response(self.cdk, "pending_dispatch"),
+            [_item_response(self.cdk, "pending_dispatch")] * 200,
+        )
+        self.svc._stop.clear()
+
+        def _stop_soon() -> None:
+            time.sleep(0.04)
+            self.svc._stop.set()
+
+        threading.Thread(target=_stop_soon, daemon=True).start()
+        cls, st, msg, _ = self._attempt(client)
+        self.assertEqual(cls, "poll_stopped")
+        self.assertEqual(st, "pending_dispatch")
+        self.assertIn("停止", msg)
+        self.svc._stop.clear()
 
     def test_envelope_error_without_item_is_fail(self) -> None:
         client = MockRedeemClient(_envelope_only(500, "internal error"))
@@ -221,14 +247,16 @@ class AttemptResponseTest(unittest.TestCase):
         self.assertEqual(cls, "success")
         self.assertGreaterEqual(client.poll_calls, 1)
 
-    def test_submit_missing_item_disappears_until_timeout(self) -> None:
+    def test_submit_missing_item_keeps_polling_until_success(self) -> None:
+        """status 短暂查不到 item 时不报错，继续轮询直到终态。"""
         client = MockRedeemClient(
             _item_response(self.cdk, "queued"),
-            [None, {"code": 0, "data": {"items": []}}] * 10,
+            [None, {"code": 0, "data": {"items": []}}] * 3
+            + [_item_response(self.cdk, "success", message="reappeared")],
         )
         cls, _, msg, _ = self._attempt(client)
-        self.assertEqual(cls, "poll_exhausted")
-        self.assertIn("大兜底", msg)
+        self.assertEqual(cls, "success")
+        self.assertEqual(msg, "reappeared")
 
     def test_redeem_error_on_submit(self) -> None:
         client = MockRedeemClient(RedeemError("network down"))
@@ -311,15 +339,28 @@ class ActivateAccountCdkDispositionTest(unittest.TestCase):
         self.mark_invalid.assert_not_called()
         self.assertGreaterEqual(self.release.call_count, 1)
 
-    def test_poll_timeout_releases(self) -> None:
+    def test_poll_then_fail_releases(self) -> None:
+        """长时间 pending 后失败：不 consume，release CDK。"""
         client = MockRedeemClient(
             _item_response(self.cdk, "running"),
-            [_item_response(self.cdk, "running")] * 20,
+            [_item_response(self.cdk, "running")] * 5
+            + [_item_response(self.cdk, "failed", message="later fail")],
         )
         self.assertFalse(self._run_activate(client))
         self.consume.assert_not_called()
         self.mark_invalid.assert_not_called()
         self.assertGreaterEqual(self.release.call_count, 1)
+
+    def test_long_pending_then_success_consumes(self) -> None:
+        """接口正常 pending 再久也会等到 success 并 consume。"""
+        client = MockRedeemClient(
+            _item_response(self.cdk, "pending_dispatch"),
+            [_item_response(self.cdk, "pending_dispatch")] * 6
+            + [_item_response(self.cdk, "success")],
+        )
+        self.assertTrue(self._run_activate(client))
+        self.consume.assert_called_once_with(self.cdk, self.token)
+        self.release.assert_not_called()
 
     def test_envelope_error_releases(self) -> None:
         client = MockRedeemClient(_envelope_only(403, "forbidden"))
@@ -428,10 +469,11 @@ class ActivationOccupationLeakTest(unittest.TestCase):
         self._assert_no_occupation()
         self.assertEqual(self.cdk_svc._cdks["CDK-LEASE"]["status"], STATUS_AVAILABLE)
 
-    def test_poll_timeout_releases_cdk_reservation(self) -> None:
+    def test_poll_then_fail_releases_cdk_reservation(self) -> None:
         client = MockRedeemClient(
             _item_response("CDK-LEASE", "running"),
-            [_item_response("CDK-LEASE", "running")] * 20,
+            [_item_response("CDK-LEASE", "running")] * 4
+            + [_item_response("CDK-LEASE", "failed")],
         )
         self.assertFalse(self._activate(client))
         self._assert_no_occupation()

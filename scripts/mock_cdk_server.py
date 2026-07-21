@@ -13,7 +13,7 @@
 按 cdkey 关键字（大小写不敏感）指定测试结果，方便覆盖各分支：
   含 "INVALID"/"BAD"/"NOTFOUND" → 提交即返回 not_found（客户端应标记该 CDK 无效并换下一张）
   含 "FAIL"                     → 最终 failed
-  含 "TIMEOUT"                  → 卡在 running 永不终态（客户端应轮询到 poll_timeout 判超时）
+  含 "TIMEOUT"                  → 卡在 running 永不终态（客户端会一直轮询直到终态或任务停止）
   含 "SLOW"                     → 排队更久后 success
   其它                          → success
 

@@ -67,12 +67,23 @@ COPY scripts ./scripts
 COPY --from=web-build /app/web/dist ./web_dist
 
 # CloakBrowser 浏览器注册引擎：安装 Node 依赖并在构建期预下载 stealth Chromium（~200MB），
-# 避免容器首次注册时才现场下载导致长时间阻塞/超时。若下载需授权，构建时传入：
+# 避免容器首次注册时才现场下载导致长时间阻塞/超时。
+#
+# 生产默认拉 cloakbrowser@latest（wrapper + 对应二进制），避免镜像长期锁在 package-lock 旧版。
+# 本地可复现构建：
+#   docker build --build-arg CLOAKBROWSER_UPDATE_LATEST=false ...
+# 授权下载：
 #   docker build --build-arg CLOAKBROWSER_LICENSE_KEY=xxxx ...
+# CI 应传入 CLOAKBROWSER_CACHEBUST（如 github.run_id）打散缓存，否则 @latest 层可能永不刷新。
 ARG CLOAKBROWSER_LICENSE_KEY=""
+ARG CLOAKBROWSER_UPDATE_LATEST=true
+ARG CLOAKBROWSER_CACHEBUST=0
 COPY node_engine ./node_engine
 RUN cd node_engine \
     && npm install --omit=dev --no-audit --no-fund \
+    && CLOAKBROWSER_UPDATE_LATEST="$CLOAKBROWSER_UPDATE_LATEST" \
+       CLOAKBROWSER_CACHEBUST="$CLOAKBROWSER_CACHEBUST" \
+       sh scripts/ensure-cloakbrowser-version.sh \
     && CLOAKBROWSER_LICENSE_KEY="$CLOAKBROWSER_LICENSE_KEY" node scripts/install-binary.js
 
 EXPOSE 80

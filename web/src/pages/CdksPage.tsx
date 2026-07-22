@@ -207,8 +207,8 @@ export default function CdksPage() {
               {c.bound_account.email}
             </Text>
           </Button>
-        ) : c.bound_token ? (
-          <Text type="tertiary">{maskCdk(c.bound_token)}（账号已删除）</Text>
+        ) : c.bound_email || c.bound_token ? (
+          <Text type="tertiary">{c.bound_email || maskCdk(c.bound_token || "")}（账号已删除）</Text>
         ) : (
           <Text type="tertiary">—</Text>
         ),
@@ -536,9 +536,9 @@ function CdkMobileList({
                       {c.bound_account.email}
                     </Text>
                   </Button>
-                ) : c.bound_token ? (
+                ) : c.bound_email || c.bound_token ? (
                   <Text type="tertiary" style={{ flex: 1 }}>
-                    {maskCdk(c.bound_token)}（账号已删除）
+                    {c.bound_email || maskCdk(c.bound_token || "")}（账号已删除）
                   </Text>
                 ) : (
                   <Text type="tertiary" style={{ flex: 1 }}>

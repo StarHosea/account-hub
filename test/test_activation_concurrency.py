@@ -47,11 +47,12 @@ class ActivationConcurrencyTest(unittest.TestCase):
             "services.activation_service.account_service",
             get_account=MagicMock(return_value=self.acct),
             update_account=MagicMock(return_value=self.acct),
+            apply_stage_update=MagicMock(return_value=self.acct),
         )
 
     def _patch_preverify(self, token: str | None = None):
         tok = token or self.token
-        return patch.object(self.svc, "_preverify_already_plus", return_value=(False, tok))
+        return patch.object(self.svc, "_preverify_already_plus", return_value=(False, tok, True))
 
     def test_duplicate_claim_rejects_second_caller(self) -> None:
         email_key = _norm_email("concurrent@x.com")
@@ -200,16 +201,17 @@ class ActivationConcurrencyTest(unittest.TestCase):
         with patch("services.activation_service.CdkRedeemClient", return_value=self.client):
             with patch("services.activation_service.account_service.get_account", return_value=acct):
                 with patch("services.activation_service.account_service.update_account", return_value=acct):
-                    with self._patch_preverify("eyJ-a"):
-                        with patch("services.activation_service.cdk_service.acquire_available", return_value="CDK-1"):
-                            with patch("services.activation_service.cdk_service.consume"):
-                                with patch("services.activation_service.cdk_service.release"):
-                                    with patch.object(self.svc, "_attempt", side_effect=_blocking_attempt):
-                                        t = threading.Thread(target=self.svc._run, args=(targets, cfg))
-                                        t.start()
-                                        self.assertTrue(gate.wait(timeout=5))
-                                        release.set()
-                                        t.join(timeout=5)
+                    with patch("services.activation_service.account_service.apply_stage_update", return_value=acct):
+                        with self._patch_preverify("eyJ-a"):
+                            with patch("services.activation_service.cdk_service.acquire_available", return_value="CDK-1"):
+                                with patch("services.activation_service.cdk_service.consume"):
+                                    with patch("services.activation_service.cdk_service.release"):
+                                        with patch.object(self.svc, "_attempt", side_effect=_blocking_attempt):
+                                            t = threading.Thread(target=self.svc._run, args=(targets, cfg))
+                                            t.start()
+                                            self.assertTrue(gate.wait(timeout=5))
+                                            release.set()
+                                            t.join(timeout=5)
 
         stats = self.svc.get()["stats"]
         self.assertEqual(stats["success"], 1)
@@ -241,19 +243,20 @@ class ActivationConcurrencyTest(unittest.TestCase):
 
         with patch("services.activation_service.account_service.get_account", side_effect=_get_account):
             with patch("services.activation_service.account_service.update_account", side_effect=lambda t, u, quiet=False: _get_account(t)):
-                with self._patch_preverify(token_old):
-                    with patch("services.activation_service.cdk_service.acquire_available", side_effect=["CDK-A", None]):
-                        with patch("services.activation_service.cdk_service.release"):
-                            with patch.object(self.svc, "_attempt", side_effect=_blocking_attempt):
-                                t1 = threading.Thread(target=_run, args=(token_old,))
-                                t1.start()
-                                self.assertTrue(gate.wait(timeout=5))
-                                t2 = threading.Thread(target=_run, args=(token_new,))
-                                t2.start()
-                                time.sleep(0.05)
-                                release.set()
-                                t1.join(timeout=5)
-                                t2.join(timeout=5)
+                with patch("services.activation_service.account_service.apply_stage_update", side_effect=lambda t, s, **e: _get_account(t)):
+                    with self._patch_preverify(token_old):
+                        with patch("services.activation_service.cdk_service.acquire_available", side_effect=["CDK-A", None]):
+                            with patch("services.activation_service.cdk_service.release"):
+                                with patch.object(self.svc, "_attempt", side_effect=_blocking_attempt):
+                                    t1 = threading.Thread(target=_run, args=(token_old,))
+                                    t1.start()
+                                    self.assertTrue(gate.wait(timeout=5))
+                                    t2 = threading.Thread(target=_run, args=(token_new,))
+                                    t2.start()
+                                    time.sleep(0.05)
+                                    release.set()
+                                    t1.join(timeout=5)
+                                    t2.join(timeout=5)
 
         self.assertEqual(submit_calls, ["CDK-A"])
         self.assertEqual(sum(1 for r in results if r is None), 1)

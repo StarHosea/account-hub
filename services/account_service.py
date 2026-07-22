@@ -13,6 +13,8 @@ from typing import Any
 
 from services.account_lifecycle import (
     PLAN_FREE,
+    PLAN_PLUS,
+    STAGE_PLUS_ACTIVATED,
     STAGE_PLUS_REVIEW,
     STAGE_REGISTERING,
     STAGE_REGISTERED,
@@ -149,7 +151,7 @@ class AccountService:
         不动 plus_unavailable 及「已激活/激活失败」终态。同时把 stage 从 activating 复位为 registered。
         返回复位数量。
         """
-        from services.account_lifecycle import PLAN_PLUS, STAGE_ACTIVATING, STAGE_PLUS_ACTIVATED, STAGE_REGISTERED, apply_stage, enrich_account
+        from services.account_lifecycle import STAGE_ACTIVATING, STAGE_REGISTERED, apply_stage, enrich_account
 
         reset = 0
         for acct in self.list_accounts():
@@ -166,13 +168,17 @@ class AccountService:
             if not stuck_plus and not stuck_stage:
                 continue
             if item.get("plus_redeem_locked"):
-                # 重启前已提交并被服务端受理过 CDK：按已激活保留，避免重复烧卡。
-                patch = apply_stage(
-                    {**item, "plus_last_message": "重启前已提交 CDK，已标记为已激活"},
-                    STAGE_PLUS_ACTIVATED,
-                    plan=PLAN_PLUS,
-                    activated_at=item.get("activated_at") or item.get("plus_activated_at") or None,
-                )
+                # 重启前已提交且可能被服务端受理过 CDK：结局未知，不再乐观标「已激活」
+                # （曾出现明确失败的卡也被打过锁，直接标成功会造成假激活）。
+                # 复位为未激活但保留 redeem 锁：下轮激活会先做档位预检（preverify），
+                # 真成功的自动转正为已激活；未确认的因有锁不会再烧第二张卡。
+                clear = {
+                    "plus_status": "未激活",
+                    "plus_cdk": None,
+                    "plus_task_id": None,
+                    "plus_last_message": "重启中断：CDK 曾提交，待激活预检核实真实档位",
+                }
+                patch = apply_stage({**item, **clear}, STAGE_REGISTERED, **clear)
                 self.update_account(token, patch, quiet=True)
                 reset += 1
                 continue
@@ -443,7 +449,7 @@ class AccountService:
         normalized["last_token_rotate_error"] = normalized.get("last_token_rotate_error") or None
         normalized["last_token_rotate_error_at"] = normalized.get("last_token_rotate_error_at") or None
         # 激活不可用标记：某邮箱账号两种类型 CDK 均连续激活失败后置位，下轮激活自动跳过，
-        # 直到人工「标记可用」重置。与 plus_status 分离，保证重置后仍持久生效。
+        # 直到用「撤销激活」复位。与 plus_status 分离，保证重置后仍持久生效。
         normalized["plus_unavailable"] = bool(normalized.get("plus_unavailable"))
         return enrich_account(normalized)
 
@@ -1622,9 +1628,13 @@ class AccountService:
         return {"updated": updated, "items": self.list_accounts()}
 
     def revoke_activation(self, tokens: list[str], *, revoke_cdk: bool = True) -> dict:
-        """撤销激活：将 plus_review 账号复位为免费已注册态，重新进入激活队列。
+        """撤销激活：将已激活（plus_activated）账号复位为免费已注册态，重新进入激活队列。
 
-        revoke_cdk=True 时同步把绑定的 CDK 从 used/invalid 复位为 available。
+        这是错标「已激活」（乐观标记 / 程序异常）唯一的人工纠正入口：同时清除
+        plus_redeem_locked / plus_unavailable 与激活进度字段。对 registered 但带激活残留
+        （redeem 锁 / 不可用标记）的账号同样生效——否则这类账号（如锁定后核实非 Plus 被
+        标不可用的）没有任何人工恢复路径。revoke_cdk=True 时同步把绑定的 CDK 从
+        used/invalid 复位为 available。
         """
         from services.cdk_service import cdk_service
 
@@ -1643,7 +1653,9 @@ class AccountService:
                     skipped += 1
                     continue
                 item = enrich_account(current)
-                if str(item.get("stage") or "") != STAGE_PLUS_REVIEW:
+                stage = str(item.get("stage") or "")
+                has_residue = bool(item.get("plus_redeem_locked") or item.get("plus_unavailable"))
+                if stage != STAGE_PLUS_ACTIVATED and not (stage == STAGE_REGISTERED and has_residue):
                     skipped += 1
                     continue
                 cdk = str((item.get("activation") or {}).get("cdk") or item.get("plus_cdk") or "").strip()
@@ -1696,6 +1708,25 @@ class AccountService:
             "items": self.list_accounts(),
         }
 
+    @staticmethod
+    def _sync_plan_with_type(current: dict, updates: dict) -> dict:
+        """写 type 未写 plan 时联动 plan，使远端刷新 / 手动改类型能真实生效。
+
+        enrich 推导里 plan 一旦存在就优先于 type（type 会被 plan 反写），因此仅带 type
+        的更新（fetch_remote_info、账号管理手动改类型）会被旧 plan 静默顶回。联动规则：
+        - type=plus → plan=plus（升级方向总是安全：远端说是 Plus 就是 Plus）；
+        - type=其他 → 仅当账号未处于 plus_activated 时降 plan=free。已激活账号可能只是
+          远端 Plus 生效延迟，降级必须走「撤销激活」或激活核实流程，不能被一次刷新打回。
+        """
+        if "type" not in updates or "plan" in updates:
+            return updates
+        new_type = str(updates.get("type") or "").strip().lower()
+        if new_type == "plus":
+            return {**updates, "plan": PLAN_PLUS}
+        if str(current.get("stage") or "") == STAGE_PLUS_ACTIVATED:
+            return updates
+        return {**updates, "plan": PLAN_FREE}
+
     def update_account(self, access_token: str, updates: dict, quiet: bool = False) -> dict | None:
         if not access_token:
             return None
@@ -1705,6 +1736,7 @@ class AccountService:
             if current is None:
                 return None
             stored_token = str(current.get("access_token") or storage_key).strip()
+            updates = self._sync_plan_with_type(current, updates)
             account = self._normalize_account({**current, **updates, "access_token": stored_token})
             if account is None:
                 return None
@@ -1725,6 +1757,35 @@ class AccountService:
                                 {"token": anonymize_token(stored_token), "status": account.get("status")})
             return dict(account)
         return None
+
+    def apply_stage_update(self, access_token: str, stage: str, **extra) -> dict | None:
+        """锁内原子完成「读取 → apply_stage → 写回」，激活引擎的终态迁移专用。
+
+        此前激活链路用「get_account → apply_stage → update_account(全字段快照)」三步：
+        读写间隙其他线程的更新会被旧快照覆盖；且分两次 update 时，第一步写入的
+        plus_status=已激活 会在 stage 尚未升级时被 enrich 推导冲回「排队中」，进程恰好
+        在两步之间中断就会把已成功的账号复位成免费号。改为单次锁内写彻底消除该窗口。
+        """
+        if not access_token:
+            return None
+        with self._lock:
+            storage_key = self._resolve_storage_key_locked(access_token)
+            current = self._accounts.get(storage_key) if storage_key else None
+            if current is None:
+                return None
+            stored_token = str(current.get("access_token") or storage_key).strip()
+            patched = apply_stage(dict(current), stage, **extra)
+            account = self._normalize_account({**patched, "access_token": stored_token})
+            if account is None:
+                return None
+            next_key = self._account_dict_key(account)
+            if not next_key:
+                return None
+            if next_key != storage_key:
+                self._accounts.pop(storage_key, None)
+            self._accounts[next_key] = account
+            self._save_accounts()
+            return dict(account)
 
     def _record_refresh_success(self, access_token: str) -> None:
         with self._lock:

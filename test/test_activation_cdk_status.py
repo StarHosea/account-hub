@@ -283,11 +283,13 @@ class ActivateAccountCdkDispositionTest(unittest.TestCase):
 
         with patch("services.activation_service.account_service.get_account", return_value=self.acct):
             with patch("services.activation_service.account_service.update_account", return_value=self.acct):
-                with patch("services.activation_service.cdk_service.acquire_available", side_effect=_acquire):
-                    with patch("services.activation_service.cdk_service.consume") as consume:
-                        with patch("services.activation_service.cdk_service.release") as release:
-                            with patch("services.activation_service.cdk_service.mark_invalid") as mark_invalid:
-                                result = self.svc._activate_account(client, self.token, self.cfg)
+                with patch("services.activation_service.account_service.apply_stage_update", return_value=self.acct):
+                    with patch.object(self.svc, "_preverify_already_plus", return_value=(False, self.token, True)):
+                        with patch("services.activation_service.cdk_service.acquire_available", side_effect=_acquire):
+                            with patch("services.activation_service.cdk_service.consume") as consume:
+                                with patch("services.activation_service.cdk_service.release") as release:
+                                    with patch("services.activation_service.cdk_service.mark_invalid") as mark_invalid:
+                                        result = self.svc._activate_account(client, self.token, self.cfg)
         self.consume = consume
         self.release = release
         self.mark_invalid = mark_invalid
@@ -296,7 +298,7 @@ class ActivateAccountCdkDispositionTest(unittest.TestCase):
     def test_success_consumes_cdk_once(self) -> None:
         client = MockRedeemClient(_item_response(self.cdk, "success"))
         self.assertTrue(self._run_activate(client))
-        self.consume.assert_called_once_with(self.cdk, self.token)
+        self.consume.assert_called_once_with(self.cdk, self.token, email="status@x.com")
         self.release.assert_not_called()
         self.mark_invalid.assert_not_called()
 
@@ -326,7 +328,7 @@ class ActivateAccountCdkDispositionTest(unittest.TestCase):
             [_item_response(self.cdk, "success")],
         )
         self.assertTrue(self._run_activate(client))
-        self.consume.assert_called_once_with(self.cdk, self.token)
+        self.consume.assert_called_once_with(self.cdk, self.token, email="status@x.com")
         self.release.assert_not_called()
 
     def test_pending_fail_on_poll_releases(self) -> None:
@@ -359,7 +361,7 @@ class ActivateAccountCdkDispositionTest(unittest.TestCase):
             + [_item_response(self.cdk, "success")],
         )
         self.assertTrue(self._run_activate(client))
-        self.consume.assert_called_once_with(self.cdk, self.token)
+        self.consume.assert_called_once_with(self.cdk, self.token, email="status@x.com")
         self.release.assert_not_called()
 
     def test_envelope_error_releases(self) -> None:
@@ -379,11 +381,13 @@ class ActivateAccountCdkDispositionTest(unittest.TestCase):
 
         with patch("services.activation_service.account_service.get_account", return_value=self.acct):
             with patch("services.activation_service.account_service.update_account", return_value=self.acct):
-                with patch("services.activation_service.cdk_service.acquire_available", side_effect=_acquire):
-                    with patch("services.activation_service.cdk_service.consume") as consume:
-                        with patch("services.activation_service.cdk_service.release") as release:
-                            with patch("services.activation_service.cdk_service.mark_invalid") as mark_invalid:
-                                result = self.svc._activate_account(client, self.token, self.cfg)
+                with patch("services.activation_service.account_service.apply_stage_update", return_value=self.acct):
+                    with patch.object(self.svc, "_preverify_already_plus", return_value=(False, self.token, True)):
+                        with patch("services.activation_service.cdk_service.acquire_available", side_effect=_acquire):
+                            with patch("services.activation_service.cdk_service.consume") as consume:
+                                with patch("services.activation_service.cdk_service.release") as release:
+                                    with patch("services.activation_service.cdk_service.mark_invalid") as mark_invalid:
+                                        result = self.svc._activate_account(client, self.token, self.cfg)
         self.assertFalse(result)
         consume.assert_not_called()
         mark_invalid.assert_not_called()
@@ -402,18 +406,20 @@ class ActivateAccountCdkDispositionTest(unittest.TestCase):
 
         with patch("services.activation_service.account_service.get_account", return_value=self.acct):
             with patch("services.activation_service.account_service.update_account", return_value=self.acct):
-                with patch(
-                    "services.activation_service.cdk_service.acquire_available",
-                    side_effect=[cdk_fail, cdk_ok, None],
-                ):
-                    with patch("services.activation_service.cdk_service.consume") as consume:
-                        with patch("services.activation_service.cdk_service.release") as release:
-                            with patch("services.activation_service.cdk_service.mark_invalid"):
-                                with patch.object(self.svc, "_attempt", side_effect=_attempt_side_effect):
-                                    result = self.svc._activate_account(MagicMock(), self.token, cfg)
+                with patch("services.activation_service.account_service.apply_stage_update", return_value=self.acct):
+                    with patch.object(self.svc, "_preverify_already_plus", return_value=(False, self.token, True)):
+                        with patch(
+                            "services.activation_service.cdk_service.acquire_available",
+                            side_effect=[cdk_fail, cdk_ok, None],
+                        ):
+                            with patch("services.activation_service.cdk_service.consume") as consume:
+                                with patch("services.activation_service.cdk_service.release") as release:
+                                    with patch("services.activation_service.cdk_service.mark_invalid"):
+                                        with patch.object(self.svc, "_attempt", side_effect=_attempt_side_effect):
+                                            result = self.svc._activate_account(MagicMock(), self.token, cfg)
         self.assertTrue(result)
         release.assert_called_once_with(cdk_fail)
-        consume.assert_called_once_with(cdk_ok, self.token)
+        consume.assert_called_once_with(cdk_ok, self.token, email="status@x.com")
 
 
 def _make_isolated_cdk_service(*cdks: tuple[str, str]) -> CdkService:
@@ -457,7 +463,9 @@ class ActivationOccupationLeakTest(unittest.TestCase):
         with patch("services.activation_service.cdk_service", self.cdk_svc):
             with patch("services.activation_service.account_service.get_account", return_value=self.acct):
                 with patch("services.activation_service.account_service.update_account", return_value=self.acct):
-                    return self.svc._activate_account(client, self.token, self.cfg)
+                    with patch("services.activation_service.account_service.apply_stage_update", return_value=self.acct):
+                        with patch.object(self.svc, "_preverify_already_plus", return_value=(False, self.token, True)):
+                            return self.svc._activate_account(client, self.token, self.cfg)
 
     def _assert_no_occupation(self) -> None:
         self.assertEqual(self.svc.get()["stats"]["claiming"], 0)
@@ -496,8 +504,10 @@ class ActivationOccupationLeakTest(unittest.TestCase):
         with patch("services.activation_service.cdk_service", self.cdk_svc):
             with patch("services.activation_service.account_service.get_account", return_value=self.acct):
                 with patch("services.activation_service.account_service.update_account", return_value=self.acct):
-                    with self.assertRaises(AuthError):
-                        self.svc._activate_account(client, self.token, self.cfg)
+                    with patch("services.activation_service.account_service.apply_stage_update", return_value=self.acct):
+                        with patch.object(self.svc, "_preverify_already_plus", return_value=(False, self.token, True)):
+                            with self.assertRaises(AuthError):
+                                self.svc._activate_account(client, self.token, self.cfg)
         self._assert_no_occupation()
         self.assertEqual(self.cdk_svc._cdks["CDK-LEASE"]["status"], STATUS_AVAILABLE)
 
@@ -525,7 +535,9 @@ class ActivationOccupationLeakTest(unittest.TestCase):
                 with patch("services.activation_service.cdk_service", cdk_svc):
                     with patch("services.activation_service.account_service.get_account", return_value=self.acct):
                         with patch("services.activation_service.account_service.update_account", return_value=self.acct):
-                            self.assertFalse(self.svc._activate_account(client, self.token, self.cfg))
+                            with patch("services.activation_service.account_service.apply_stage_update", return_value=self.acct):
+                                with patch.object(self.svc, "_preverify_already_plus", return_value=(False, self.token, True)):
+                                    self.assertFalse(self.svc._activate_account(client, self.token, self.cfg))
                 self.assertEqual(len(cdk_svc._reserved), 0)
                 self.assertEqual(cdk_svc._cdks["CDK-F"]["status"], STATUS_AVAILABLE)
                 self.assertEqual(self.svc.get()["stats"]["claiming"], 0)

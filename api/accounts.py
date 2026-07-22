@@ -479,7 +479,8 @@ def create_router() -> APIRouter:
 
     @router.post("/api/accounts/revoke-activation")
     async def revoke_activation(body: AccountRevokeActivationRequest, authorization: str | None = Header(default=None)):
-        """撤销激活：将 plus_review 账号复位为免费可激活态，可选同步撤销 CDK 使用。"""
+        """撤销激活：将已激活（plus_activated）账号复位为免费可激活态（清 redeem 锁/不可用标记），
+        可选同步撤销 CDK 使用。错标「已激活」的人工纠正入口。"""
         require_admin(authorization)
         tokens = _unique_tokens(body.access_tokens)
         if not tokens:

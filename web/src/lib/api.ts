@@ -91,7 +91,7 @@ export type Account = {
   plus_last_message?: string | null;
   plus_updated_at?: string | null;
   last_activation_audit_id?: string | null;
-  // 激活不可用标记：两种类型 CDK 均连续激活失败后置位，下轮激活自动跳过，直到人工标记可用。
+  // 激活不可用标记：两种类型 CDK 均连续激活失败后置位，下轮激活自动跳过，用「撤销激活」复位。
   plus_unavailable?: boolean;
   // 首次激活成功（plus_status→已激活）时间，用于账号管理「激活日期」列。
   plus_activated_at?: string | null;
@@ -239,6 +239,7 @@ export type Cdk = {
   type: CdkType;
   status: CdkStatus;
   bound_token: string | null;
+  bound_email?: string | null;
   bound_account?: CdkBoundAccount | null;
   used_at: string | null;
   imported_at: string | null;
@@ -700,7 +701,8 @@ export async function markAccountsUsed(
   });
 }
 
-// 撤销激活：将 plus_review 账号复位为免费可激活态，可选同步撤销 CDK 使用。
+// 撤销激活：将已激活（plus_activated）账号复位为免费可激活态（清 redeem 锁/不可用标记），
+// 可选同步撤销 CDK 使用。错标「已激活」的人工纠正入口。
 export async function revokeActivation(accessTokens: string[], revokeCdk = true) {
   return httpRequest<{ updated: number; cdk_revoked: number; skipped: number; items: Account[] }>(
     "/api/accounts/revoke-activation",

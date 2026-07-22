@@ -25,14 +25,49 @@ class RevokeActivationTest(unittest.TestCase):
             "activation": {"cdk": cdk, "cdk_type": "UPI", "attempts": {"UPI": 1, "IDEL": 0}},
         }
 
-    def test_revoke_activation_skips_retired_plus_review(self):
-        self.svc._accounts["eyJreview"] = self._review_account()
+    def test_revoke_activation_resets_activated_account(self):
+        """撤销激活对已激活账号生效：复位 registered/free、清 redeem 锁与激活字段。
+
+        历史 plus_review 账号读盘时被 enrich 升格为 plus_activated，此前 revoke 只认
+        plus_review 导致永远 skipped——错标「已激活」的账号无任何人工纠正入口。
+        """
+        account = self._review_account()
+        account["plus_redeem_locked"] = True
+        account["plus_unavailable"] = True
+        self.svc._accounts["eyJreview"] = account
         with patch("services.activation_audit_service.activation_audit_service.delete_by_access_tokens", return_value=0):
             result = self.svc.revoke_activation(["eyJreview"], revoke_cdk=False)
-        self.assertEqual(result["updated"], 0)
-        self.assertEqual(result["skipped"], 1)
+        self.assertEqual(result["updated"], 1)
+        self.assertEqual(result["skipped"], 0)
         item = enrich_account(self.svc._accounts["eyJreview"])
-        self.assertEqual(item["stage"], STAGE_PLUS_ACTIVATED)
+        self.assertEqual(item["stage"], STAGE_REGISTERED)
+        self.assertEqual(item["plan"], "free")
+        self.assertEqual(item["plus_status"], "未激活")
+        self.assertFalse(item.get("plus_redeem_locked"))
+        self.assertFalse(item.get("plus_unavailable"))
+        self.assertIsNone(item.get("plus_activated_at"))
+
+    def test_revoke_activation_clears_registered_residue(self):
+        """registered 但带激活残留（redeem 锁/不可用）的账号也可撤销复位——
+        锁定后核实非 Plus 被标不可用的账号，这是唯一的人工恢复入口。"""
+        self.svc._accounts["eyJlocked"] = {
+            "email": "locked@x.com",
+            "access_token": "eyJlocked",
+            "stage": STAGE_REGISTERED,
+            "plan": "free",
+            "type": "free",
+            "plus_status": "激活失败",
+            "plus_redeem_locked": True,
+            "plus_unavailable": True,
+        }
+        with patch("services.activation_audit_service.activation_audit_service.delete_by_access_tokens", return_value=0):
+            result = self.svc.revoke_activation(["eyJlocked"], revoke_cdk=False)
+        self.assertEqual(result["updated"], 1)
+        item = enrich_account(self.svc._accounts["eyJlocked"])
+        self.assertEqual(item["stage"], STAGE_REGISTERED)
+        self.assertEqual(item["plus_status"], "未激活")
+        self.assertFalse(item.get("plus_redeem_locked"))
+        self.assertFalse(item.get("plus_unavailable"))
 
     def test_revoke_activation_skips_non_review(self):
         self.svc._accounts["eyJok"] = {

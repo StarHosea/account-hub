@@ -101,6 +101,11 @@ class AccountService:
     # 刷新进度追踪
     _refresh_progress: dict[str, dict] = {}
     _refresh_progress_lock = Lock()
+    # 批量套餐查询进度追踪
+    _plan_refresh_progress: dict[str, dict] = {}
+    _plan_refresh_progress_lock = Lock()
+    _PLAN_REFRESH_MAX_WORKERS = 5
+    _PLAN_REFRESH_SUBMIT_DELAY_SECONDS = 0.15
     # 刷新 Token（强制换 JWT）进度追踪
     _token_rotate_progress: dict[str, dict] = {}
     _token_rotate_progress_lock = Lock()
@@ -451,6 +456,9 @@ class AccountService:
         # 激活不可用标记：某邮箱账号两种类型 CDK 均连续激活失败后置位，下轮激活自动跳过，
         # 直到用「撤销激活」复位。与 plus_status 分离，保证重置后仍持久生效。
         normalized["plus_unavailable"] = bool(normalized.get("plus_unavailable"))
+        tier = str(normalized.get("subscription_tier") or "").strip()
+        normalized["subscription_tier"] = tier or None
+        normalized["subscription_tier_at"] = normalized.get("subscription_tier_at") or None
         return enrich_account(normalized)
 
     @staticmethod
@@ -473,6 +481,51 @@ class AccountService:
             return True
         remaining = cls._token_expires_in(access_token)
         return remaining is not None and remaining <= cls._ACCESS_TOKEN_REFRESH_SKEW_SECONDS
+
+    @staticmethod
+    def _account_has_browser_session(account: dict | None) -> bool:
+        if not isinstance(account, dict):
+            return False
+        session = account.get("browser_session")
+        return isinstance(session, dict) and session.get("cookies") is not None
+
+    @classmethod
+    def _token_is_fresh(cls, access_token: str) -> bool:
+        remaining = cls._token_expires_in(access_token)
+        return remaining is not None and remaining > 0
+
+    @classmethod
+    def _account_can_fetch_mail_code(cls, email: str) -> bool:
+        email = str(email or "").strip()
+        if not email:
+            return False
+        try:
+            from services.mailbox_service import mailbox_service
+            return bool(str(mailbox_service.get_fetch_url(email) or "").strip())
+        except Exception:
+            return False
+
+    @classmethod
+    def _token_refresh_skip_reason(cls, account: dict | None) -> str | None:
+        """强制/自动刷新预检：返回跳过原因；None 表示可执行。"""
+        if not isinstance(account, dict):
+            return "账号不存在"
+        email = str(account.get("email") or "").strip()
+        if not email:
+            return "无邮箱"
+        password = str(account.get("password") or "").strip()
+        access_token = str(account.get("access_token") or "").strip()
+        has_session = cls._account_has_browser_session(account)
+        fresh = cls._token_is_fresh(access_token)
+        if fresh and has_session:
+            return None
+        if password:
+            return None
+        if cls._account_can_fetch_mail_code(email):
+            return None
+        if has_session:
+            return None
+        return "无密码且无法收码"
 
     @classmethod
     def _token_issued_at(cls, access_token: str) -> datetime | None:
@@ -1929,6 +1982,39 @@ class AccountService:
         self._record_refresh_success(active_token)
         return self.update_account(active_token, result)
 
+    def fetch_remote_plan(
+        self,
+        access_token: str,
+        event: str = "fetch_remote_plan",
+    ) -> dict[str, Any] | None:
+        """仅拉取远端 ChatGPT 套餐档位并写回 subscription_tier，不改动激活状态 / lifecycle plan。"""
+        if not access_token:
+            raise ValueError("access_token is required")
+        from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
+
+        try:
+            result = OpenAIBackendAPI(access_token).get_plan_type()
+        except InvalidAccessTokenError as exc:
+            self._record_invalid_token_seen(
+                access_token,
+                event,
+                str(exc),
+                defer_invalid_removal=True,
+            )
+            raise
+        tier = str(result.get("subscription_tier") or "").strip()
+        if not tier:
+            raise RuntimeError("empty subscription_tier from remote")
+        self._record_refresh_success(access_token)
+        return self.update_account(
+            access_token,
+            {
+                "subscription_tier": tier,
+                "subscription_tier_at": self._now(),
+            },
+            quiet=True,
+        )
+
     # ---- 刷新进度追踪 ----
 
     def init_refresh_progress(self, progress_id: str, total: int) -> None:
@@ -1978,6 +2064,67 @@ class AccountService:
         """清理过期进度记录。"""
         with self._refresh_progress_lock:
             self._refresh_progress.pop(progress_id, None)
+
+    def init_plan_refresh_progress(self, progress_id: str, total: int) -> None:
+        with self._plan_refresh_progress_lock:
+            self._plan_refresh_progress[progress_id] = {
+                "total": total,
+                "processed": 0,
+                "done": False,
+                "error": None,
+                "plan_counts": {"free": 0, "plus": 0, "pro": 0, "other": 0, "error": 0, "invalid": 0},
+            }
+
+    @staticmethod
+    def _plan_count_bucket(plan_type: str) -> str:
+        key = str(plan_type or "").strip().lower().replace("-", "").replace("_", "").replace(" ", "")
+        if key in ("free", "basic"):
+            return "free"
+        if key == "plus":
+            return "plus"
+        if key in ("pro", "chatgptpro"):
+            return "pro"
+        return "other"
+
+    def update_plan_refresh_progress(
+        self,
+        progress_id: str,
+        *,
+        plan_type: str = "",
+        error: bool = False,
+        invalid: bool = False,
+    ) -> None:
+        with self._plan_refresh_progress_lock:
+            progress = self._plan_refresh_progress.get(progress_id)
+            if progress is None:
+                return
+            progress["processed"] += 1
+            if invalid:
+                bucket = "invalid"
+            elif error:
+                bucket = "error"
+            else:
+                bucket = self._plan_count_bucket(plan_type)
+            progress["plan_counts"][bucket] = progress["plan_counts"].get(bucket, 0) + 1
+
+    def finish_plan_refresh_progress(self, progress_id: str, result: dict | None = None, error: str | None = None) -> None:
+        with self._plan_refresh_progress_lock:
+            progress = self._plan_refresh_progress.get(progress_id)
+            if progress is None:
+                return
+            progress["done"] = True
+            progress["result"] = result
+            if error:
+                progress["error"] = error
+
+    def get_plan_refresh_progress(self, progress_id: str) -> dict | None:
+        with self._plan_refresh_progress_lock:
+            progress = self._plan_refresh_progress.get(progress_id)
+            return dict(progress) if progress else None
+
+    def clean_plan_refresh_progress(self, progress_id: str) -> None:
+        with self._plan_refresh_progress_lock:
+            self._plan_refresh_progress.pop(progress_id, None)
 
     # ---- 重新登录进度追踪 ----
 
@@ -2107,11 +2254,27 @@ class AccountService:
         def _rotate_one(token: str) -> tuple[bool, bool, bool, str | None]:
             account = self.get_account(token)
             if not account:
-                return False, True, False, "账号不存在"
-            email = str(account.get("email") or "").strip()
-            password = str(account.get("password") or "").strip()
-            if not email or not password:
-                return False, True, False, "无邮箱密码"
+                reason = "账号不存在"
+                log_service.add(
+                    LOG_TYPE_ACCOUNT,
+                    "刷新 Token 跳过",
+                    {"source": "refresh_account_tokens", "token": anonymize_token(token), "reason": reason},
+                )
+                return False, True, False, reason
+            reason = self._token_refresh_skip_reason(account)
+            if reason:
+                email = str(account.get("email") or "").strip()
+                log_service.add(
+                    LOG_TYPE_ACCOUNT,
+                    "刷新 Token 跳过",
+                    {
+                        "source": "refresh_account_tokens",
+                        "token": anonymize_token(token),
+                        "email": email or None,
+                        "reason": reason,
+                    },
+                )
+                return False, True, False, reason
             _, ok, changed = self.rotate_access_token(token, event="refresh_account_tokens")
             if not ok:
                 acct = self.get_account(token) or {}
@@ -2221,6 +2384,78 @@ class AccountService:
         if progress_id:
             self.finish_refresh_progress(progress_id, result)
 
+        return result
+
+    def refresh_account_plans(
+        self,
+        access_tokens: list[str],
+        progress_id: str | None = None,
+    ) -> dict[str, Any]:
+        access_tokens = list(dict.fromkeys(token for token in access_tokens if token))
+        if not access_tokens:
+            items = self.list_accounts()
+            result = {"refreshed": 0, "errors": [], "items": items}
+            if progress_id:
+                self.finish_plan_refresh_progress(progress_id, result)
+            return result
+
+        refreshed = 0
+        errors: list[dict[str, str]] = []
+        max_workers = min(self._PLAN_REFRESH_MAX_WORKERS, len(access_tokens))
+
+        if progress_id:
+            self.init_plan_refresh_progress(progress_id, len(access_tokens))
+
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        try:
+            from services.openai_backend_api import InvalidAccessTokenError
+
+            futures = {}
+            for index, token in enumerate(access_tokens):
+                if index > 0 and self._PLAN_REFRESH_SUBMIT_DELAY_SECONDS > 0:
+                    time.sleep(self._PLAN_REFRESH_SUBMIT_DELAY_SECONDS)
+                futures[executor.submit(self.fetch_remote_plan, token, "refresh_account_plans")] = token
+            for future in as_completed(futures):
+                token = futures[future]
+                try:
+                    account = future.result()
+                except (KeyboardInterrupt, SystemExit):
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    raise
+                except InvalidAccessTokenError as exc:
+                    errors.append({"token": anonymize_token(token), "error": str(exc), "code": "invalid_token"})
+                    if progress_id:
+                        self.update_plan_refresh_progress(progress_id, invalid=True)
+                except Exception as exc:
+                    error_str = str(exc)
+                    if not _is_tls_connection_error(error_str):
+                        errors.append({"token": anonymize_token(token), "error": error_str})
+                    if progress_id:
+                        self.update_plan_refresh_progress(progress_id, error=True)
+                else:
+                    if account is not None:
+                        refreshed += 1
+                    if progress_id:
+                        self.update_plan_refresh_progress(
+                            progress_id,
+                            plan_type=str((account or {}).get("subscription_tier") or ""),
+                            error=account is None,
+                        )
+        except (KeyboardInterrupt, SystemExit):
+            if progress_id:
+                self.finish_plan_refresh_progress(progress_id, error="cancelled")
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+        result = {
+            "refreshed": refreshed,
+            "errors": errors,
+            "items": self.list_accounts(),
+        }
+        if progress_id:
+            self.finish_plan_refresh_progress(progress_id, result)
         return result
 
     def re_login_accounts(self, access_tokens: list[str], progress_id: str | None = None) -> dict[str, Any]:

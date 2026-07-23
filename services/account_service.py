@@ -693,13 +693,13 @@ class AccountService:
             if not force and self._recent_token_refresh_error(account):
                 return active_token
             # token 失效 → 走浏览器 UI 登录取新 token（不再有 refresh_token 无头刷新）。
-            # 无邮箱/无密码的号（外部购号未存密码）无法浏览器登录，保持现 token 不动。
+            # 无邮箱，或无密码且无法收码且无 session 时无法登录，保持现 token 不动。
+            if self._token_refresh_skip_reason(account):
+                return active_token
             email = str(account.get("email") or "").strip()
             password = str(account.get("password") or "").strip()
             totp_secret = str(account.get("totp_secret") or "").strip()
             account_proxy = str(account.get("proxy") or "").strip()
-            if not email or not password:
-                return active_token
         # 浏览器登录（并发闸在 openai_account_ops 内）：锁外同步执行，拿到新 token 再落库返回，
         # 保证 fetch_remote_info 等调用方能在同一次调用里拿到有效新 token（否则会误判失效移除账号）。
         from services.register import openai_account_ops

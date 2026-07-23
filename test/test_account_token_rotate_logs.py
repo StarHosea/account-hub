@@ -113,5 +113,32 @@ class RefreshAccountTokenSkipLogsTests(unittest.TestCase):
         rotate.assert_called_once()
 
 
+    def test_refresh_access_token_allows_otp_without_password(self) -> None:
+        token = make_jwt({"exp": int(time.time()) - 10, "email": "auto-otp@example.com"})
+        self._put("auto-otp@example.com", access_token=token, password="")
+        with (
+            patch("services.mailbox_service.mailbox_service.get_fetch_url", return_value="https://mail.example/feed"),
+            patch(
+                "services.register.openai_account_ops.run_browser_login",
+                return_value={"ok": True, "access_token": "rotated.jwt", "reset_password": "", "browser_session": None},
+            ) as login,
+            patch.object(self.service, "_apply_refreshed_tokens", return_value="rotated.jwt"),
+            patch.object(self.service, "update_account"),
+        ):
+            out = self.service.refresh_access_token(token, force=True, event="test_auto")
+
+        self.assertEqual(out, "rotated.jwt")
+        login.assert_called_once()
+        self.assertEqual(login.call_args.args[0], "auto-otp@example.com")
+        self.assertEqual(login.call_args.args[1], "")
+
+    def test_refresh_access_token_skips_without_mailbox_or_password(self) -> None:
+        token = make_jwt({"exp": int(time.time()) - 10, "email": "stuck@example.com"})
+        self._put("stuck@example.com", access_token=token, password="")
+        with patch("services.mailbox_service.mailbox_service.get_fetch_url", return_value=None):
+            out = self.service.refresh_access_token(token, force=True, event="test_skip")
+        self.assertEqual(out, token)
+
+
 if __name__ == "__main__":
     unittest.main()

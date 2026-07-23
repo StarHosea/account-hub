@@ -4,8 +4,8 @@
 oauth-token），而是复用注册用的 node_engine 浏览器引擎：spawn worker.js →
 在真实浏览器里恢复 session 或登录取新 token。
 
-- session_refresh：注入 browser_session（cookies/localStorage）快路径，失败 fallback 密码登录
-- login：完整密码登录（刷新 / 重登兜底）
+- session_refresh：注入 browser_session（cookies/localStorage）快路径；未过期时不 fallback 登录，失败再降级 login
+- login：完整登录（有密码走密码；无密码走邮箱 OTP / 现有忘记密码兜底）
 - 验证码从账号「自己绑定的邮箱」取（mailbox_service.get_fetch_url），不是注册用的邮箱池。
 - 代理复用账号专属出口（号一号一 IP），转成 CloakBrowser 可用的 socks5/http URL。
 """

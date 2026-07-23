@@ -29,27 +29,15 @@
 - Modify: `services/account_service.py`
 - Modify: `test/test_account_token_rotate_logs.py`
 
-- [ ] **Step 1: 改写失败测试** — 无密码无收件 → reason=`无密码且无法收码`；无密码有 fetch_url → 不跳过（mock rotate）
+- [x] **Step 1: 改写失败测试** — 无密码无收件 → reason=`无密码且无法收码`；无密码有 fetch_url → 不跳过（mock rotate）
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
-```bash
-.venv/bin/python -m unittest test.test_account_token_rotate_logs -v
-```
+- [x] **Step 3: 实现** `_token_refresh_skip_reason(account) -> str | None` 与 `refresh_account_tokens` 使用新预检；无邮箱 → `无邮箱`
 
-- [ ] **Step 3: 实现** `_token_refresh_skip_reason(account) -> str | None` 与 `refresh_account_tokens` 使用新预检；无邮箱 → `无邮箱`
+- [x] **Step 4: 测试通过**
 
-逻辑：
-- 无 email → `无邮箱`
-- 有未过期 JWT + 可用 browser_session → 允许
-- 有 password → 允许
-- `mailbox_service.get_fetch_url(email)` 非空 → 允许
-- 有可用 browser_session（即使 JWT 过期）→ 允许（先试 session）
-- 否则 → `无密码且无法收码`
-
-- [ ] **Step 4: 测试通过**
-
-- [ ] **Step 5: Commit** `fix(accounts): 刷新 Token 预检支持无密码 OTP`
+- [x] **Step 5: Commit** `fix(accounts): 刷新 Token 预检支持无密码 OTP`
 
 ---
 
@@ -59,18 +47,18 @@
 - Modify: `services/register/openai_account_ops.py`
 - Create: `test/test_token_refresh_routing.py`
 
-- [ ] **Step 1: 写失败测试**（mock `_drive_worker`）
+- [x] **Step 1: 写失败测试**（mock `_drive_worker`）
   - 未过期 + cookies → `session_refresh` 且 `fallbackLogin is False`
   - session_only 失败 + 有收件 → 再调 `login`
   - 无 session → 直接 `login`，密码可为空
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
-- [ ] **Step 3: 实现分流**（去掉无密码硬失败）
+- [x] **Step 3: 实现分流**（去掉无密码硬失败）
 
-- [ ] **Step 4: 测试通过**
+- [x] **Step 4: 测试通过**
 
-- [ ] **Step 5: Commit** `fix(register): token 刷新按 session/login 分流`
+- [x] **Step 5: Commit** `fix(register): token 刷新按 session/login 分流`
 
 ---
 
@@ -80,13 +68,13 @@
 - Modify: `services/account_service.py`（`refresh_access_token` 约 650–657）
 - 可在 `test/test_account_token_rotate_logs.py` 或同文件加短测
 
-- [ ] **Step 1–4:** 无密码但可收码时不再直接 return 旧 token（mock `run_browser_login`）
+- [x] **Step 1–4:** 无密码但可收码时不再直接 return 旧 token（mock `run_browser_login`）
 
-- [ ] **Step 5: Commit** `fix(accounts): 自动刷新预检与强制刷新对齐`
+- [x] **Step 5: Commit** `fix(accounts): 自动刷新预检与强制刷新对齐`
 
 ---
 
 ### Task 4: 验证
 
-- [ ] 跑相关 unittest 全绿
+- [x] 跑相关 unittest 全绿
 - [ ] 重启本地后端（若改动已加载）

@@ -103,29 +103,64 @@ function LogView({ logs }: { logs: LogEntry[] }) {
   );
 }
 
-function renderPlusStatus(a: Account) {
+function renderActivatingCdk(a: Account, compact?: boolean) {
+  const cdk = a.plus_cdk?.trim();
+  const cdkType = a.plus_cdk_type;
+  if (!cdk) {
+    return (
+      <Text type="tertiary" size="small">
+        待分配
+      </Text>
+    );
+  }
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 4, minWidth: 0 }}>
+      {cdkType ? (
+        <Tag color={cdkType === "UPI" ? "blue" : "purple"} size="small" type="light" style={{ alignSelf: "flex-start" }}>
+          {cdkType}
+        </Tag>
+      ) : null}
+      <Tooltip content={cdk}>
+        <Text
+          size="small"
+          copyable={{ content: cdk }}
+          ellipsis={{ showTooltip: false }}
+          style={{
+            fontFamily: "var(--semi-font-mono, monospace)",
+            maxWidth: compact ? 140 : 240,
+          }}
+        >
+          {cdk}
+        </Text>
+      </Tooltip>
+    </div>
+  );
+}
+
+function renderActivatingProgress(a: Account) {
   const st: PlusStatus = a.plus_status ?? "未激活";
   const inProgress = st === "排队中" || st === "激活中";
   const attempts = a.plus_attempts;
-  const tries = attempts && (attempts.UPI || attempts.IDEL) ? `UPI ${attempts.UPI} / IDEL ${attempts.IDEL}` : "";
+  const upi = attempts?.UPI ?? 0;
+  const idel = attempts?.IDEL ?? 0;
+  const hasAttempts = upi > 0 || idel > 0;
+  const detail = a.plus_last_message?.trim() || (inProgress ? "等待服务端响应…" : "—");
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0 }}>
-      <Space spacing={4}>
+    <div style={{ display: "flex", flexDirection: "column", gap: 4, minWidth: 0 }}>
+      <Space spacing={4} wrap>
         {inProgress ? <Spin size="small" /> : null}
         <Tag color={(PLUS_TAG_COLOR[st] ?? "grey") as never} type="light">
           {st}
         </Tag>
-        {tries ? (
+        {hasAttempts ? (
           <Text type="tertiary" size="small">
-            {tries}
+            已试 UPI {upi} · IDEL {idel}
           </Text>
         ) : null}
       </Space>
-      {a.plus_last_message ? (
-        <Text type="tertiary" size="small" ellipsis={{ showTooltip: true }} style={{ maxWidth: 260 }}>
-          {a.plus_last_message}
-        </Text>
-      ) : null}
+      <Text type="tertiary" size="small" ellipsis={{ showTooltip: true }} style={{ maxWidth: 360 }}>
+        {detail}
+      </Text>
     </div>
   );
 }
@@ -213,7 +248,7 @@ export default function ActivatorPage() {
   const activationRunning = !!act?.running;
   const activatingCount = act?.summary.activating ?? 0;
   const pendingActivate = act?.summary.pending ?? 0;
-  const activatedCount = act?.summary.plus_by_type ?? 0;
+  const activatedCount = act?.summary.activated ?? 0;
 
   const target = activationConfig?.target ?? 0;
   const concurrency = activationConfig?.concurrency ?? 10;
@@ -233,8 +268,12 @@ export default function ActivatorPage() {
   const jobClaiming = act?.stats.claiming ?? 0;
   const showJobStats = activationRunning || jobSuccess > 0 || jobFail > 0 || jobSkipped > 0 || jobReview > 0;
 
-  const activatingAccounts = useMemo(
-    () => accounts.filter((a) => a.plus_status === "排队中" || a.plus_status === "激活中"),
+  const progressAccounts = useMemo(
+    () =>
+      accounts.filter((a) => {
+        const st = a.plus_status ?? "未激活";
+        return st === "排队中" || st === "激活中" || a.stage === "activating";
+      }),
     [accounts],
   );
 
@@ -283,8 +322,30 @@ export default function ActivatorPage() {
   };
 
   const activationColumns = [
-    { title: "邮箱", dataIndex: "email", render: (v: string | null) => v || <Text type="tertiary">—</Text> },
-    { title: "激活进度", dataIndex: "plus_status", render: (_: unknown, a: Account) => renderPlusStatus(a) },
+    {
+      title: "邮箱",
+      dataIndex: "email",
+      width: isMobile ? 160 : 220,
+      render: (v: string | null) =>
+        v ? (
+          <Text ellipsis={{ showTooltip: true }} style={{ maxWidth: isMobile ? 150 : 210 }}>
+            {v}
+          </Text>
+        ) : (
+          <Text type="tertiary">—</Text>
+        ),
+    },
+    {
+      title: "CDK",
+      dataIndex: "plus_cdk",
+      width: isMobile ? 150 : 200,
+      render: (_: unknown, a: Account) => renderActivatingCdk(a, isMobile),
+    },
+    {
+      title: "当前进度",
+      dataIndex: "plus_status",
+      render: (_: unknown, a: Account) => renderActivatingProgress(a),
+    },
   ];
 
   const activationResourceHints = [
@@ -433,19 +494,19 @@ export default function ActivatorPage() {
         }
         style={{ marginBottom: 16 }}
       >
-        {activatingCount > activatingAccounts.length ? (
+        {activatingCount > progressAccounts.length ? (
           <Text type="tertiary" size="small" style={{ display: "block", marginBottom: 8 }}>
-            另有 {activatingCount - activatingAccounts.length} 个进行中账号未在列表显示（列表上限 200）。
+            另有 {activatingCount - progressAccounts.length} 个进行中账号未在列表显示（列表上限 200）。
           </Text>
         ) : null}
         <Table
-          dataSource={activatingAccounts}
+          dataSource={progressAccounts}
           columns={activationColumns}
           rowKey="access_token"
           size="small"
           pagination={false}
           empty={<Empty description="当前没有进行中的激活任务" />}
-          scroll={{ y: 300 }}
+          scroll={{ x: isMobile ? 520 : undefined, y: 300 }}
         />
       </Card>
 

@@ -135,7 +135,7 @@ class OperationLogStorage:
         finally:
             session.close()
 
-    def delete(self, ids: list[str]) -> int:
+    def delete(self, ids: list[str]) -> dict[str, int]:
         target_ids = {str(item or "").strip() for item in ids if str(item or "").strip()}
         if not target_ids:
             return {"removed": 0}
@@ -146,6 +146,18 @@ class OperationLogStorage:
                 .filter(OperationLogRow.id.in_(target_ids))
                 .delete(synchronize_session=False)
             )
+            session.commit()
+            return {"removed": int(removed)}
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def clear(self) -> dict[str, int]:
+        session = self._Session()
+        try:
+            removed = session.query(OperationLogRow).delete(synchronize_session=False)
             session.commit()
             return {"removed": int(removed)}
         except Exception:

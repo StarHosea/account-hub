@@ -153,6 +153,21 @@ def infer_plan_from_legacy(account: dict[str, Any]) -> str:
     return _legacy_plan(account.get("type"))
 
 
+def remote_subscription_tier(account: dict[str, Any]) -> str:
+    """ChatGPT 远端套餐档位（free/plus/pro/team…），与 CDK 激活 lifecycle 无关。"""
+    tier = str(account.get("subscription_tier") or "").strip().lower()
+    if tier:
+        return tier
+    legacy_type = str(account.get("type") or "").strip().lower()
+    if not legacy_type or legacy_type == "codex":
+        return ""
+    plan = infer_plan_from_legacy(account)
+    mirrored = _plan_to_legacy(plan).lower()
+    if legacy_type != mirrored:
+        return legacy_type
+    return ""
+
+
 def _normalize_dispatch(raw: object, account: dict[str, Any]) -> dict[str, Any]:
     dispatch = empty_dispatch()
     if isinstance(raw, dict):
@@ -289,6 +304,16 @@ def enrich_account(account: dict[str, Any]) -> dict[str, Any]:
     # legacy mirrors
     item["type"] = _plan_to_legacy(item["plan"])
     item["status"] = _token_status_to_legacy(str(item["token_status"]))
+    # ChatGPT 远端套餐档位（仅「同步套餐」写入）；与 lifecycle plan / 激活状态无关。
+    tier = str(account.get("subscription_tier") or "").strip()
+    if not tier:
+        legacy_type = str(account.get("type") or "").strip()
+        mirrored = _plan_to_legacy(item["plan"])
+        if legacy_type and legacy_type.lower() not in ("codex",) and legacy_type.lower() != mirrored.lower():
+            tier = legacy_type
+    item["subscription_tier"] = tier or None
+    item["subscription_tier_at"] = account.get("subscription_tier_at") or None
+    item["is_activated"] = str(item.get("stage")) == STAGE_PLUS_ACTIVATED
     item["plus_status"] = _legacy_plus_status(str(item["stage"]), str(item["plan"]))
     # 保留激活服务直接写入的细粒度进度（排队中 / 激活中 / 激活失败），
     # 避免仅由 stage+plan 推导时把「激活中」压成「排队中」或冲回「未激活」。

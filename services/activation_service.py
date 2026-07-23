@@ -13,6 +13,7 @@ from services.account_lifecycle import (
     STAGE_PLUS_ACTIVATED,
     STAGE_REGISTERED,
     enrich_account,
+    remote_subscription_tier,
     _norm_email,
 )
 from services.account_service import account_service
@@ -161,9 +162,8 @@ class ActivationService:
         free = sum(1 for a in accounts if a.get("plus_status", STATUS_UNACTIVATED) == STATUS_UNACTIVATED)
         activated = sum(1 for a in accounts if a.get("plus_status") == STATUS_ACTIVATED)
         activating = sum(1 for a in accounts if a.get("plus_status") in (STATUS_QUEUED, STATUS_ACTIVATING))
-        # 按真实套餐 type 判定「是否已激活 Plus」：type==plus 视为已激活，其余（含 free/空）视为未激活。
-        # 与上面基于 plus_status 的 free/activated 口径分开：这两个字段供工作台卡片展示用。
-        plus_by_type = sum(1 for a in accounts if str(a.get("type") or "").strip().lower() == "plus")
+        # 按远端 subscription_tier 统计真实 ChatGPT 套餐（与 CDK 激活 lifecycle 无关）。
+        plus_by_type = sum(1 for a in accounts if remote_subscription_tier(a) == "plus")
         not_plus_by_type = len(accounts) - plus_by_type
         pending = sum(1 for a in accounts if is_activation_eligible(a))
         return {
@@ -602,23 +602,50 @@ class ActivationService:
                         }
                     account_service.apply_stage_update(token, STAGE_REGISTERED, **clear)
 
+    def _fetch_remote_plan_with_token_refresh(
+        self,
+        token: str,
+        event: str,
+    ) -> tuple[dict | None, str, bool, str | None]:
+        """拉远端套餐；InvalidAccessToken 时强制换 JWT 再试一次。
+
+        返回 (account, active_token, verified, error)：
+        - verified=False 表示查询失败（网络/换 Token 失败/仍无效）；
+        - active_token 可能因换 JWT 与传入不同。
+        """
+        from services.openai_backend_api import InvalidAccessTokenError
+
+        active = token
+        try:
+            return account_service.fetch_remote_plan(active, event=event), active, True, None
+        except InvalidAccessTokenError as exc:
+            refreshed = account_service.refresh_access_token(active, force=True, event=event)
+            if refreshed and refreshed != active:
+                active = refreshed
+                try:
+                    return account_service.fetch_remote_plan(active, event=event), active, True, None
+                except Exception as retry_exc:  # noqa: BLE001
+                    return None, active, False, str(retry_exc)
+            return None, active, False, str(exc)
+        except Exception as exc:  # noqa: BLE001
+            return None, active, False, str(exc)
+
     def _preverify_already_plus(self, token: str, email: str, log_sink, audit) -> tuple[bool, str, bool]:
         """提交前预检真实档位：已是 Plus 直接判成功、不烧卡。
 
         返回 (handled, latest_token, verified)：
         - handled=True 表示已按「已是 Plus」收尾，调用方直接成功返回；
-        - latest_token 为 fetch_remote_info 刷新后的最新 access_token（可能与传入不同），
-          供后续 submit 使用；查询失败时原样回传，不阻断兑换；
+        - latest_token 在 token 刷新后可能与传入不同；
         - verified 表示本次档位查询是否成功（False=网络/接口失败、档位未知），供
           plus_redeem_locked 账号的守卫区分「确认非 Plus」与「查不到」。
         """
-        try:
-            acct = account_service.fetch_remote_info(token, event="activation_preverify")
-        except Exception:  # noqa: BLE001 —— 预检失败不应阻断正常兑换
-            return False, token, False
+        acct, active, verified, _error = self._fetch_remote_plan_with_token_refresh(token, "activation_preverify")
+        if not verified:
+            return False, active, False
+
         item = enrich_account(acct or {})
-        latest = str(item.get("access_token") or token) or token
-        if str(item.get("type") or "").strip().lower() != "plus":
+        latest = str(item.get("access_token") or active) or active
+        if remote_subscription_tier(item) != "plus":
             return False, latest, True
         msg = "提交前核实已是 Plus，跳过兑换（不烧卡）"
         account_service.apply_stage_update(
@@ -824,18 +851,21 @@ class ActivationService:
 
     def _verify_plan_after_timeout(self, token: str, audit) -> tuple[str, str]:
         """timeout 重试用尽后核实真实档位。返回 (verdict, latest_token)，verdict ∈ plus/free/unknown。"""
-        try:
-            acct = account_service.fetch_remote_info(token, event="activation_timeout_verify")
-        except Exception as exc:  # noqa: BLE001 —— 查询失败按 unknown 交由调用方乐观收尾
+        acct, active, verified, error = self._fetch_remote_plan_with_token_refresh(token, "activation_timeout_verify")
+        if not verified:
             if audit:
-                audit.record_plan_verify("error", error=str(exc))
-            return "unknown", token
+                audit.record_plan_verify("error", error=error or "plan verify failed")
+            return "unknown", active
         item = enrich_account(acct or {})
-        latest = str(item.get("access_token") or token) or token
-        tier = str(item.get("type") or "").strip().lower()
+        latest = str(item.get("access_token") or active) or active
+        tier = remote_subscription_tier(item)
         if audit:
             audit.record_plan_verify("done", tier=tier or "unknown")
-        return ("plus" if tier == "plus" else "free"), latest
+        if tier == "plus":
+            return "plus", latest
+        if tier:
+            return "free", latest
+        return "unknown", latest
 
     def _mark_activated_after_submit(self, token: str, email: str, cdk, cdk_type, audit, log_sink) -> None:
         """CDK 已受理、超时重试用尽且档位核实失败：乐观按已激活收尾（保留持久锁，不再自动烧卡）。

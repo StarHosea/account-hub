@@ -38,6 +38,8 @@ import {
   fetchAccounts,
   refreshAccounts,
   fetchRefreshProgress,
+  refreshAccountPlans,
+  fetchRefreshPlanProgress,
   refreshAccountTokens,
   fetchRefreshTokenProgress,
   fetchAccountDetail,
@@ -85,6 +87,58 @@ function stageTag(a: Account, isRefreshing: boolean) {
   const stage = a.stage || "registered";
   const label = a.stage_label || stage;
   return <Tag color={(STAGE_TAG_COLOR[stage] ?? "grey") as never} type="light">{label}</Tag>;
+}
+
+/** 对齐 sub2api planTypeDisplayLabel：canonical 值映射为友好标签。 */
+function planTypeDisplayLabel(value: string): string {
+  switch (value.trim().toLowerCase().replace(/[\s_-]+/g, "")) {
+    case "plus":
+      return "Plus";
+    case "pro":
+    case "chatgptpro":
+      return "Pro";
+    case "free":
+    case "basic":
+      return "Free";
+    case "team":
+      return "Team";
+    default:
+      return value.trim();
+  }
+}
+
+function planTypeTag(tier: string | undefined | null, isSyncing = false) {
+  if (isSyncing) {
+    return (
+      <Space spacing={4}>
+        <Spin size="small" />
+        <Text type="tertiary" size="small">同步中</Text>
+      </Space>
+    );
+  }
+  const raw = (tier || "").trim();
+  if (!raw) return <Text type="tertiary">—</Text>;
+  const label = planTypeDisplayLabel(raw);
+  const key = raw.toLowerCase().replace(/[\s_-]+/g, "");
+  const color =
+    key === "plus" ? "green"
+    : key === "pro" || key === "chatgptpro" ? "purple"
+    : key === "free" || key === "basic" ? "grey"
+    : "blue";
+  return <Tag color={color as never} type="light">{label}</Tag>;
+}
+
+const PLUS_STATUS_TAG_COLOR: Record<string, string> = {
+  未激活: "grey",
+  排队中: "blue",
+  激活中: "orange",
+  已激活: "green",
+  激活失败: "red",
+};
+
+function activationStatusTag(a: Account) {
+  const st = a.plus_status ?? (a.is_activated ? "已激活" : "未激活");
+  return <Tag color={(PLUS_STATUS_TAG_COLOR[st] ?? "grey") as never} type="light">{st}</Tag>;
 }
 
 function renderGeo(a: Account) {
@@ -186,6 +240,7 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
   const [loading, setLoading] = useState(true);
   const [selectedKeys, setSelectedKeys] = useState<string[]>([]);
   const [refreshing, setRefreshing] = useState<Set<string>>(new Set());
+  const [planRefreshing, setPlanRefreshing] = useState<Set<string>>(new Set());
   const [rotatingTokens, setRotatingTokens] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
 
@@ -274,6 +329,14 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
       return next;
     });
 
+  const setPlanRefreshFlag = (token: string, on: boolean) =>
+    setPlanRefreshing((prev) => {
+      const next = new Set(prev);
+      if (on) next.add(token);
+      else next.delete(token);
+      return next;
+    });
+
   const setRotateFlag = (token: string, on: boolean) =>
     setRotatingTokens((prev) => {
       const next = new Set(prev);
@@ -315,6 +378,60 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
     }
   };
 
+  const handleRefreshPlan = async (uiKeys: string[]) => {
+    if (!uiKeys.length) return;
+    const tokens = uiKeys
+      .map((k) => {
+        const acct = accounts.find((a) => accountKey(a) === k);
+        return acct ? accountOpKey(acct) : k;
+      })
+      .filter(Boolean);
+    if (!tokens.length) return;
+    uiKeys.forEach((k) => setPlanRefreshFlag(k, true));
+    try {
+      const { progress_id } = await refreshAccountPlans(tokens);
+      const final = await new Promise<Awaited<ReturnType<typeof fetchRefreshPlanProgress>>>((resolve, reject) => {
+        const timer = setInterval(async () => {
+          try {
+            const p = await fetchRefreshPlanProgress(progress_id);
+            if (p.done) {
+              clearInterval(timer);
+              resolve(p);
+            }
+          } catch (err) {
+            clearInterval(timer);
+            reject(err);
+          }
+        }, 500);
+      });
+      if (final.error) {
+        Toast.error(final.error);
+      } else {
+        const counts = final.plan_counts ?? {};
+        const parts = [
+          `free ${counts.free ?? 0}`,
+          `plus ${counts.plus ?? 0}`,
+        ];
+        if (counts.pro) parts.push(`pro ${counts.pro}`);
+        if (counts.other) parts.push(`其他 ${counts.other}`);
+        if (counts.error) parts.push(`失败 ${counts.error}`);
+        const invalid = counts.invalid ?? 0;
+        if (invalid) parts.push(`失效 Token ${invalid}`);
+        const msg = `套餐同步完成：${parts.join("，")}`;
+        if (invalid) {
+          Toast.warning(`${msg}。失效账号请先「刷新 Token」后再同步`);
+        } else {
+          Toast.success(msg);
+        }
+      }
+      await load(true);
+    } catch (e) {
+      Toast.error(e instanceof Error ? e.message : "套餐同步失败");
+    } finally {
+      uiKeys.forEach((k) => setPlanRefreshFlag(k, false));
+    }
+  };
+
   const handleRotateToken = async (tokens: string[]) => {
     if (!tokens.length) return;
     tokens.forEach((t) => setRotateFlag(t, true));
@@ -345,8 +462,14 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
         if (fail) parts.push(`失败 ${fail}`);
         if (skip) parts.push(`跳过 ${skip}`);
         const summaryText = parts.join("，");
+        const errorHints = (final.result?.errors || [])
+          .map((item) => String((item as { error?: string }).error || "").trim())
+          .filter(Boolean);
+        const reasonText = errorHints.length ? `：${errorHints.slice(0, 3).join("；")}` : "";
         if (fail > 0) {
-          Toast.warning(`Token 刷新完成：${summaryText}`);
+          Toast.warning(`Token 刷新完成：${summaryText}${reasonText}`);
+        } else if (skip > 0) {
+          Toast.warning(`Token 刷新完成：${summaryText}${reasonText}`);
         } else if (changed > 0) {
           Toast.success(`Token 已刷新：${summaryText}`);
         } else {
@@ -582,7 +705,23 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
     {
       title: "状态",
       width: 110,
-      render: (_: unknown, a: Account) => stageTag(a, refreshing.has(accountKey(a)) || rotatingTokens.has(accountKey(a))),
+      render: (_: unknown, a: Account) => stageTag(
+        a,
+        refreshing.has(accountKey(a)) || rotatingTokens.has(accountKey(a)),
+      ),
+    },
+    {
+      title: "激活",
+      width: 90,
+      render: (_: unknown, a: Account) => activationStatusTag(a),
+    },
+    {
+      title: "套餐",
+      width: 90,
+      render: (_: unknown, a: Account) => planTypeTag(
+        a.subscription_tier,
+        planRefreshing.has(accountKey(a)),
+      ),
     },
     ...(planType === "plus"
       ? [{
@@ -834,6 +973,14 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
               >
                 刷新 Token
               </Button>
+              <Button
+                size="small"
+                icon={<IconSync />}
+                loading={selectedKeys.some((k) => planRefreshing.has(k))}
+                onClick={() => void handleRefreshPlan(selectedKeys)}
+              >
+                同步套餐
+              </Button>
               <span style={{ width: 1, height: 18, background: "var(--semi-color-border)", display: "inline-block" }} />
             </>
           ) : null}
@@ -870,6 +1017,7 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
           selected={selectedKeys}
           allSelected={allOnPageSelected}
           refreshing={refreshing}
+          planRefreshing={planRefreshing}
           rotatingTokens={rotatingTokens}
           showDispatchStatus={planType === "plus"}
           onToggleAll={toggleSelectAll}
@@ -890,7 +1038,7 @@ export default function AccountsPage({ planType }: { planType: AccountPlanPage }
           loading={loading}
           rowKey={(a) => accountKey(a as Account)}
           tableLayout="fixed"
-          scroll={{ x: planType === "plus" ? 1800 : 1680 }}
+          scroll={{ x: planType === "plus" ? 1980 : 1860 }}
           pagination={{
             currentPage: page,
             pageSize: PAGE_SIZE,
@@ -1121,6 +1269,7 @@ type AccountMobileListProps = {
   selected: string[];
   allSelected: boolean;
   refreshing: Set<string>;
+  planRefreshing: Set<string>;
   rotatingTokens: Set<string>;
   showDispatchStatus?: boolean;
   onToggleAll: () => void;
@@ -1141,6 +1290,7 @@ function AccountMobileList({
   selected,
   allSelected,
   refreshing,
+  planRefreshing,
   rotatingTokens,
   showDispatchStatus = false,
   onToggleAll,
@@ -1204,6 +1354,8 @@ function AccountMobileList({
                 )}
                 <Space spacing={4} wrap>
                   {statusNode}
+                  {activationStatusTag(a)}
+                  {planTypeTag(a.subscription_tier, planRefreshing.has(key))}
                   {showDispatchStatus ? renderDispatchStatus(a, { showTime: false }) : null}
                 </Space>
               </div>

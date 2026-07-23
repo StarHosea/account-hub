@@ -99,6 +99,11 @@ export type Account = {
   stage?: AccountStage;
   stage_label?: string;
   plan?: "free" | "plus";
+  /** ChatGPT 远端套餐档位（free/plus/pro/team…），仅「同步套餐」更新 */
+  subscription_tier?: string | null;
+  subscription_tier_at?: string | null;
+  /** CDK 激活是否已完成（stage=plus_activated），与 subscription_tier 无关 */
+  is_activated?: boolean;
   token_status?: "ok" | "rate_limited" | "invalid";
   // 注册失败与 Token 刷新失败（账号页「错误信息」）；不含激活失败详情。
   last_error?: string | null;
@@ -137,8 +142,9 @@ type AccountMutationResponse = {
 
 export type AccountRefreshResponse = {
   items: Account[];
-  refreshed: number;
-  errors: Array<{ access_token: string; error: string }>;
+  refreshed?: number;
+  rotated?: number;
+  errors: Array<{ access_token?: string; token?: string; error: string }>;
 };
 
 export type RefreshProgressResponse = {
@@ -147,6 +153,7 @@ export type RefreshProgressResponse = {
   done: boolean;
   error: string | null;
   status_counts?: Record<string, number>;
+  plan_counts?: Record<string, number>;
   total_quota?: number;
   result?: AccountRefreshResponse | null;
   results?: Array<{ token: string; status: string; error?: string | null }>;
@@ -356,7 +363,7 @@ export type ActivationSummary = {
   activated: number;
   activating: number;
   total: number;
-  // 按真实套餐 type 判定：plus_by_type=已是 Plus；not_plus_by_type=非 Plus 账号总数。
+  // activated=CDK 生命周期已激活；plus_by_type=远端 subscription_tier==plus（需同步套餐后才准）。
   plus_by_type?: number;
   not_plus_by_type?: number;
   // pending=可被激活引擎选中的账号数（与 start 时 _resolve_targets 口径一致）。
@@ -575,6 +582,17 @@ export async function refreshAccounts(accessTokens: string[]) {
 
 export async function fetchRefreshProgress(progressId: string) {
   return httpRequest<RefreshProgressResponse>(`/api/accounts/refresh/progress/${progressId}`);
+}
+
+export async function refreshAccountPlans(accessTokens: string[]) {
+  return httpRequest<{ progress_id: string }>("/api/accounts/refresh-plan", {
+    method: "POST",
+    body: { access_tokens: accessTokens },
+  });
+}
+
+export async function fetchRefreshPlanProgress(progressId: string) {
+  return httpRequest<RefreshProgressResponse>(`/api/accounts/refresh-plan/progress/${progressId}`);
 }
 
 export async function refreshAccountTokens(accessTokens: string[]) {
@@ -1276,4 +1294,39 @@ export async function startRun(target: number, autoReplenish: boolean) {
 
 export async function stopRun() {
   return httpRequest<RunState>("/api/run/stop", { method: "POST" });
+}
+
+// ── Operation Logs ─────────────────────────────────────────────────
+
+export type OperationLog = {
+  id: string;
+  time: string;
+  type: string;
+  summary: string;
+  detail?: Record<string, unknown> | null;
+};
+
+export type OperationLogListParams = {
+  type?: string;
+  start_date?: string;
+  end_date?: string;
+  limit?: number;
+};
+
+export async function fetchOperationLogs(params: OperationLogListParams = {}) {
+  return httpRequest<{ items: OperationLog[] }>(`/api/logs${buildQuery(params)}`);
+}
+
+export async function deleteOperationLogs(ids: string[]) {
+  return httpRequest<{ removed: number }>("/api/logs", {
+    method: "DELETE",
+    body: { ids },
+  });
+}
+
+export async function clearOperationLogs() {
+  return httpRequest<{ removed: number }>("/api/logs", {
+    method: "DELETE",
+    body: { clear_all: true },
+  });
 }

@@ -268,6 +268,35 @@ class ActivationReviewTest(unittest.TestCase):
         acquire.assert_not_called()
         svc._release_account("skip@x.com")
 
+    def test_verify_plan_after_timeout_refreshes_invalid_token(self):
+        from services.openai_backend_api import InvalidAccessTokenError
+
+        svc = ActivationService()
+        old_token = "eyJold"
+        new_token = "eyJnew"
+        refreshed_acct = {
+            "email": "t@x.com",
+            "access_token": new_token,
+            "subscription_tier": "plus",
+            "plan": "free",
+            "stage": STAGE_REGISTERED,
+        }
+
+        def _fetch(token: str, event: str = "fetch_remote_plan"):
+            if token == old_token:
+                raise InvalidAccessTokenError("token invalidated")
+            return refreshed_acct
+
+        with patch("services.activation_service.account_service.fetch_remote_plan", side_effect=_fetch):
+            with patch(
+                "services.activation_service.account_service.refresh_access_token",
+                return_value=new_token,
+            ) as refresh:
+                verdict, latest = svc._verify_plan_after_timeout(old_token, audit=None)
+        self.assertEqual(verdict, "plus")
+        self.assertEqual(latest, new_token)
+        refresh.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

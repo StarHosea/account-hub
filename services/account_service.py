@@ -1992,6 +1992,16 @@ class AccountService:
             raise ValueError("access_token is required")
         from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
 
+        # 同步套餐前清掉旧错误展示：last_error 可能由上次 enrich 固化写入存储。
+        self.update_account(
+            access_token,
+            {
+                "last_refresh_error": None,
+                "last_refresh_error_at": None,
+                "last_error": None,
+            },
+            quiet=True,
+        )
         try:
             result = OpenAIBackendAPI(access_token).get_plan_type()
         except InvalidAccessTokenError as exc:

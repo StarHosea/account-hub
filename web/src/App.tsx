@@ -10,6 +10,7 @@ import MailboxesPage from "@/pages/MailboxesPage";
 import PhonesPage from "@/pages/PhonesPage";
 import DispatchPage from "@/pages/DispatchPage";
 import ActivationAuditPage from "@/pages/ActivationAuditPage";
+import LogsPage from "@/pages/LogsPage";
 import SettingsPage from "@/pages/SettingsPage";
 
 export default function App() {
@@ -31,6 +32,7 @@ export default function App() {
         <Route path="/phones" element={<PhonesPage />} />
         <Route path="/dispatch" element={<DispatchPage />} />
         <Route path="/activation-audit" element={<ActivationAuditPage />} />
+        <Route path="/logs" element={<LogsPage />} />
         <Route path="/settings" element={<SettingsPage />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />

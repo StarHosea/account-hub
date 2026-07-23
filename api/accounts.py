@@ -330,6 +330,34 @@ def create_router() -> APIRouter:
 
         return {"progress_id": progress_id}
 
+    @router.post("/api/accounts/refresh-plan")
+    async def refresh_account_plans(body: AccountRefreshRequest, authorization: str | None = Header(default=None)):
+        """批量查询远端套餐档位（仅 accounts/check，不触发浏览器换 token）。"""
+        require_admin(authorization)
+        access_tokens = [str(token or "").strip() for token in body.access_tokens if str(token or "").strip()]
+        if not access_tokens:
+            raise HTTPException(status_code=400, detail={"error": "access_tokens is required"})
+
+        progress_id = str(uuid.uuid4())
+        account_service.init_plan_refresh_progress(progress_id, len(access_tokens))
+
+        async def _do_refresh_plan():
+            try:
+                await run_in_threadpool(account_service.refresh_account_plans, access_tokens, progress_id)
+            except Exception as e:
+                account_service.finish_plan_refresh_progress(progress_id, error=str(e))
+
+        asyncio.create_task(_do_refresh_plan())
+        return {"progress_id": progress_id}
+
+    @router.get("/api/accounts/refresh-plan/progress/{progress_id}")
+    async def get_refresh_plan_progress(progress_id: str, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        progress = account_service.get_plan_refresh_progress(progress_id)
+        if progress is None:
+            raise HTTPException(status_code=404, detail={"error": "progress not found"})
+        return progress
+
     @router.get("/api/accounts/refresh/progress/{progress_id}")
     async def get_refresh_progress(progress_id: str, authorization: str | None = Header(default=None)):
         require_admin(authorization)

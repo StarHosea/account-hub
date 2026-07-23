@@ -9,6 +9,7 @@ import {
   IconSend,
   IconSetting,
   IconHistory,
+  IconFile,
 } from "@douyinfe/semi-icons";
 
 import { NAV_LABELS } from "@/constants/nav";
@@ -23,5 +24,6 @@ export const NAV_MENU_ITEMS = [
   { itemKey: "/phones", text: NAV_LABELS.phones, icon: <IconPhone /> },
   { itemKey: "/dispatch", text: NAV_LABELS.dispatch, icon: <IconSend /> },
   { itemKey: "/activation-audit", text: NAV_LABELS.activationAudit, icon: <IconHistory /> },
+  { itemKey: "/logs", text: NAV_LABELS.logs, icon: <IconFile /> },
   { itemKey: "/settings", text: NAV_LABELS.settings, icon: <IconSetting /> },
 ];

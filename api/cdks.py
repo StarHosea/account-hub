@@ -23,30 +23,44 @@ class CdkRevokeRequest(BaseModel):
     cdks: list[str]
 
 
-def _bound_email(token: str | None) -> str:
+def _resolve_bound(token: str | None, email: str | None) -> dict | None:
+    """解析 CDK 绑定的账号：优先按 bound_email（稳定），回退 bound_token（旧数据）。
+
+    token 会随刷新轮换、别名表仅内存态，重启后按旧 token 解析会误报「账号已删除」。
+    """
+    em = str(email or "").strip()
+    if em:
+        account = account_service.find_by_email(em)
+        if account is not None:
+            return account
+    if token:
+        return account_service.get_account(token)
+    return None
+
+
+def _bound_email(token: str | None, email: str | None = None) -> str:
     """仅解析绑定账号的邮箱，用于 q 搜索匹配（账号已删返回空串）。"""
-    if not token:
-        return ""
-    account = account_service.get_account(token)
+    em = str(email or "").strip()
+    if em:
+        return em
+    account = _resolve_bound(token, None)
     if not account:
         return ""
     return str(account.get("email") or "").strip()
 
 
-def _bound_account(token: str | None) -> dict | None:
-    """把 CDK 的 bound_token 解析成绑定账号的可展示信息（含接码地址）。账号已删则返回 None。"""
-    if not token:
-        return None
-    account = account_service.get_account(token)
+def _bound_account(token: str | None, email: str | None = None) -> dict | None:
+    """把 CDK 的绑定信息解析成可展示的账号信息（含接码地址）。账号已删则返回 None。"""
+    account = _resolve_bound(token, email)
     if not account:
         return None
-    email = str(account.get("email") or "").strip()
+    acct_email = str(account.get("email") or "").strip()
     return {
-        "email": email or None,
+        "email": acct_email or None,
         "password": account.get("password") or None,
         "totp_secret": account.get("totp_secret") or None,
         "otpauth_url": account.get("otpauth_url") or None,
-        "fetch_url": (mailbox_service.get_fetch_url(email) or None) if email else None,
+        "fetch_url": (mailbox_service.get_fetch_url(acct_email) or None) if acct_email else None,
         "status": account.get("status") or None,
         "plus_status": account.get("plus_status") or None,
         "source_type": account.get("source_type") or None,
@@ -62,7 +76,7 @@ def _paginate(seq: list[dict], page: int, page_size: int) -> list[dict]:
 def _payload() -> dict:
     items = cdk_service.list_cdks()
     for item in items:
-        item["bound_account"] = _bound_account(item.get("bound_token"))
+        item["bound_account"] = _bound_account(item.get("bound_token"), item.get("bound_email"))
     return {"items": items, "counts": cdk_service.counts()}
 
 
@@ -94,13 +108,13 @@ def create_router() -> APIRouter:
                 c
                 for c in items
                 if keyword in str(c.get("cdk") or "").lower()
-                or keyword in _bound_email(c.get("bound_token")).lower()
+                or keyword in _bound_email(c.get("bound_token"), c.get("bound_email")).lower()
             ]
 
         total = len(items)
         paged = _paginate(items, page, page_size)
         for item in paged:  # 仅对当前页解析展示用绑定账号信息
-            item["bound_account"] = _bound_account(item.get("bound_token"))
+            item["bound_account"] = _bound_account(item.get("bound_token"), item.get("bound_email"))
         return {
             "items": paged,
             "counts": counts,

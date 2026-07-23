@@ -112,6 +112,9 @@ class CdkService:
             "type": normalize_type(item.get("type")),
             "status": status,
             "bound_token": item.get("bound_token") or None,
+            # 绑定账号以邮箱为主键：access_token 会随刷新轮换，token 别名表仅内存态，
+            # 重启后按旧 token 解析会误报「账号已删除」；邮箱是账号的稳定标识。
+            "bound_email": str(item.get("bound_email") or "").strip() or None,
             "used_at": item.get("used_at") or None,
             "imported_at": item.get("imported_at") or _now(),
             "note": str(item.get("note") or ""),
@@ -211,8 +214,8 @@ class CdkService:
         with self._lock:
             self._reserved.discard(str(cdk).strip())
 
-    def consume(self, cdk: str, bound_token: str) -> None:
-        """成功兑换：置 used 并记录绑定账号。"""
+    def consume(self, cdk: str, bound_token: str, email: str | None = None) -> None:
+        """成功兑换：置 used 并记录绑定账号（email 为稳定主键，token 仅作参考）。"""
         with self._lock:
             self._reserved.discard(str(cdk).strip())
             item = self._cdks.get(str(cdk).strip())
@@ -220,6 +223,7 @@ class CdkService:
                 return
             item["status"] = STATUS_USED
             item["bound_token"] = str(bound_token or "") or None
+            item["bound_email"] = str(email or "").strip() or None
             item["used_at"] = _now()
             self._save()
 
@@ -276,6 +280,7 @@ class CdkService:
                 if item.get("status") != STATUS_AVAILABLE:
                     item["status"] = STATUS_AVAILABLE
                     item["bound_token"] = None
+                    item["bound_email"] = None
                     item["used_at"] = None
                     need_save = True
                     touched = True

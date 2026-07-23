@@ -4,8 +4,8 @@
 oauth-token），而是复用注册用的 node_engine 浏览器引擎：spawn worker.js →
 在真实浏览器里恢复 session 或登录取新 token。
 
-- session_refresh：注入 browser_session（cookies/localStorage）快路径，失败 fallback 密码登录
-- login：完整密码登录（刷新 / 重登兜底）
+- session_refresh：注入 browser_session（cookies/localStorage）快路径；未过期时不 fallback 登录，失败再降级 login
+- login：完整登录（有密码走密码；无密码走邮箱 OTP / 现有忘记密码兜底）
 - 验证码从账号「自己绑定的邮箱」取（mailbox_service.get_fetch_url），不是注册用的邮箱池。
 - 代理复用账号专属出口（号一号一 IP），转成 CloakBrowser 可用的 socks5/http URL。
 """
@@ -98,35 +98,24 @@ def _build_browser_job(
     return job
 
 
-def run_token_refresh(
-    account: dict[str, Any],
-    *,
-    log=lambda *_: None,
-) -> dict:
-    """强制刷新 access_token：优先 session 恢复，失败 fallback 密码登录。
+def _token_is_fresh(access_token: str) -> bool:
+    """JWT exp > now；无法解析视为不新鲜。"""
+    try:
+        import base64
+        import time as _time
 
-    返回 {ok, access_token, browser_session, fingerprint_seed, via_session, reset_password, error}。
-    """
-    email = str(account.get("email") or "").strip()
-    password = str(account.get("password") or "").strip()
-    if not email or not password:
-        return {"ok": False, "error": "无邮箱或密码，无法刷新 token"}
+        payload = str(access_token or "").split(".")[1]
+        payload += "=" * ((4 - len(payload) % 4) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")))
+        exp = int((data or {}).get("exp") or 0)
+        return exp > int(_time.time())
+    except Exception:
+        return False
 
-    # 统一走 session_refresh：确认登录态后会 reload 再读 AccessToken；
-    # 无 browser_session 时由 fallbackLogin 走密码登录。
-    session = _browser_session_from_account(account)
-    job = _build_browser_job(account, mode="session_refresh")
-    job["fallbackLogin"] = True
-    if session:
-        job["storageState"] = session
-    mail_config, mailbox = _account_mail_ctx(email)
 
-    with _login_sem:
-        result = _drive_worker(job, mail_config, mailbox, log)
-
+def _normalize_refresh_result(result: dict) -> dict:
     if not result.get("ok"):
         return result
-
     storage = result.get("browser_session")
     if not isinstance(storage, dict):
         storage = None
@@ -141,6 +130,52 @@ def run_token_refresh(
         "user": result.get("user"),
         "expires": result.get("expires"),
     }
+
+
+def run_token_refresh(
+    account: dict[str, Any],
+    *,
+    log=lambda *_: None,
+) -> dict:
+    """强制刷新 access_token：未过期+Cookie 只走 session；否则登录（可无密码 OTP）。
+
+    返回 {ok, access_token, browser_session, fingerprint_seed, via_session, reset_password, error}。
+    """
+    email = str(account.get("email") or "").strip()
+    if not email:
+        return {"ok": False, "error": "无邮箱，无法刷新 token"}
+
+    access_token = str(account.get("access_token") or "").strip()
+    session = _browser_session_from_account(account)
+    fresh = _token_is_fresh(access_token)
+    mail_config, mailbox = _account_mail_ctx(email)
+
+    def _run(job: dict) -> dict:
+        with _login_sem:
+            return _drive_worker(job, mail_config, mailbox, log)
+
+    # 未过期 + Cookie：只 session 刷 AccessToken；失败再降级登录。
+    if session and fresh:
+        job = _build_browser_job(account, mode="session_refresh")
+        job["fallbackLogin"] = False
+        job["storageState"] = session
+        result = _run(job)
+        if result.get("ok"):
+            return _normalize_refresh_result(result)
+        # 降级登录（无密码时 Node 走邮箱 OTP）
+        login_job = _build_browser_job(account, mode="login")
+        return _normalize_refresh_result(_run(login_job))
+
+    # 已过期但有 Cookie：先试 session，失败由 worker 内 fallbackLogin 走登录。
+    if session:
+        job = _build_browser_job(account, mode="session_refresh")
+        job["fallbackLogin"] = True
+        job["storageState"] = session
+        return _normalize_refresh_result(_run(job))
+
+    # 无 Cookie：直接正常登录。
+    login_job = _build_browser_job(account, mode="login")
+    return _normalize_refresh_result(_run(login_job))
 
 
 def run_browser_login(

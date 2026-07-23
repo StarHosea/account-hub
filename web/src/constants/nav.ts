@@ -9,6 +9,7 @@ export const NAV_LABELS = {
   phones: "号码管理",
   dispatch: "账号出库",
   activationAudit: "激活审计",
+  logs: "操作日志",
   settings: "系统设置",
 } as const;
 
@@ -24,6 +25,7 @@ export const NAV_ITEMS: { itemKey: string; text: string }[] = [
   { itemKey: "/phones", text: NAV_LABELS.phones },
   { itemKey: "/dispatch", text: NAV_LABELS.dispatch },
   { itemKey: "/activation-audit", text: NAV_LABELS.activationAudit },
+  { itemKey: "/logs", text: NAV_LABELS.logs },
   { itemKey: "/settings", text: NAV_LABELS.settings },
 ];
 

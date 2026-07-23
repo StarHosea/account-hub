@@ -12,8 +12,8 @@ from services.account_lifecycle import (
     STAGE_ACTIVATING,
     STAGE_PLUS_ACTIVATED,
     STAGE_REGISTERED,
-    apply_stage,
     enrich_account,
+    remote_subscription_tier,
     _norm_email,
 )
 from services.account_service import account_service
@@ -24,6 +24,7 @@ from services.cdk_redeem_client import (
     CdkRedeemClient,
     RedeemError,
     classify,
+    is_cdk_used_error,
     item_for_cdk,
     item_message,
     item_status,
@@ -33,6 +34,7 @@ from services.cdk_redeem_client import (
 )
 from services.activation_audit_service import (
     OUTCOME_FAILED,
+    OUTCOME_REVIEW,
     OUTCOME_SUCCESS,
     ActivationAuditRecorder,
     activation_audit_service,
@@ -51,14 +53,16 @@ _TERMINAL_CLS = frozenset({"success", "fail", "cdk_invalid", "timeout", "cancell
 
 
 def is_activation_eligible(account: dict) -> bool:
-    """与 start() → _resolve_targets 默认分支相同的可选中口径（尚未入队的 registered 免费号）。"""
+    """与 start() → _resolve_targets 默认分支相同的可选中口径（尚未激活成功的 registered 免费号）。
+
+    plus_redeem_locked（曾提交且可能被受理过 CDK）的账号**仍可入选**：worker 会先做档位
+    预检（preverify），真成功的自动转正，未确认的因有锁不会再提交新卡——锁挡的是烧卡，
+    不挡核实。
+    """
     item = enrich_account(account)
     if item.get("stage") in _ACTIVATION_DONE_STAGES:
         return False
     if item.get("plus_activated_at"):
-        return False
-    if item.get("plus_redeem_locked"):
-        # 已对该账号提交并被服务端受理过一张 CDK：不再自动提交第二张卡，避免重复激活烧卡。
         return False
     if item.get("plus_unavailable"):
         return False
@@ -75,8 +79,6 @@ def can_run_activation(account: dict) -> bool:
     if item.get("stage") in _ACTIVATION_DONE_STAGES:
         return False
     if item.get("plus_activated_at"):
-        return False
-    if item.get("plus_redeem_locked"):
         return False
     if item.get("plus_unavailable"):
         return False
@@ -160,9 +162,8 @@ class ActivationService:
         free = sum(1 for a in accounts if a.get("plus_status", STATUS_UNACTIVATED) == STATUS_UNACTIVATED)
         activated = sum(1 for a in accounts if a.get("plus_status") == STATUS_ACTIVATED)
         activating = sum(1 for a in accounts if a.get("plus_status") in (STATUS_QUEUED, STATUS_ACTIVATING))
-        # 按真实套餐 type 判定「是否已激活 Plus」：type==plus 视为已激活，其余（含 free/空）视为未激活。
-        # 与上面基于 plus_status 的 free/activated 口径分开：这两个字段供工作台卡片展示用。
-        plus_by_type = sum(1 for a in accounts if str(a.get("type") or "").strip().lower() == "plus")
+        # 按远端 subscription_tier 统计真实 ChatGPT 套餐（与 CDK 激活 lifecycle 无关）。
+        plus_by_type = sum(1 for a in accounts if remote_subscription_tier(a) == "plus")
         not_plus_by_type = len(accounts) - plus_by_type
         pending = sum(1 for a in accounts if is_activation_eligible(a))
         return {
@@ -387,13 +388,7 @@ class ActivationService:
         # 入选后立刻标 stage=activating，供运行监控 /api/accounts?activation=activating 展示。
         # 须在 cap 之后标记，避免 limit 截掉的账号卡住 activating。
         for token in targets:
-            acct = by_token.get(token)
-            if not acct:
-                acct = account_service.get_account(token)
-            if not acct:
-                continue
-            item = enrich_account(acct)
-            account_service.update_account(token, apply_stage(item, STAGE_ACTIVATING), quiet=True)
+            account_service.apply_stage_update(token, STAGE_ACTIVATING)
         return targets
 
     @staticmethod
@@ -414,8 +409,6 @@ class ActivationService:
                 futures = [executor.submit(self._activate_account, client, token, cfg) for token in targets]
                 self._bump(running=min(len(targets), cfg["concurrency"]))
                 for future in futures:
-                    if self._stop.is_set():
-                        pass
                     try:
                         result = future.result()
                     except Exception as exc:
@@ -446,12 +439,11 @@ class ActivationService:
             cdk_service.clear_reservations()
         self._bump(running=0, job_running=False, finished_at=_now())
         self._persist_stats(force=True)
-        review_final = int(self._stats.get("review") or 0)
         parts: list[str] = []
         if skipped:
             parts.append(f"跳过重复 {skipped}")
         if review:
-            parts.append(f"已标记激活 {review}")
+            parts.append(f"已提交待核 {review}")
         suffix = f"，{ '，'.join(parts)}" if parts else ""
         self._append_log(f"激活任务结束，成功 {success}，失败 {fail}{suffix}", "yellow")
 
@@ -475,8 +467,7 @@ class ActivationService:
             item = enrich_account(acct)
             # 自动激活不走 _resolve_targets，须在此标 activating；批量路径已标记则幂等。
             if item.get("stage") != STAGE_ACTIVATING:
-                account_service.update_account(token, apply_stage(item, STAGE_ACTIVATING), quiet=True)
-                acct = account_service.get_account(token) or acct
+                acct = account_service.apply_stage_update(token, STAGE_ACTIVATING) or acct
             if self._stop.is_set():
                 return False
             return self._activate_account_body(client, token, cfg, acct, email, log_sink, source)
@@ -509,9 +500,33 @@ class ActivationService:
 
             # 提交前预检真实档位：已是 Plus 则直接判成功、打持久锁，绝不再烧卡。
             # 返回最新 access_token（fetch_remote_info 可能刷新 token），后续用它提交更稳。
-            handled, token = self._preverify_already_plus(token, email, log_sink, audit)
+            handled, token, plan_verified = self._preverify_already_plus(token, email, log_sink, audit)
             if handled:
                 return True
+            # token 可能已被 preverify 刷新：审计与账号联动（last_activation_audit_id、
+            # 按 token 检索/删除审计）都要用最新值，否则审计与账号对不上。
+            audit.access_token = token
+
+            latest = enrich_account(account_service.get_account(token) or acct or {})
+            if latest.get("plus_redeem_locked"):
+                # 曾提交且可能被服务端受理过 CDK：锁挡的是「再烧一张卡」，不挡核实。
+                # 预检已确认非 Plus → 标失败待人工；档位查询失败 → 本轮跳过，下轮再核实。
+                if not plan_verified:
+                    self._record_skip(email, "曾提交 CDK 待核实，本次档位查询失败，已跳过（不烧卡）", log_sink)
+                    return None
+                msg = "曾提交 CDK 未确认成功，核实非 Plus：不再自动烧卡，已标记不可用，可在账号管理用「撤销激活」复位后重试"
+                account_service.apply_stage_update(
+                    token,
+                    STAGE_REGISTERED,
+                    plus_status=STATUS_FAILED,
+                    plus_unavailable=True,
+                    plus_last_message=msg,
+                    plus_updated_at=_now(),
+                )
+                self._append_log(f"[{email}] {msg}", "red", log_sink)
+                if not audit.finished_at:
+                    self._end_audit(audit, OUTCOME_FAILED, msg, token, cdk=None, cdk_type=None, cdk_consumed=False)
+                return False
 
             for cdk_type in CDK_TYPES:
                 tried: set[str] = set()
@@ -532,33 +547,29 @@ class ActivationService:
                         return True
                     if outcome == "review":
                         self._mark_activated_after_submit(token, email, last_cdk, last_cdk_type, audit, log_sink)
-                        return True
+                        return "review"
                     if outcome == "stopped":
                         break
                     # outcome == "next_card"：换下一张卡继续（attempts 已按需在单卡逻辑内递增）
                 if self._stop.is_set():
                     break
 
+            if self._stop.is_set():
+                # 停止信号打断：不判失败、不标不可用（否则点一次「停止」会把整批进行中的
+                # 账号错标成激活失败）；finally 会把进行中状态复位为未激活，下轮重新处理。
+                return None
+
             summary = "两种类型 CDK 均激活失败，已标记账号不可用" if any_attempt else "无可用 CDK"
-            self._set_account(token, plus_status=STATUS_FAILED,
-                              plus_unavailable=any_attempt,
-                              plus_last_message=summary)
-            acct = account_service.get_account(token)
-            if acct:
-                # 保留失败态 plus_status，同时把 stage 从 activating 收回 registered。
-                account_service.update_account(
-                    token,
-                    apply_stage(
-                        enrich_account(acct),
-                        STAGE_REGISTERED,
-                        plus_status=STATUS_FAILED,
-                        plus_unavailable=any_attempt,
-                        plus_last_message=summary,
-                    ),
-                    quiet=True,
-                )
+            account_service.apply_stage_update(
+                token,
+                STAGE_REGISTERED,
+                plus_status=STATUS_FAILED,
+                plus_unavailable=any_attempt,
+                plus_last_message=summary,
+                plus_updated_at=_now(),
+            )
             if any_attempt:
-                self._append_log(f"[{email}] 两种类型 CDK 均激活失败，标记账号不可用（下轮激活将跳过，可人工标记可用）", "red", log_sink)
+                self._append_log(f"[{email}] 两种类型 CDK 均激活失败，标记账号不可用（下轮激活将跳过，可在账号管理用「撤销激活」复位）", "red", log_sink)
             if not audit.finished_at:
                 self._end_audit(
                     audit,
@@ -589,39 +600,71 @@ class ActivationService:
                             "plus_cdk": None,
                             "plus_task_id": None,
                         }
-                    patch = apply_stage({**item, **clear}, STAGE_REGISTERED, **clear)
-                    account_service.update_account(token, patch, quiet=True)
+                    account_service.apply_stage_update(token, STAGE_REGISTERED, **clear)
 
-    def _preverify_already_plus(self, token: str, email: str, log_sink, audit) -> tuple[bool, str]:
+    def _fetch_remote_plan_with_token_refresh(
+        self,
+        token: str,
+        event: str,
+    ) -> tuple[dict | None, str, bool, str | None]:
+        """拉远端套餐；InvalidAccessToken 时强制换 JWT 再试一次。
+
+        返回 (account, active_token, verified, error)：
+        - verified=False 表示查询失败（网络/换 Token 失败/仍无效）；
+        - active_token 可能因换 JWT 与传入不同。
+        """
+        from services.openai_backend_api import InvalidAccessTokenError
+
+        active = token
+        try:
+            return account_service.fetch_remote_plan(active, event=event), active, True, None
+        except InvalidAccessTokenError as exc:
+            refreshed = account_service.refresh_access_token(active, force=True, event=event)
+            if refreshed and refreshed != active:
+                active = refreshed
+                try:
+                    return account_service.fetch_remote_plan(active, event=event), active, True, None
+                except Exception as retry_exc:  # noqa: BLE001
+                    return None, active, False, str(retry_exc)
+            return None, active, False, str(exc)
+        except Exception as exc:  # noqa: BLE001
+            return None, active, False, str(exc)
+
+    def _preverify_already_plus(self, token: str, email: str, log_sink, audit) -> tuple[bool, str, bool]:
         """提交前预检真实档位：已是 Plus 直接判成功、不烧卡。
 
-        返回 (handled, latest_token)：handled=True 表示已按「已是 Plus」收尾，调用方直接成功返回；
-        handled=False 表示需继续正常兑换。latest_token 为 fetch_remote_info 刷新后的最新 access_token
-        （可能与传入不同），供后续 submit 使用；查询失败时原样回传，不阻断兑换。
+        返回 (handled, latest_token, verified)：
+        - handled=True 表示已按「已是 Plus」收尾，调用方直接成功返回；
+        - latest_token 在 token 刷新后可能与传入不同；
+        - verified 表示本次档位查询是否成功（False=网络/接口失败、档位未知），供
+          plus_redeem_locked 账号的守卫区分「确认非 Plus」与「查不到」。
         """
-        try:
-            acct = account_service.fetch_remote_info(token, event="activation_preverify")
-        except Exception:  # noqa: BLE001 —— 预检失败不应阻断正常兑换
-            return False, token
+        acct, active, verified, _error = self._fetch_remote_plan_with_token_refresh(token, "activation_preverify")
+        if not verified:
+            return False, active, False
+
         item = enrich_account(acct or {})
-        latest = str(item.get("access_token") or token) or token
-        if str(item.get("type") or "").strip().lower() != "plus":
-            return False, latest
+        latest = str(item.get("access_token") or active) or active
+        if remote_subscription_tier(item) != "plus":
+            return False, latest, True
         msg = "提交前核实已是 Plus，跳过兑换（不烧卡）"
-        self._set_account(latest, plus_redeem_locked=True)
-        account_service.update_account(
+        account_service.apply_stage_update(
             latest,
-            apply_stage(item, STAGE_PLUS_ACTIVATED, plan="plus",
-                        activated_at=item.get("activated_at") or _now(),
-                        plus_last_message=msg),
-            quiet=True,
+            STAGE_PLUS_ACTIVATED,
+            plan="plus",
+            plus_status=STATUS_ACTIVATED,
+            plus_redeem_locked=True,
+            activated_at=item.get("activated_at") or item.get("plus_activated_at") or _now(),
+            plus_activated_at=item.get("plus_activated_at") or _now(),
+            plus_last_message=msg,
+            plus_updated_at=_now(),
         )
         self._append_log(f"[{email}] {msg}", "green", log_sink)
         if audit:
             audit.record_plan_verify("success", tier="plus")
             if not audit.finished_at:
                 self._end_audit(audit, OUTCOME_SUCCESS, msg, latest, cdk=None, cdk_type=None, cdk_consumed=False)
-        return True, latest
+        return True, latest, True
 
     def _redeem_one_cdk(self, client: CdkRedeemClient, token: str, cdk: str, cdk_type: str, cfg: dict,
                         attempts: dict, max_attempts: int, email: str, log_sink, audit) -> str:
@@ -629,13 +672,18 @@ class ActivationService:
 
           success   —— 兑换成功（已 consume、已置激活）
           next_card —— 该卡不再重试，换下一张卡（失败已计入 attempts / not_found / 重试超上限）
-          review    —— 已受理但未出明确终态，按已激活收尾（timeout 重试超限），持久锁已在
+          review    —— 已受理但未出明确终态且档位核实失败，按「已提交待核」乐观收尾
           stopped   —— 收到停止信号
 
         重试策略：timeout（服务端返回 timeout 终态）走 /cdkey-jobs/retry 复用同卡、不计失败次数、
-        上限 timeout_retry_max；failed 走 retry 复用同卡、上限 failed_retry_max，用尽才换卡并计入
-        max_attempts_per_type。轮询阶段接口正常且未出终态时会一直查状态，不因时间兜底报错。
-        任一次被服务端受理即打 plus_redeem_locked 持久锁，杜绝重复烧卡。
+        上限 timeout_retry_max；用尽后先核实真实档位——已是 Plus 判成功，非 Plus 计一次失败换卡，
+        查询失败才乐观标记（review）。failed 走 retry 复用同卡、上限 failed_retry_max，用尽才换卡
+        并计入 max_attempts_per_type；服务端明示「已提供/已被使用」的卡直接标异常换卡、不计账号
+        失败次数。轮询阶段接口正常且未出终态时会一直查状态，不因时间兜底报错。
+
+        持久锁（plus_redeem_locked）只在 success / timeout / poll_stopped 打——这些状态下服务端
+        可能已经或将要核销一张卡；明确失败（fail/cancelled/rejected）与卡不存在（cdk_invalid）
+        没有核销风险，不打锁，避免一次普通失败把账号永久挡在自动激活之外。
         """
         timeout_retry_max = int(cfg.get("timeout_retry_max", 5))
         failed_retry_max = int(cfg.get("failed_retry_max", 3))
@@ -659,33 +707,15 @@ class ActivationService:
                 except RedeemError as exc:
                     cls, status, message, task_id = "fail", "error", scrub(str(exc)), ""
 
-                # 一旦被服务端受理（进入过队列），立刻打持久锁：即便后续判超时/失败也不再烧第二张卡。
-                if cls not in ("rejected", "retry_rejected") and not locked:
+                if cls in ("success", "timeout", "poll_stopped") and not locked:
                     self._set_account(token, plus_redeem_locked=True)
                     locked = True
 
                 if cls == "success":
-                    cdk_service.consume(cdk, token)
+                    cdk_service.consume(cdk, token, email=email)
                     consumed = True
                     audit.cdk_consumed = True
-                    already_activated_at = (account_service.get_account(token) or {}).get("plus_activated_at")
-                    self._set_account(token, plus_status=STATUS_ACTIVATED, plus_task_id=task_id,
-                                      plus_last_message=message or "兑换成功",
-                                      plus_activated_at=already_activated_at or _now())
-                    self._append_log(f"[{email}] 激活成功（{cdk_type}）", "green", log_sink)
-                    acct = account_service.get_account(token)
-                    if acct:
-                        item = enrich_account(acct)
-                        account_service.update_account(
-                            token,
-                            apply_stage(
-                                item,
-                                STAGE_PLUS_ACTIVATED,
-                                plan="plus",
-                                activated_at=item.get("activated_at") or item.get("plus_activated_at") or _now(),
-                            ),
-                            quiet=True,
-                        )
+                    self._finalize_activation_success(token, email, cdk_type, task_id, message or "兑换成功", log_sink)
                     if audit and not audit.finished_at:
                         self._end_audit(
                             audit,
@@ -704,6 +734,15 @@ class ActivationService:
                     self._append_log(f"[{email}] CDK {scrub(cdk)} 无效(not_found)，换下一个", "yellow", log_sink)
                     return "next_card"
 
+                if cls in ("fail", "rejected") and is_cdk_used_error(message, status):
+                    # 服务端明示该 CDK 已被使用/已提供：卡已被核销，重试同卡永远失败。
+                    # 标记 CDK 异常并换下一张；不计账号失败次数——是卡的问题，不是账号的问题。
+                    cdk_service.mark_invalid(cdk)
+                    consumed = True
+                    self._append_log(
+                        f"[{email}] CDK {scrub(cdk)} 服务端提示已被使用，标记异常并换下一张", "yellow", log_sink)
+                    return "next_card"
+
                 if cls == "timeout":
                     if timeout_retries < timeout_retry_max:
                         timeout_retries += 1
@@ -713,8 +752,34 @@ class ActivationService:
                             f"[{email}] {cdk_type} 兑换超时，复用同卡重试 第 {timeout_retries}/{timeout_retry_max} 次", "yellow", log_sink)
                         action = "retry"
                         continue
+                    # 超时重试用尽：不再直接标已激活，先核实真实档位再定终态。
+                    verdict, token = self._verify_plan_after_timeout(token, audit)
+                    if verdict == "plus":
+                        cdk_service.consume(cdk, token, email=email)
+                        consumed = True
+                        audit.cdk_consumed = True
+                        msg = "兑换超时重试达上限，档位核实已是 Plus"
+                        self._finalize_activation_success(token, email, cdk_type, task_id, msg, log_sink)
+                        if audit and not audit.finished_at:
+                            self._end_audit(audit, OUTCOME_SUCCESS, msg, token,
+                                            cdk=audit.cdk, cdk_type=audit.cdk_type, cdk_consumed=True)
+                        return "success"
+                    if verdict == "free":
+                        # 服务端没兑上：解锁（无核销证据），计一次失败并换下一张卡。
+                        # 本卡随 finally release 回池；若服务端实际已核销，别的账号再提交
+                        # 会收到「已提供」并被自动标异常（is_cdk_used_error 兜底）。
+                        if locked:
+                            self._set_account(token, plus_redeem_locked=False)
+                            locked = False
+                        attempts[cdk_type] = attempts.get(cdk_type, 0) + 1
+                        self._set_account(token, plus_attempts=attempts,
+                                          plus_last_message=f"{cdk_type} 兑换超时（重试 {timeout_retry_max} 次）且核实非 Plus")
+                        self._append_log(
+                            f"[{email}] {cdk_type} 超时重试达上限且核实非 Plus，计一次失败并换下一张卡", "red", log_sink)
+                        return "next_card"
+                    # 档位核实失败（网络/接口异常）：保守按「已提交待核」乐观收尾，上层单列统计。
                     self._append_log(
-                        f"[{email}] {cdk_type} 超时重试已达上限（{timeout_retry_max}），已标记为已激活", "yellow", log_sink)
+                        f"[{email}] {cdk_type} 超时重试已达上限（{timeout_retry_max}）且档位核实失败，按已提交待核收尾", "yellow", log_sink)
                     return "review"
 
                 if cls == "poll_stopped":
@@ -758,26 +823,71 @@ class ActivationService:
             if not consumed:
                 cdk_service.release(cdk)
 
+    def _finalize_activation_success(self, token: str, email: str, cdk_type: str, task_id: str,
+                                     message: str, log_sink) -> None:
+        """确认成功的唯一收尾：单次原子写升级 stage/plan/plus_status。
+
+        此前分两步（先写 plus_status=已激活、再升 stage）：第一步的中间态会被 enrich
+        推导冲回「排队中」，两步之间中断就会把已成功账号复位成免费号——CDK 已消耗、
+        服务端已激活，本地却显示未激活。原子写彻底关掉该窗口。
+        """
+        prev = account_service.get_account(token) or {}
+        already = prev.get("plus_activated_at")
+        updated = account_service.apply_stage_update(
+            token,
+            STAGE_PLUS_ACTIVATED,
+            plan="plus",
+            plus_status=STATUS_ACTIVATED,
+            plus_task_id=task_id or prev.get("plus_task_id"),
+            plus_last_message=message,
+            plus_activated_at=already or _now(),
+            activated_at=prev.get("activated_at") or already or _now(),
+            plus_updated_at=_now(),
+        )
+        if updated is None:
+            self._append_log(f"[{email}] 兑换成功但未找到账号记录，状态未写入，请人工核查", "red", log_sink)
+        else:
+            self._append_log(f"[{email}] 激活成功（{cdk_type}）", "green", log_sink)
+
+    def _verify_plan_after_timeout(self, token: str, audit) -> tuple[str, str]:
+        """timeout 重试用尽后核实真实档位。返回 (verdict, latest_token)，verdict ∈ plus/free/unknown。"""
+        acct, active, verified, error = self._fetch_remote_plan_with_token_refresh(token, "activation_timeout_verify")
+        if not verified:
+            if audit:
+                audit.record_plan_verify("error", error=error or "plan verify failed")
+            return "unknown", active
+        item = enrich_account(acct or {})
+        latest = str(item.get("access_token") or active) or active
+        tier = remote_subscription_tier(item)
+        if audit:
+            audit.record_plan_verify("done", tier=tier or "unknown")
+        if tier == "plus":
+            return "plus", latest
+        if tier:
+            return "free", latest
+        return "unknown", latest
+
     def _mark_activated_after_submit(self, token: str, email: str, cdk, cdk_type, audit, log_sink) -> None:
-        """CDK 已受理但未拿到明确成功终态：仍按已激活收尾，保留持久锁、不再自动烧卡。"""
-        msg = "CDK 已提交受理，已标记为已激活"
-        acct = account_service.get_account(token)
-        if acct:
-            item = enrich_account(acct)
-            account_service.update_account(
-                token,
-                apply_stage(
-                    item,
-                    STAGE_PLUS_ACTIVATED,
-                    plan="plus",
-                    activated_at=item.get("activated_at") or item.get("plus_activated_at") or _now(),
-                    plus_last_message=msg,
-                ),
-                quiet=True,
-            )
-        self._append_log(f"[{email}] {msg}", "green", log_sink)
+        """CDK 已受理、超时重试用尽且档位核实失败：乐观按已激活收尾（保留持久锁，不再自动烧卡）。
+
+        与确认成功不同：这里没有服务端 success 终态，文案明确标注「未确认」，审计 outcome
+        记为 review、批量统计单列「已提交待核」，供人工复核后用「撤销激活」纠正。
+        """
+        msg = "CDK 已提交受理，未等到明确成功终态，已乐观标记为已激活——请人工核实真实档位"
+        prev = account_service.get_account(token) or {}
+        account_service.apply_stage_update(
+            token,
+            STAGE_PLUS_ACTIVATED,
+            plan="plus",
+            plus_status=STATUS_ACTIVATED,
+            plus_last_message=msg,
+            plus_activated_at=prev.get("plus_activated_at") or _now(),
+            activated_at=prev.get("activated_at") or prev.get("plus_activated_at") or _now(),
+            plus_updated_at=_now(),
+        )
+        self._append_log(f"[{email}] {msg}", "yellow", log_sink)
         if audit and not audit.finished_at:
-            self._end_audit(audit, OUTCOME_SUCCESS, msg, token, cdk=cdk, cdk_type=cdk_type, cdk_consumed=audit.cdk_consumed)
+            self._end_audit(audit, OUTCOME_REVIEW, msg, token, cdk=cdk, cdk_type=cdk_type, cdk_consumed=audit.cdk_consumed)
 
     def _log_raw(self, cdk: str, phase: str, js: object, log_sink=None) -> None:
         """把兑换接口的原始响应（脱敏 + 截断）写进激活日志，便于本地定位真实信封结构与状态词。"""

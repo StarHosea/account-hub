@@ -125,7 +125,7 @@ class ActivationReviewTest(unittest.TestCase):
             "type": "free",
         }
         with patch("services.activation_service.account_service.list_accounts", return_value=[review, pending]):
-            with patch("services.activation_service.account_service.update_account"):
+            with patch("services.activation_service.account_service.apply_stage_update"):
                 targets = svc._resolve_targets(None)
         self.assertEqual(targets, ["eyJfree"])
 
@@ -139,20 +139,20 @@ class ActivationReviewTest(unittest.TestCase):
             "plan": "free",
             "type": "free",
         }
-        updates: list[tuple[str, dict]] = []
+        updates: list[tuple[str, str]] = []
 
-        def _capture_update(token, fields, quiet=False):
-            updates.append((token, dict(fields)))
-            return {**pending, **fields}
+        def _capture_stage(token, stage, **extra):
+            updates.append((token, stage))
+            return {**pending, "stage": stage, **extra}
 
         with patch("services.activation_service.account_service.list_accounts", return_value=[pending]):
-            with patch("services.activation_service.account_service.update_account", side_effect=_capture_update):
+            with patch("services.activation_service.account_service.apply_stage_update", side_effect=_capture_stage):
                 targets = svc._resolve_targets(None, limit=1)
         self.assertEqual(targets, ["eyJfree"])
-        self.assertTrue(updates, "默认路径应 update_account 标记激活中")
-        token, fields = updates[0]
+        self.assertTrue(updates, "默认路径应 apply_stage_update 标记激活中")
+        token, stage = updates[0]
         self.assertEqual(token, "eyJfree")
-        self.assertEqual(fields.get("stage"), STAGE_ACTIVATING)
+        self.assertEqual(stage, STAGE_ACTIVATING)
 
     def test_resolve_targets_limit_only_marks_selected(self):
         """limit 截取后只标记实际入选账号，避免多余账号卡在 activating。"""
@@ -169,13 +169,13 @@ class ActivationReviewTest(unittest.TestCase):
         ]
         marked: list[str] = []
 
-        def _capture_update(token, fields, quiet=False):
-            if fields.get("stage") == STAGE_ACTIVATING:
+        def _capture_stage(token, stage, **extra):
+            if stage == STAGE_ACTIVATING:
                 marked.append(token)
-            return {**next(a for a in accounts if a["access_token"] == token), **fields}
+            return {**next(a for a in accounts if a["access_token"] == token), "stage": stage, **extra}
 
         with patch("services.activation_service.account_service.list_accounts", return_value=accounts):
-            with patch("services.activation_service.account_service.update_account", side_effect=_capture_update):
+            with patch("services.activation_service.account_service.apply_stage_update", side_effect=_capture_stage):
                 targets = svc._resolve_targets(None, limit=1)
         self.assertEqual(targets, ["eyJ0"])
         self.assertEqual(marked, ["eyJ0"])
@@ -211,6 +211,34 @@ class ActivationReviewTest(unittest.TestCase):
         assert failed is not None
         self.assertEqual(failed.get("plus_status"), "激活失败")
 
+    def test_reconcile_locked_stuck_account_not_marked_activated(self):
+        """曾提交 CDK（redeem 锁）且卡在进行中的账号：重启对账不得乐观标已激活。
+
+        旧行为直接标 plus_activated 造成假成功（明确失败的卡也打过锁）；新行为复位为
+        未激活并保留锁，交由下轮激活预检核实真实档位。
+        """
+        storage = MemoryStorage([
+            {
+                "email": "locked@x.com",
+                "access_token": "eyJlocked",
+                "stage": STAGE_ACTIVATING,
+                "plan": "free",
+                "plus_status": "激活中",
+                "plus_redeem_locked": True,
+            },
+        ])
+        svc = AccountService(storage)
+        reset = svc.reconcile_stuck_activations()
+        self.assertEqual(reset, 1)
+        item = svc.get_account("eyJlocked")
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertEqual(item.get("stage"), STAGE_REGISTERED)
+        self.assertEqual(item.get("plan"), "free")
+        self.assertEqual(item.get("plus_status"), "未激活")
+        self.assertTrue(item.get("plus_redeem_locked"))
+        self.assertIsNone(item.get("plus_activated_at"))
+
     def test_account_claim_rejects_duplicate(self):
         svc = ActivationService()
         email_key = "claim@x.com"
@@ -239,6 +267,35 @@ class ActivationReviewTest(unittest.TestCase):
         self.assertIsNone(ok)
         acquire.assert_not_called()
         svc._release_account("skip@x.com")
+
+    def test_verify_plan_after_timeout_refreshes_invalid_token(self):
+        from services.openai_backend_api import InvalidAccessTokenError
+
+        svc = ActivationService()
+        old_token = "eyJold"
+        new_token = "eyJnew"
+        refreshed_acct = {
+            "email": "t@x.com",
+            "access_token": new_token,
+            "subscription_tier": "plus",
+            "plan": "free",
+            "stage": STAGE_REGISTERED,
+        }
+
+        def _fetch(token: str, event: str = "fetch_remote_plan"):
+            if token == old_token:
+                raise InvalidAccessTokenError("token invalidated")
+            return refreshed_acct
+
+        with patch("services.activation_service.account_service.fetch_remote_plan", side_effect=_fetch):
+            with patch(
+                "services.activation_service.account_service.refresh_access_token",
+                return_value=new_token,
+            ) as refresh:
+                verdict, latest = svc._verify_plan_after_timeout(old_token, audit=None)
+        self.assertEqual(verdict, "plus")
+        self.assertEqual(latest, new_token)
+        refresh.assert_called_once()
 
 
 if __name__ == "__main__":

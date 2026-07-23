@@ -38,5 +38,8 @@ class LogService:
     def delete(self, ids: list[str]) -> dict[str, int]:
         return self._storage.delete(ids)
 
+    def clear(self) -> dict[str, int]:
+        return self._storage.clear()
+
 
 log_service = LogService()

@@ -149,6 +149,68 @@ class AccountLifecycleTest(unittest.TestCase):
         self.assertEqual(item["plus_last_message"], "套餐核实失败：token invalidated (/backend-api/me)")
         self.assertEqual(item["activation"]["last_message"], "套餐核实失败：token invalidated (/backend-api/me)")
 
+    def test_enrich_separates_subscription_tier_and_activation(self):
+        """subscription_tier 表示远端套餐；is_activated / plan 表示 CDK 激活生命周期。"""
+        synced = enrich_account(
+            {
+                "email": "pro@b.com",
+                "access_token": "eyJpro",
+                "subscription_tier": "pro",
+                "plan": "free",
+                "stage": STAGE_REGISTERED,
+            }
+        )
+        self.assertEqual(synced["subscription_tier"], "pro")
+        self.assertEqual(synced["plan"], "free")
+        self.assertEqual(synced["type"], "free")
+        self.assertFalse(synced["is_activated"])
+
+        activated = enrich_account(
+            {
+                "email": "legacy@b.com",
+                "access_token": "eyJlegacy",
+                "subscription_tier": "free",
+                "plan": "plus",
+                "stage": STAGE_PLUS_ACTIVATED,
+                "plus_status": "已激活",
+            }
+        )
+        self.assertEqual(activated["subscription_tier"], "free")
+        self.assertEqual(activated["plan"], "plus")
+        self.assertEqual(activated["type"], "plus")
+        self.assertTrue(activated["is_activated"])
+        self.assertEqual(activated["plus_status"], "已激活")
+
+    def test_enrich_migrates_legacy_type_to_subscription_tier(self):
+        """旧版写入 type=pro 且与 lifecycle plan 不一致时，展示层回填 subscription_tier。"""
+        legacy = enrich_account(
+            {
+                "email": "old@b.com",
+                "access_token": "eyJold",
+                "type": "pro",
+                "plan": "free",
+                "stage": STAGE_REGISTERED,
+            }
+        )
+        self.assertEqual(legacy["subscription_tier"], "pro")
+        self.assertEqual(legacy["type"], "free")
+
+    def test_remote_subscription_tier_prefers_stored_field(self):
+        from services.account_lifecycle import remote_subscription_tier
+
+        self.assertEqual(
+            remote_subscription_tier({"subscription_tier": "Plus", "type": "free", "plan": "free"}),
+            "plus",
+        )
+        self.assertEqual(
+            remote_subscription_tier({"type": "pro", "plan": "free"}),
+            "pro",
+        )
+        self.assertEqual(
+            remote_subscription_tier({"type": "free", "plan": "free"}),
+            "",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

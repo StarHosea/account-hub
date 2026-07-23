@@ -62,6 +62,28 @@ def classify(status: str) -> str:
     return "unknown"
 
 
+# 「CDK 已被使用/已提供」类失败文案：该卡已被服务端核销给某账号，重试同卡永远失败，
+# 应立即标记 CDK 异常并换下一张（不计入账号失败次数——是卡的问题，不是账号的问题）。
+_CDK_USED_HINTS = (
+    "已提供",
+    "已被使用",
+    "已使用",
+    "已兑换",
+    "已被兑换",
+    "already provided",
+    "already used",
+    "already redeemed",
+    "already exchanged",
+)
+
+
+def is_cdk_used_error(message: str, status: str = "") -> bool:
+    text = f"{message or ''} {status or ''}".strip().lower()
+    if not text:
+        return False
+    return any(hint in text for hint in _CDK_USED_HINTS)
+
+
 def _as_int(value: object) -> int | None:
     if isinstance(value, bool):
         return None
@@ -87,14 +109,22 @@ def items_of(js: object) -> list:
     return []
 
 
+def _item_cdk_value(it: dict) -> str | None:
+    for key in ("cdkey", "cdk", "cdkey_code", "code"):
+        if it.get(key):
+            return str(it.get(key))
+    return None
+
+
 def item_for_cdk(js: object, cdk: str) -> dict | None:
     items = items_of(js)
     for it in items:
-        if isinstance(it, dict):
-            c = it.get("cdkey") or it.get("cdk") or it.get("cdkey_code") or it.get("code")
-            if c == cdk:
-                return it
-    if len(items) == 1 and isinstance(items[0], dict):
+        if isinstance(it, dict) and _item_cdk_value(it) == cdk:
+            return it
+    # 单条兜底：仅当该条**未回显 cdkey**（服务端省略字段）时才视为本卡结果。
+    # 若明确带了别的 cdkey（如服务端返回该账号已存在的另一张卡的任务），绝不能当成
+    # 本卡状态——否则会把别的卡的 success 记到当前卡上，consume 错卡、账号与 CDK 错配。
+    if len(items) == 1 and isinstance(items[0], dict) and _item_cdk_value(items[0]) is None:
         return items[0]
     return None
 

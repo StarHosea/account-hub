@@ -10,6 +10,7 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 from collections.abc import Callable
@@ -311,13 +312,117 @@ class OpenAIBackendAPI:
             extra_headers={"Content-Type": "application/json"},
         )
 
-    def _get_default_account(self) -> Dict[str, Any]:
-        payload = self._request_json(
+    @staticmethod
+    def _extract_plan_type_from_account_entry(acct_entry: dict) -> str:
+        if not isinstance(acct_entry, dict):
+            return ""
+        account = acct_entry.get("account")
+        if isinstance(account, dict):
+            plan_type = str(account.get("plan_type") or "").strip()
+            if plan_type:
+                return plan_type
+        entitlement = acct_entry.get("entitlement")
+        if isinstance(entitlement, dict):
+            sub_plan = str(entitlement.get("subscription_plan") or "").strip()
+            if sub_plan:
+                return sub_plan
+        return ""
+
+    @staticmethod
+    def _extract_entitlement_expires_at(acct_entry: dict) -> str:
+        if not isinstance(acct_entry, dict):
+            return ""
+        entitlement = acct_entry.get("entitlement")
+        if not isinstance(entitlement, dict):
+            return ""
+        return str(entitlement.get("expires_at") or "").strip()
+
+    @staticmethod
+    def _has_deactivated_marker(obj: dict) -> bool:
+        """对齐 sub2api hasChatGPTAccountDeactivatedMarker。"""
+        if not isinstance(obj, dict):
+            return False
+        for key in ("deactivated", "is_deactivated", "disabled", "is_disabled"):
+            if obj.get(key) is True:
+                return True
+        for key in ("deactivated_at", "disabled_at", "deleted_at"):
+            if str(obj.get(key) or "").strip():
+                return True
+        status = str(obj.get("status") or obj.get("state") or "").strip().lower()
+        if status in ("deactivated", "disabled", "deleted", "inactive", "suspended"):
+            return True
+        return False
+
+    @classmethod
+    def _is_usable_account_entry(cls, acct_entry: dict, *, now: datetime | None = None) -> bool:
+        """对齐 sub2api isUsableChatGPTAccountCandidate：停用标记 + entitlement 过期。"""
+        if not isinstance(acct_entry, dict):
+            return False
+        if cls._has_deactivated_marker(acct_entry):
+            return False
+        account = acct_entry.get("account")
+        if isinstance(account, dict) and cls._has_deactivated_marker(account):
+            return False
+        expires_at = cls._extract_entitlement_expires_at(acct_entry)
+        if not expires_at:
+            return True
+        try:
+            # RFC3339 / ISO8601；兼容尾部 Z
+            expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        except ValueError:
+            return True
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        ref = now or datetime.now(timezone.utc)
+        if ref.tzinfo is None:
+            ref = ref.replace(tzinfo=timezone.utc)
+        return expiry > ref
+
+    @classmethod
+    def resolve_plan_type_from_accounts_check(cls, payload: dict, *, org_id: str = "") -> str:
+        """从 accounts/check 响应解析 plan_type（对齐 sub2api 优先级：org > default > 付费 > 任意）。"""
+        accounts = payload.get("accounts") if isinstance(payload.get("accounts"), dict) else {}
+        org_id = str(org_id or "").strip()
+        if org_id:
+            acct_raw = accounts.get(org_id)
+            if isinstance(acct_raw, dict) and cls._is_usable_account_entry(acct_raw):
+                plan = cls._extract_plan_type_from_account_entry(acct_raw)
+                if plan:
+                    return plan
+
+        default_plan = paid_plan = any_plan = ""
+        for acct_raw in accounts.values():
+            if not isinstance(acct_raw, dict) or not cls._is_usable_account_entry(acct_raw):
+                continue
+            plan = cls._extract_plan_type_from_account_entry(acct_raw)
+            if not plan:
+                continue
+            if not any_plan:
+                any_plan = plan
+            account = acct_raw.get("account")
+            if isinstance(account, dict) and account.get("is_default"):
+                default_plan = plan
+            if plan.lower() != "free" and not paid_plan:
+                paid_plan = plan
+
+        if default_plan:
+            return default_plan
+        if paid_plan:
+            return paid_plan
+        if any_plan:
+            return any_plan
+        return "free"
+
+    def _get_accounts_check_payload(self) -> Dict[str, Any]:
+        return self._request_json(
             "accounts_check",
             "GET",
             "/backend-api/accounts/check/v4-2023-04-27",
             query="?timezone_offset_min=-480",
         )
+
+    def _get_default_account(self) -> Dict[str, Any]:
+        payload = self._get_accounts_check_payload()
         default_account = ((payload.get("accounts") or {}).get("default") or {}).get("account") or {}
         logger.debug({
             "event": "backend_user_info_account_payload",
@@ -329,6 +434,17 @@ class OpenAIBackendAPI:
             "subscription_plan": (payload.get("accounts") or {}).get("default", {}).get("entitlement", {}).get("subscription_plan"),
         })
         return default_account
+
+    def get_plan_type(self) -> Dict[str, Any]:
+        """仅查询 ChatGPT 订阅档位（单请求 accounts/check，比 get_user_info 更轻）。"""
+        if not self.access_token:
+            raise RuntimeError("access_token is required")
+        payload = self._get_accounts_check_payload()
+        auth = account_service._decode_jwt_payload(self.access_token).get("https://api.openai.com/auth")
+        org_id = str((auth or {}).get("poid") or "").strip() if isinstance(auth, dict) else ""
+        plan_type = self.resolve_plan_type_from_accounts_check(payload, org_id=org_id)
+        logger.debug({"event": "backend_plan_type_result", "subscription_tier": plan_type, "org_id": org_id})
+        return {"subscription_tier": plan_type}
 
     def get_user_info(self) -> Dict[str, Any]:
         """获取当前 token 的账号信息。"""
